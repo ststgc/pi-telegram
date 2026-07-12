@@ -48,7 +48,7 @@ interface TelegramCommandsAndToolsBindingDeps {
     chatId: number,
     replyToMessageId: number | undefined,
     markdown: string,
-    options?: { replyMarkup?: unknown },
+    options?: { replyMarkup?: unknown; target?: { chatId: number; threadId?: number } },
   ) => Promise<number | undefined>;
   callMultipart: OutboundHandlers.TelegramVoiceReplySenderDeps["sendMultipart"];
   getDefaultChatId: () => number | undefined;
@@ -182,6 +182,14 @@ export function registerTelegramCommandsAndTools({
         await (stopPolling ?? lockedPollingRuntime.stop)();
       }
       configStore.activateProfile(undefined);
+    },
+    sendNewSessionReady: async (target) => {
+      await sendMarkdownReply(
+        target.chatId,
+        undefined,
+        "✅ New Pi session started.",
+        { target },
+      );
     },
     activateProfileConfig: async (_ctx, profileName) => {
       await configStore.load();

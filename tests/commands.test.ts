@@ -359,19 +359,38 @@ test("Command helpers replace the current Pi session through the official comman
     startPolling: async () => {},
     stopPolling: async () => {},
     updateStatus: () => {},
+    sendNewSessionReady: async (target) => {
+      events.push(`ready:${target.chatId}:${target.threadId}`);
+    },
   });
   const ctx = {
     ...createBridgeCommandContext(),
     waitForIdle: async () => {
       events.push("idle");
     },
-    newSession: async () => {
+    newSession: async (options: {
+      withSession?: (ctx: { sendUserMessage: (message: string) => Promise<void> }) => Promise<void>;
+    }) => {
       events.push("new-session");
+      await options.withSession?.({
+        sendUserMessage: async (message) => {
+          events.push(`follow-up:${message}`);
+        },
+      });
       return { cancelled: false };
     },
-  } as ExtensionCommandContext;
-  await getRequiredCommand(harness.commands, "telegram-new-session").handler("", ctx);
-  assert.deepEqual(events, ["idle", "new-session"]);
+  } as unknown as ExtensionCommandContext;
+  const payload = encodeURIComponent(
+    JSON.stringify({ chatId: 7, threadId: 42, replyToMessageId: 9 }),
+  );
+  await getRequiredCommand(harness.commands, "telegram-new-session").handler(payload, ctx);
+  await getRequiredCommand(harness.commands, "telegram-new-session-ready").handler(payload, ctx);
+  assert.deepEqual(events, [
+    "idle",
+    "new-session",
+    `follow-up:/telegram-new-session-ready ${encodeURIComponent(JSON.stringify({ chatId: 7, replyToMessageId: 9, threadId: 42 }))}`,
+    "ready:7:42",
+  ]);
 });
 
 test("Command helpers parse slash commands with args", () => {

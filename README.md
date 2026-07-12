@@ -167,7 +167,7 @@ Messages sent while Pi is busy become queued turns. Priority lanes support contr
 
 ### Models, Thinking, And Sessions
 
-The model menu opens on **All Models** and exposes every currently authenticated model; scoped favorites remain available as an optional tab. The thinking menu exposes `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`, with Pi clamping unsupported levels to the selected model's capabilities. `/new` requires confirmation, refuses while Pi or the Telegram queue is busy, and uses Pi's official session-replacement API so lifecycle hooks run normally and the current Telegram thread reconnects to the fresh session.
+The model menu opens on **All Models** and exposes every currently authenticated model; scoped favorites remain available as an optional tab. The thinking menu exposes `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`, with Pi clamping unsupported levels to the selected model's capabilities. `/new` requires confirmation, refuses while Pi or the Telegram queue is busy, and uses Pi's official session-replacement API so lifecycle hooks run normally and the current Telegram thread reconnects to the fresh session. After the replacement runtime is ready, it sends `✅ New Pi session started.` from the new session instance.
 
 Terminal footer status is intentionally disabled for this bridge. Connection, role, queue, and transport diagnostics remain available in Telegram and through Pi's `/telegram-status` command without adding `Telegram Disconnected` to unrelated tmux panes.
 

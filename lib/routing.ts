@@ -613,7 +613,7 @@ export interface TelegramInboundRouteRuntimeDeps<
     message: string,
     options?: Queue.TelegramPromptDeliveryOptions,
   ) => void;
-  requestNewSession?: () => void;
+  requestNewSession?: (target: Commands.TelegramCommandMessageTarget) => void;
   isIdle: (ctx: TContext) => boolean;
   hasPendingMessages: (ctx: TContext) => boolean;
   compact: (
@@ -1416,7 +1416,16 @@ export function createTelegramInboundRouteRuntime<
           !deps.bridgeRuntime.lifecycle.hasDispatchPending() &&
           !deps.telegramQueueStore.hasQueuedItems() &&
           !deps.bridgeRuntime.lifecycle.isCompactionInProgress(),
-        requestNewSession: () => deps.requestNewSession?.(),
+        requestNewSession: () => {
+          const chatId = query.message?.chat?.id;
+          const replyToMessageId = query.message?.message_id;
+          if (typeof chatId !== "number" || typeof replyToMessageId !== "number") return;
+          deps.requestNewSession?.({
+            chatId,
+            replyToMessageId,
+            threadId: query.message?.message_thread_id,
+          });
+        },
       });
     if (handledByNewSession) return;
     const handledByQueue = await deps.queueMenuCallbackHandler(query, ctx);

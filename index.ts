@@ -833,8 +833,8 @@ export default function (pi: Pi.ExtensionAPI) {
     }),
     setModel,
     sendUserMessage,
-    requestNewSession() {
-      sendUserMessage("/telegram-new-session");
+    requestNewSession(target) {
+      sendUserMessage(Commands.formatTelegramNewSessionCommand(target));
     },
     isIdle,
     hasPendingMessages,

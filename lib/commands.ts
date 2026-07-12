@@ -322,6 +322,7 @@ export interface TelegramBridgeCommandRegistrationDeps {
     ctx: ExtensionCommandContext,
     profileName: string,
   ) => Promise<boolean>;
+  sendNewSessionReady?: (target: TelegramCommandMessageTarget) => Promise<void>;
 }
 
 function parseTelegramProfileArg(args: string): string | undefined {
@@ -345,6 +346,37 @@ function formatTelegramTakeoverPrompt(
   const to = theme.fg("muted", "to:");
   const source = owner ?? "another Pi instance";
   return `${action}\n\n${from} ${source}\n${to} ${ctx.cwd}`;
+}
+
+export function formatTelegramNewSessionCommand(
+  target: TelegramCommandMessageTarget,
+  ready = false,
+): string {
+  const payload = encodeURIComponent(JSON.stringify(target));
+  return ready
+    ? `/telegram-new-session-ready ${payload}`
+    : `/telegram-new-session ${payload}`;
+}
+
+export function parseTelegramNewSessionTarget(
+  args: string,
+): TelegramCommandMessageTarget | undefined {
+  try {
+    const value = JSON.parse(decodeURIComponent(args.trim())) as Partial<TelegramCommandMessageTarget>;
+    if (typeof value.chatId !== "number" || typeof value.replyToMessageId !== "number") {
+      return undefined;
+    }
+    if (value.threadId !== undefined && typeof value.threadId !== "number") {
+      return undefined;
+    }
+    return {
+      chatId: value.chatId,
+      replyToMessageId: value.replyToMessageId,
+      threadId: value.threadId,
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 export function registerTelegramBridgeCommands(
@@ -428,12 +460,36 @@ export function registerTelegramBridgeCommands(
   });
   pi.registerCommand("telegram-new-session", {
     description: "Internal Telegram same-thread session replacement",
-    handler: async (_args, ctx) => {
+    handler: async (args, ctx) => {
+      const target = parseTelegramNewSessionTarget(args);
+      if (!target) {
+        ctx.ui.notify("Telegram session replacement target is invalid.", "error");
+        return;
+      }
       await ctx.waitForIdle();
-      const result = await ctx.newSession();
+      const result = await ctx.newSession({
+        withSession: async (newCtx) => {
+          await newCtx.sendUserMessage(formatTelegramNewSessionCommand(target, true));
+        },
+      });
       if (result.cancelled) {
         ctx.ui.notify("Telegram session replacement was cancelled.", "warning");
       }
+    },
+  });
+  pi.registerCommand("telegram-new-session-ready", {
+    description: "Internal Telegram new-session completion notice",
+    handler: async (args, ctx) => {
+      const target = parseTelegramNewSessionTarget(args);
+      if (!target) {
+        ctx.ui.notify("Telegram session completion target is invalid.", "error");
+        return;
+      }
+      if (!deps.sendNewSessionReady) {
+        ctx.ui.notify("Telegram session completion delivery is unavailable.", "error");
+        return;
+      }
+      await deps.sendNewSessionReady(target);
     },
   });
 }

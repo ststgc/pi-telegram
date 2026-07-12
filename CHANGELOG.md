@@ -2,7 +2,7 @@
 
 ## Unreleased: Custom Operator Controls
 
-- `[Sessions]` Added a visible Telegram `/new` command with inline confirmation and busy-state guards. Confirmed replacement routes through a hidden Pi extension command and the official `ExtensionCommandContext.newSession()` API, preserving normal lifecycle teardown/startup and the existing same-thread follower handoff without TTY injection or private runtime mutation.
+- `[Sessions]` Added a visible Telegram `/new` command with inline confirmation and busy-state guards. Confirmed replacement routes through a hidden Pi extension command and the official `ExtensionCommandContext.newSession()` API, preserving normal lifecycle teardown/startup and the existing same-thread follower handoff without TTY injection or private runtime mutation. The replacement instance sends `✅ New Pi session started.` after startup so completion is visible from Telegram.
 - `[Models]` The Telegram model menu now opens on all authenticated models instead of scoped favorites. Scoped models remain available as an optional tab, and the existing thinking menu continues to expose every Pi-supported reasoning level.
 - `[Terminal UI]` Telegram status updates now clear the extension status key instead of publishing connected/disconnected state into Pi's shared footer. Telegram menus and `/telegram-status` retain full operational diagnostics.
 - `[Validation]` Added command-context session replacement, confirmation callback, all-model default, and hidden terminal-status regressions.
