@@ -45,7 +45,7 @@ Use emoji as stable semantic markers, not decoration. Emoji carry transportable 
 | `▶️` | Continue/resume generation | `/continue` command and matching menu action | Means resume/continue current session flow, not force-next. |
 | `⏹️` | Abort current Pi work | `/abort` command description | Stops active work but is not a destructive queue clear by itself. |
 | `🟥` | Stop / abort-and-clear danger | `/stop` command description | Stronger than `⏹️`; use for disruptive stop/clear semantics. |
-| `🆕` | New session / fresh start | Reserved visible extension command example for `/new`-like flows | Same-thread Telegram `/new` is currently blocked by Pi core API; keep this meaning reserved. |
+| `🆕` | New session / fresh start | `/new` command, confirmation action, and replacement notice | Same-thread Telegram `/new` uses Pi's official extension session-replacement API. |
 | `🌀` | Refresh | Queue refresh row and future refresh buttons | Re-fetch/re-render current surface, not transport reconnect. |
 | `↪️` | Reroute to an existing target | Thread chooser buttons that send a captured command/message from one thread to another live thread | Curved arrow means the message arrived here but bends to another target. |
 | `🔁` | Replace/restore mode | Thread replace/restore chooser entrypoints | Opens a second step for moving a Pi instance binding to the current source thread. |

@@ -34,7 +34,7 @@ Keep this boundary explicit:
 
 - Do not use raw TTY injection, ANSI terminal clearing, private TUI container mutation, or a shadow `pi` subprocess to simulate interactive commands.
 - Do not treat Telegram as a generic remote shell for every Pi slash command.
-- Commands that require interactive session replacement or TUI rerendering, such as a true Telegram `/new`, need a public Pi API that invokes the same runtime path as the terminal command.
+- Telegram `/new` uses Pi's public `ExtensionCommandContext.newSession()` path. Telegram callbacks request a hidden Pi extension command; no raw TTY input, private runtime mutation, or shadow process is involved.
 - A separate PTY supervisor or daemon could choose to own those risks, but that would be a different product mode rather than this extension's runtime contract.
 
 The repository uses a **Flat Domain DAG**:
@@ -198,7 +198,8 @@ Telegram controls execute through command/callback domains, not by entering the 
 Immediate controls:
 
 - `/start` opens the main inline application menu.
-- `/model`, `/thinking`, `/queue`, and `/settings` are hidden shortcuts to menu sections.
+- `/model`, `/thinking`, `/queue`, and `/settings` are hidden shortcuts to menu sections. The model menu starts on all authenticated models; scoped models remain an optional tab.
+- `/new` opens an inline confirmation dialog, refuses while Pi or the Telegram queue is busy, then routes through a hidden Pi extension command whose `ExtensionCommandContext` calls the official `newSession()` API. Normal session shutdown/start hooks preserve the current Telegram thread binding.
 - `/compact` opens an inline confirmation dialog and then runs compaction when the bridge is idle.
 - `/next` dispatches the next queued turn, aborting Pi first when needed.
 - `/abort` aborts active work while preserving queued items. Abort-history preservation is enabled only for Telegram-owned active turns; later local/non-Telegram agent starts clear stale abort-history mode so the next Telegram prompt appends instead of absorbing old queued turns as history.
@@ -270,13 +271,15 @@ Unknown callback data outside owned prefixes is forwarded as `[callback] <data>`
 - Voice/STT/TTS providers: [Voice Integration](./voice.md).
 - Inbound/outbound command-template handlers: [Command Templates](./command-templates.md).
 
-Extension callbacks must avoid `pi-telegram` owned prefixes such as `compact:`, `tgbtn:`, `menu:`, `model:`, `thinking:`, `status:`, `queue:`, `settings:`, and `section:`. Workflow-specific Telegram slash commands should use the public command registry instead of becoming new core built-ins unless they are bridge lifecycle, transport ownership, queue safety, or essential operator controls.
+Extension callbacks must avoid `pi-telegram` owned prefixes such as `compact:`, `new:`, `tgbtn:`, `menu:`, `model:`, `thinking:`, `status:`, `queue:`, `settings:`, and `section:`. Workflow-specific Telegram slash commands should use the public command registry instead of becoming new core built-ins unless they are bridge lifecycle, transport ownership, queue safety, or essential operator controls.
 
 The bridge does not mirror arbitrary `ctx.ui.confirm/input/select/custom` prompts from other extensions into Telegram. Companion extensions that need Telegram operation should expose a Telegram-native command, section, settings row, callback, status line, inbound/update handler, or assistant action-markup path instead of relying on hidden TUI-only prompts.
 
 ## Diagnostics And Operational Behavior
 
-Status rendering distinguishes connected, active, dispatching, queued, tool-running, model-switching, and compacting states. If a queue mutation removes the last waiting item while Telegram-owned work still has running tools, status remains active instead of degrading to connected.
+The bridge deliberately clears its Pi terminal status entry on every status update, so optional Telegram state does not appear in every tmux pane or custom footer. Full connection, role, queue, transport, and runtime-event projections remain available in Telegram menus and `/telegram-status`.
+
+Telegram-side status rendering distinguishes connected, active, dispatching, queued, tool-running, model-switching, and compacting states. If a queue mutation removes the last waiting item while Telegram-owned work still has running tools, status remains active instead of degrading to connected.
 
 Queue reactions are shortcut controls for waiting turns. Promotion reactions (`👍`, `⚡️`, `❤️`, `🕊`, `🔥`) move prompts to priority; removal reactions (`👎`, `👻`, `💔`, `💩`, `🗑`) remove waiting turns because ordinary Telegram DM deletions are not exposed through Bot API polling.
 

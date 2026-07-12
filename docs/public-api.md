@@ -53,7 +53,7 @@ Stable commands inside the paired Telegram DM:
 
 Hidden compatibility shortcuts may open sections directly: `/help`, `/status`, `/model`, `/thinking`, `/queue`, and `/settings`.
 
-This command surface is a mobile companion subset, not a raw terminal-command bridge. Commands that depend on Pi's interactive runtime owning session replacement, TUI transcript clearing, or arbitrary slash-command dispatch stay out of the stable Telegram API unless Pi exposes a safe public extension hook for them.
+This command surface is a mobile companion subset, not a raw terminal-command bridge. `/new` is the narrow exception for session replacement because Pi exposes the official `ExtensionCommandContext.newSession()` hook; arbitrary TUI transcript manipulation and slash-command forwarding remain outside the stable Telegram API.
 
 ### Tools and assistant-authored actions
 

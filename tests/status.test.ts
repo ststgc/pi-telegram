@@ -392,7 +392,7 @@ test("Status runtime updates the status bar and exposes bridge lines", () => {
   runtime.updateStatus(ctx, "demo error");
   assert.equal(
     events[0],
-    "telegram:<accent>telegram</accent> <error>error</error> <muted>demo error</muted>",
+    "telegram:undefined",
   );
   assert.deepEqual(runtime.getStatusLines().slice(0, 3), [
     "connection:",
@@ -552,7 +552,7 @@ test("Bridge status runtime stays active while tools run after queue changes", (
   });
   assert.equal(
     events[0],
-    "telegram:<accent>telegram</accent> <warning>active</warning>",
+    "telegram:undefined",
   );
 });
 
@@ -591,7 +591,7 @@ test("Bridge status runtime builds status state from live ports", () => {
   });
   assert.equal(
     events[0],
-    "telegram:<accent>telegram</accent> <warning>active</warning><success> +1</success>",
+    "telegram:undefined",
   );
   assert.deepEqual(runtime.getStatusLines(), [
     "connection:",

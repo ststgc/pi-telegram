@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased: Custom Operator Controls
+
+- `[Sessions]` Added a visible Telegram `/new` command with inline confirmation and busy-state guards. Confirmed replacement routes through a hidden Pi extension command and the official `ExtensionCommandContext.newSession()` API, preserving normal lifecycle teardown/startup and the existing same-thread follower handoff without TTY injection or private runtime mutation.
+- `[Models]` The Telegram model menu now opens on all authenticated models instead of scoped favorites. Scoped models remain available as an optional tab, and the existing thinking menu continues to expose every Pi-supported reasoning level.
+- `[Terminal UI]` Telegram status updates now clear the extension status key instead of publishing connected/disconnected state into Pi's shared footer. Telegram menus and `/telegram-status` retain full operational diagnostics.
+- `[Validation]` Added command-context session replacement, confirmation callback, all-model default, and hidden terminal-status regressions.
+
 ## 0.20.6: Guest Attribution And Voice Action Hotfix
 
 - `[Voice Action Syntax]` Hidden `telegram_voice` actions now accept the intuitive paired form `<!-- telegram_voice ... -->...<!-- /telegram_voice -->` alongside inline, attribute-text, and single-comment multiline forms. The parser captures a non-empty multiline body and preserves language/rate attributes while leaving surrounding prose visible. Impact: agents can use an explicit closing tag without leaking the intended TTS payload as ordinary text.

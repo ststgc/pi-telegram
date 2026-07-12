@@ -92,7 +92,8 @@ The first Telegram user to message the bot becomes the allowed owner. Other user
 | Queue control | Inspect waiting turns, delete stale work, promote important prompts, continue, abort, stop, or force the next queued item. | Long Pi tasks keep running while new mobile prompts stay visible and controllable instead of interrupting or disappearing. |
 | Operator menu | Use `/start` for status, prompt templates, model, thinking, settings, queue, extension sections, and diagnostics. | The bot is an operator panel, not a command cheat sheet. |
 | Prompt templates | Run Pi prompt templates as Telegram-safe commands such as `/fix_tests`. | Reusable local workflows become phone-accessible without exposing arbitrary terminal commands. |
-| Model and thinking | Switch model or reasoning level from Telegram through safe continuation flows. | Mobile control can adjust execution strategy without tearing down the current session. |
+| Model and thinking | Browse all authenticated models by default and choose any Pi-supported reasoning level from Telegram. | Mobile control can adjust execution strategy without tearing down the current session. |
+| Session reset | Confirm `/new` to start a fresh Pi session while preserving the current Telegram thread binding. | A long-running phone conversation can reset context without returning to the terminal. |
 | Compaction | Confirm `/compact`, show native active status during compaction, and preserve Telegram-owned turn semantics. | Context maintenance is visible and safe from the phone. |
 | Draft previews | Show Telegram's native `…typing` indicator whenever the connected instance is doing agent work, or enable Rich Draft previews for streamed answer text. | Local prompts, Telegram turns, and autonomous continuations remain visibly active while draft visibility stays independent from final rendering. |
 | Assistant rendering | Choose Native Rich Markdown or legacy Markdown-to-HTML for final assistant replies. | Renderer compatibility is explicit instead of being conflated with draft previews. |
@@ -131,6 +132,7 @@ Use these in the bot DM.
 | --- | --- |
 | `/start` | Pair when needed and open the main operator menu |
 | `/compact` | Confirm and run session compaction when safe |
+| `/new` | Confirm and start a fresh Pi session in the same Telegram thread |
 | `/next` | Dispatch the next queued turn, aborting first if needed |
 | `/continue` | Enqueue a priority continuation prompt |
 | `/abort` | Abort the active run while preserving the queue |
@@ -162,6 +164,12 @@ Named profile identifiers contain only lowercase ASCII letters and digits (maxim
 ### Queue Runtime
 
 Messages sent while Pi is busy become queued turns. Priority lanes support control actions and model-switch continuations. Queue controls let you inspect, delete, promote, and dispatch work from Telegram without touching the terminal.
+
+### Models, Thinking, And Sessions
+
+The model menu opens on **All Models** and exposes every currently authenticated model; scoped favorites remain available as an optional tab. The thinking menu exposes `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`, with Pi clamping unsupported levels to the selected model's capabilities. `/new` requires confirmation, refuses while Pi or the Telegram queue is busy, and uses Pi's official session-replacement API so lifecycle hooks run normally and the current Telegram thread reconnects to the fresh session.
+
+Terminal footer status is intentionally disabled for this bridge. Connection, role, queue, and transport diagnostics remain available in Telegram and through Pi's `/telegram-status` command without adding `Telegram Disconnected` to unrelated tmux panes.
 
 ### Native Rich Markdown
 
@@ -232,7 +240,7 @@ Stable public entrypoints are documented in [Public API](./docs/public-api.md), 
 - Pretend Telegram is a terminal or PTY.
 - Forward arbitrary Telegram slash commands into the Pi TUI.
 - Inject raw TTY input or terminal-control sequences.
-- Replace Pi session lifecycle without an official Pi API.
+- Replace Pi session lifecycle through private APIs or terminal injection; `/new` uses Pi's official extension command context.
 - Let non-owner Telegram users control the bridge.
 
 Telegram is a companion surface around a live Pi runtime, not a second runtime.

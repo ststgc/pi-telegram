@@ -564,14 +564,15 @@ export function createTelegramStatusRuntime<
 >(deps: TelegramStatusRuntimeDeps<TContext>): TelegramStatusRuntime<TContext> {
   const statusKey = deps.statusKey ?? "telegram";
   return {
-    updateStatus: (ctx, error) => {
-      ctx.ui.setStatus(
-        statusKey,
-        buildTelegramStatusBarText(
-          ctx.ui.theme,
-          deps.getStatusBarState(ctx, error),
-        ),
-      );
+    updateStatus: (ctx, _error) => {
+      // Telegram state remains available through /telegram-status and the
+      // Telegram menu. Keep it out of Pi's shared footer/status surface so
+      // every terminal pane is not decorated by this optional transport.
+      const clearStatus = ctx.ui.setStatus as (
+        key: string,
+        value: string | undefined,
+      ) => void;
+      clearStatus(statusKey, undefined);
     },
     getStatusLines: (options) =>
       buildTelegramBridgeStatusLines(deps.getBridgeStatusLineState(), options),

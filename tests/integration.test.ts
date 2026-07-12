@@ -2053,7 +2053,7 @@ test("Extension runtime applies idle model picks immediately and refreshes statu
           callback_query: {
             id: "cb-idle-1",
             from: { id: 77, is_bot: false, first_name: "Test" },
-            data: "model:pick:0",
+            data: "model:pick:1",
             message: {
               message_id: 100,
               chat: { id: 99, type: "private" },
@@ -2064,7 +2064,7 @@ test("Extension runtime applies idle model picks immediately and refreshes statu
     );
     await waitForCondition(() => setModels.length === 1);
     assert.deepEqual(setModels, ["anthropic/claude-b"]);
-    assert.deepEqual(thinkingLevels, ["high"]);
+    assert.deepEqual(thinkingLevels, []);
     assert.equal(callbackAnswers.includes("Switched to claude-b"), true);
     assert.equal(statusEvents.length > statusCountBeforePick, true);
     assert.equal(

@@ -158,6 +158,7 @@ export const TELEGRAM_COMMAND_EMOJI = {
   model: "🤖",
   thinking: "🧠",
   compact: "🗜",
+  new: "🆕",
   queue: "🔢",
   thread: "🧵",
   next: "⏩",
@@ -201,6 +202,13 @@ export const TELEGRAM_BUILTIN_BOT_COMMANDS: readonly TelegramBotCommandDefinitio
       description: formatTelegramBotCommandDescription(
         "compact",
         "Compact current session",
+      ),
+    },
+    {
+      command: "new",
+      description: formatTelegramBotCommandDescription(
+        "new",
+        "Start a new session",
       ),
     },
     {
@@ -418,6 +426,16 @@ export function registerTelegramBridgeCommands(
       deps.updateStatus(ctx);
     },
   });
+  pi.registerCommand("telegram-new-session", {
+    description: "Internal Telegram same-thread session replacement",
+    handler: async (_args, ctx) => {
+      await ctx.waitForIdle();
+      const result = await ctx.newSession();
+      if (result.cancelled) {
+        ctx.ui.notify("Telegram session replacement was cancelled.", "warning");
+      }
+    },
+  });
 }
 
 export const TELEGRAM_RESERVED_COMMAND_NAMES = [
@@ -428,6 +446,7 @@ export const TELEGRAM_RESERVED_COMMAND_NAMES = [
   "status",
   "queue",
   "compact",
+  "new",
   "model",
   "thinking",
   "settings",
@@ -459,6 +478,7 @@ export type TelegramCommandAction =
   | { kind: "continue"; executionMode: "immediate" }
   | { kind: "queue"; executionMode: "immediate" }
   | { kind: "compact"; executionMode: "immediate" }
+  | { kind: "new"; executionMode: "immediate" }
   | { kind: "status"; executionMode: "immediate" }
   | { kind: "model"; executionMode: "immediate" }
   | { kind: "thinking"; executionMode: "immediate" }
@@ -478,6 +498,7 @@ export interface TelegramCommandActionDeps<TMessage, TContext> {
   handleContinue: (message: TMessage, ctx: TContext) => Promise<void>;
   handleQueue: (message: TMessage, ctx: TContext) => Promise<void>;
   handleCompact: (message: TMessage, ctx: TContext) => Promise<void>;
+  handleNew: (message: TMessage, ctx: TContext) => Promise<void>;
   handleStatus: (message: TMessage, ctx: TContext) => Promise<void>;
   handleModel: (message: TMessage, ctx: TContext) => Promise<void>;
   handleThinking: (message: TMessage, ctx: TContext) => Promise<void>;
@@ -573,6 +594,17 @@ export interface TelegramCompactConfirmationCallbackDeps<TContext> {
     replyToMessageId: number,
     target?: { chatId: number; threadId?: number },
   ) => Promise<void>;
+}
+
+export interface TelegramNewSessionConfirmationCallbackDeps<TContext> {
+  ctx: TContext;
+  answerCallbackQuery: (
+    callbackQueryId: string,
+    text?: string,
+  ) => Promise<void>;
+  editInteractiveMessage: TelegramCompactConfirmationCallbackDeps<TContext>["editInteractiveMessage"];
+  canStartNewSession: (ctx: TContext) => boolean;
+  requestNewSession: () => void;
 }
 
 export type TelegramControlCommandType =
@@ -884,6 +916,7 @@ export const TELEGRAM_APP_MENU_INTRO_HTML = [
   "",
   `${formatTelegramCommandEmojiPrefix("start")}/start — Open menu / Pair bridge`,
   `${formatTelegramCommandEmojiPrefix("compact")}/compact — Compact current session`,
+  `${formatTelegramCommandEmojiPrefix("new")}/new — Start a new session`,
   `${formatTelegramCommandEmojiPrefix("next")}/next — Force next turn`,
   `${formatTelegramCommandEmojiPrefix("continue")}/continue — Queue continue prompt`,
   `${formatTelegramCommandEmojiPrefix("abort")}/abort — Abort Pi`,
@@ -925,6 +958,7 @@ function buildTelegramAppMenuIntroHtml(): string {
     `${formatTelegramCommandEmojiPrefix("start")}/start — Open menu / Pair bridge`,
     `${formatTelegramCommandEmojiPrefix("compact")}/compact — Compact current session`,
     ...extensionLines,
+    `${formatTelegramCommandEmojiPrefix("new")}/new — Start a new session`,
     `${formatTelegramCommandEmojiPrefix("next")}/next — Force next turn`,
     `${formatTelegramCommandEmojiPrefix("continue")}/continue — Queue continue prompt`,
     `${formatTelegramCommandEmojiPrefix("abort")}/abort — Abort Pi`,
@@ -978,6 +1012,7 @@ export const TELEGRAM_COMMAND_ACTIONS = {
   status: { kind: "status", executionMode: "immediate" },
   queue: { kind: "queue", executionMode: "immediate" },
   compact: { kind: "compact", executionMode: "immediate" },
+  new: { kind: "new", executionMode: "immediate" },
   model: { kind: "model", executionMode: "immediate" },
   thinking: { kind: "thinking", executionMode: "immediate" },
   settings: { kind: "settings", executionMode: "immediate" },
@@ -1123,6 +1158,36 @@ export function getTelegramCompactConfirmationHtml(): string {
   return "<b>Compact session?</b>";
 }
 
+export function buildTelegramNewSessionConfirmationReplyMarkup(): TelegramCompactConfirmationReplyMarkup {
+  return {
+    inline_keyboard: [
+      [
+        { text: "🆕 Yes, start fresh", callback_data: "new:confirm" },
+        { text: "❌ No", callback_data: "new:cancel" },
+      ],
+    ],
+  };
+}
+
+export function getTelegramNewSessionConfirmationHtml(): string {
+  return "<b>Start a new session?</b>\n\nThe current session stays saved in Pi history.";
+}
+
+export async function openTelegramNewSessionConfirmation(
+  target: TelegramCommandMessageTarget,
+  deps: TelegramCompactConfirmationDeps,
+): Promise<void> {
+  await deps.sendInteractiveMessage(
+    target.chatId,
+    getTelegramNewSessionConfirmationHtml(),
+    "html",
+    buildTelegramNewSessionConfirmationReplyMarkup(),
+    target.threadId !== undefined
+      ? { target: { chatId: target.chatId, threadId: target.threadId } }
+      : undefined,
+  );
+}
+
 export async function openTelegramCompactConfirmation(
   target: TelegramCommandMessageTarget,
   deps: TelegramCompactConfirmationDeps,
@@ -1136,6 +1201,50 @@ export async function openTelegramCompactConfirmation(
       ? { target: { chatId: target.chatId, threadId: target.threadId } }
       : undefined,
   );
+}
+
+export async function handleTelegramNewSessionConfirmationCallback<TContext>(
+  query: TelegramCompactConfirmationCallbackQuery,
+  deps: TelegramNewSessionConfirmationCallbackDeps<TContext>,
+): Promise<boolean> {
+  if (query.data !== "new:confirm" && query.data !== "new:cancel") {
+    return false;
+  }
+  const callbackMessage = query.message;
+  const chatId = callbackMessage?.chat?.id;
+  const messageId = callbackMessage?.message_id;
+  if (typeof chatId !== "number" || typeof messageId !== "number") {
+    await deps.answerCallbackQuery(query.id, "Interactive message expired.");
+    return true;
+  }
+  if (query.data === "new:cancel") {
+    await deps.editInteractiveMessage(
+      chatId,
+      messageId,
+      "New session cancelled.",
+      "plain",
+      { inline_keyboard: [] },
+    );
+    await deps.answerCallbackQuery(query.id);
+    return true;
+  }
+  if (!deps.canStartNewSession(deps.ctx)) {
+    await deps.answerCallbackQuery(
+      query.id,
+      "Pi or the Telegram queue is busy. Send /stop or wait for it to finish.",
+    );
+    return true;
+  }
+  await deps.editInteractiveMessage(
+    chatId,
+    messageId,
+    "🆕 Starting a new session…",
+    "plain",
+    { inline_keyboard: [] },
+  );
+  await deps.answerCallbackQuery(query.id);
+  deps.requestNewSession();
+  return true;
 }
 
 export async function handleTelegramCompactConfirmationCallback<TContext>(
@@ -1291,6 +1400,9 @@ export async function executeTelegramCommandAction<TMessage, TContext>(
       return true;
     case "compact":
       await deps.handleCompact(message, ctx);
+      return true;
+    case "new":
+      await deps.handleNew(message, ctx);
       return true;
     case "status":
       await deps.handleStatus(message, ctx);
@@ -1555,6 +1667,19 @@ async function handleTelegramCommandRuntime<
           sendTextReply: sendReplyFor(nextMessage),
           recordRuntimeEvent: deps.recordRuntimeEvent,
         });
+      },
+      handleNew: async (nextMessage) => {
+        if (!deps.sendInteractiveMessage) {
+          await deps.sendTextReply(
+            nextMessage,
+            "New-session confirmation is unavailable in this runtime.",
+          );
+          return;
+        }
+        await openTelegramNewSessionConfirmation(
+          getTelegramCommandMessageTarget(nextMessage),
+          { sendInteractiveMessage: deps.sendInteractiveMessage },
+        );
       },
       handleStatus: async (nextMessage, commandCtx) => {
         await deps.showStatus(nextMessage, commandCtx);

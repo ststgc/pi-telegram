@@ -319,6 +319,7 @@ test("Menu runtime builds menu state from settings and model-registry ports", as
   assert.equal(reloadCount, 1);
   assert.equal(refreshCount, 1);
   assert.equal(result.state.chatId, 42);
+  assert.equal(result.state.scope, "all");
   assert.deepEqual(
     result.state.allModels.map((entry) => entry.model.id),
     ["gpt-5"],

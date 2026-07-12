@@ -613,6 +613,7 @@ export interface TelegramInboundRouteRuntimeDeps<
     message: string,
     options?: Queue.TelegramPromptDeliveryOptions,
   ) => void;
+  requestNewSession?: () => void;
   isIdle: (ctx: TContext) => boolean;
   hasPendingMessages: (ctx: TContext) => boolean;
   compact: (
@@ -631,6 +632,7 @@ const TELEGRAM_OWNED_CALLBACK_PREFIXES = [
   TELEGRAM_ALL_TAB_MENU_CALLBACK_PREFIX,
   TELEGRAM_UNBOUND_REROUTE_CALLBACK_PREFIX,
   "compact:",
+  "new:",
   "menu:",
   "model:",
   "queue:",
@@ -1401,6 +1403,22 @@ export function createTelegramInboundRouteRuntime<
         },
       });
     if (handledByCompact) return;
+    const handledByNewSession =
+      await Commands.handleTelegramNewSessionConfirmationCallback(query, {
+        ctx,
+        answerCallbackQuery: deps.answerCallbackQuery,
+        editInteractiveMessage: deps.editInteractiveMessage ?? (async () => {}),
+        canStartNewSession: (sessionCtx) =>
+          !!deps.requestNewSession &&
+          deps.isIdle(sessionCtx) &&
+          !deps.hasPendingMessages(sessionCtx) &&
+          !deps.activeTurnRuntime.has() &&
+          !deps.bridgeRuntime.lifecycle.hasDispatchPending() &&
+          !deps.telegramQueueStore.hasQueuedItems() &&
+          !deps.bridgeRuntime.lifecycle.isCompactionInProgress(),
+        requestNewSession: () => deps.requestNewSession?.(),
+      });
+    if (handledByNewSession) return;
     const handledByQueue = await deps.queueMenuCallbackHandler(query, ctx);
     if (handledByQueue) return;
     const handledBySettings = await deps.settingsMenuCallbackHandler?.(

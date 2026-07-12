@@ -553,7 +553,7 @@ export function buildTelegramModelMenuState<
     threadId: params.threadId,
     messageId: 0,
     page: 0,
-    scope: scopedModels.length > 0 ? "scoped" : "all",
+    scope: "all",
     scopedModels,
     allModels,
     note,

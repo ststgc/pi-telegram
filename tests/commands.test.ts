@@ -28,6 +28,7 @@ import {
   handleTelegramAbortCommand,
   handleTelegramCompactCommand,
   handleTelegramCompactConfirmationCallback,
+  handleTelegramNewSessionConfirmationCallback,
   handleTelegramModelCommand,
   handleTelegramStatusCommand,
   handleTelegramStopCommand,
@@ -40,6 +41,7 @@ import {
   TELEGRAM_COMMAND_ACTIONS,
   TELEGRAM_COMMAND_EMOJI,
   TELEGRAM_RESERVED_COMMAND_NAMES,
+  openTelegramNewSessionConfirmation,
 } from "../lib/commands.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "../lib/pi.ts";
 
@@ -94,6 +96,7 @@ test("Command helpers expose Telegram bot command definitions", () => {
       description: "🟢 Open menu / Pair bridge",
     },
     { command: "compact", description: "🗜 Compact current session" },
+    { command: "new", description: "🆕 Start a new session" },
     {
       command: "next",
       description: "⏩ Force next turn",
@@ -132,8 +135,8 @@ test("Command helpers register Telegram bot commands through deps", async () => 
 test("Command helpers keep extension Telegram bot commands hidden by default", async () => {
   clearTelegramExtensionCommands();
   const dispose = registerTelegramCommand({
-    name: "new",
-    description: "Start fresh",
+    name: "deploy",
+    description: "Deploy changes",
     handler: async () => {},
   });
   const calls: unknown[] = [];
@@ -150,10 +153,10 @@ test("Command helpers keep extension Telegram bot commands hidden by default", a
 test("Command helpers register extension Telegram bot commands when visible", async () => {
   clearTelegramExtensionCommands();
   const dispose = registerTelegramCommand({
-    name: "new",
-    description: "Start fresh",
+    name: "deploy",
+    description: "Deploy changes",
     showInMenu: true,
-    emoji: "🆕",
+    emoji: "🚀",
     handler: async () => {},
   });
   const calls: unknown[] = [];
@@ -166,7 +169,7 @@ test("Command helpers register extension Telegram bot commands when visible", as
     [
       TELEGRAM_BOT_COMMANDS[0],
       TELEGRAM_BOT_COMMANDS[1],
-      { command: "new", description: "🆕 Start fresh" },
+      { command: "deploy", description: "🚀 Deploy changes" },
       ...TELEGRAM_BOT_COMMANDS.slice(2),
     ],
   ]);
@@ -179,7 +182,7 @@ test("Command helpers reject visible extension commands without emoji", () => {
   assert.throws(
     () =>
       registerTelegramCommand({
-        name: "new",
+        name: "deploy",
         showInMenu: true,
         handler: () => {},
       }),
@@ -204,16 +207,16 @@ test("Command helpers reject invalid and built-in extension command names", () =
 test("Command helpers register disposable extension commands", () => {
   clearTelegramExtensionCommands();
   const dispose = registerTelegramCommand({
-    name: "/new",
+    name: "/deploy",
     handler: () => {},
   });
-  assert.equal(findTelegramExtensionCommand("new")?.name, "new");
+  assert.equal(findTelegramExtensionCommand("deploy")?.name, "deploy");
   assert.throws(
-    () => registerTelegramCommand({ name: "new", handler: () => {} }),
+    () => registerTelegramCommand({ name: "deploy", handler: () => {} }),
     /already registered/,
   );
   dispose();
-  assert.equal(findTelegramExtensionCommand("new"), undefined);
+  assert.equal(findTelegramExtensionCommand("deploy"), undefined);
   clearTelegramExtensionCommands();
 });
 
@@ -343,6 +346,32 @@ test("Command helpers move pi polling ownership after confirmation", async () =>
     "update-status",
   ]);
   assert.deepEqual(notifications, ["connected"]);
+});
+
+test("Command helpers replace the current Pi session through the official command context", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  const events: string[] = [];
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => {},
+    getStatusLines: () => [],
+    reloadConfig: async () => {},
+    hasBotToken: () => true,
+    startPolling: async () => {},
+    stopPolling: async () => {},
+    updateStatus: () => {},
+  });
+  const ctx = {
+    ...createBridgeCommandContext(),
+    waitForIdle: async () => {
+      events.push("idle");
+    },
+    newSession: async () => {
+      events.push("new-session");
+      return { cancelled: false };
+    },
+  } as ExtensionCommandContext;
+  await getRequiredCommand(harness.commands, "telegram-new-session").handler("", ctx);
+  assert.deepEqual(events, ["idle", "new-session"]);
 });
 
 test("Command helpers parse slash commands with args", () => {
@@ -883,6 +912,44 @@ test("Command helpers open compact confirmation and handle callbacks", async () 
   ]);
 });
 
+test("Command helpers confirm and request a same-thread new session", async () => {
+  const events: string[] = [];
+  await openTelegramNewSessionConfirmation(
+    { chatId: 7, threadId: 42, replyToMessageId: 11 },
+    {
+      sendInteractiveMessage: async (_chatId, text, mode, markup, options) => {
+        events.push(`${mode}:${text}:${markup.inline_keyboard[0]?.[0]?.callback_data}:${options?.target?.threadId}`);
+        return 9;
+      },
+    },
+  );
+  const query = {
+    id: "callback",
+    data: "new:confirm",
+    message: { chat: { id: 7 }, message_id: 9, message_thread_id: 42 },
+  };
+  assert.equal(
+    await handleTelegramNewSessionConfirmationCallback(query, {
+      ctx: "ctx",
+      canStartNewSession: () => true,
+      requestNewSession: () => events.push("request"),
+      answerCallbackQuery: async () => {
+        events.push("answer");
+      },
+      editInteractiveMessage: async (_chatId, _messageId, text) => {
+        events.push(`edit:${text}`);
+      },
+    }),
+    true,
+  );
+  assert.deepEqual(events, [
+    "html:<b>Start a new session?</b>\n\nThe current session stays saved in Pi history.:new:confirm:42",
+    "edit:🆕 Starting a new session…",
+    "answer",
+    "request",
+  ]);
+});
+
 test("Command helpers defer compact-complete queue dispatch", async () => {
   const events: string[] = [];
   let complete: (() => void) | undefined;
@@ -1079,15 +1146,15 @@ test("Command helpers build the unified app menu from commands and status", () =
     `${TELEGRAM_APP_MENU_INTRO_HTML}\n\n🧩 /review\n\n<b>Status:</b> <code>idle</code>`,
   );
   const dispose = registerTelegramCommand({
-    name: "new",
-    description: "Start fresh",
+    name: "deploy",
+    description: "Deploy changes",
     showInMenu: true,
-    emoji: "🆕",
+    emoji: "🚀",
     handler: () => {},
   });
   const menuWithExtensionCommand = TELEGRAM_APP_MENU_INTRO_HTML.replace(
-    "⏩ /next — Force next turn",
-    "🆕 /new — Start fresh\n⏩ /next — Force next turn",
+    "🆕 /new — Start a new session",
+    "🚀 /deploy — Deploy changes\n🆕 /new — Start a new session",
   );
   assert.equal(
     buildTelegramAppMenuHtml("<b>Status:</b> <code>idle</code>"),
@@ -1458,6 +1525,9 @@ test("Command helpers execute command actions through provided handlers", async 
     },
     handleCompact: async () => {
       events.push("compact");
+    },
+    handleNew: async () => {
+      events.push("new");
     },
     handleStatus: async () => {
       events.push("status");
