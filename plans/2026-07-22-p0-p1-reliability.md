@@ -104,6 +104,8 @@ SKILL_DIR=.agents/skills/domain-dag bash .agents/skills/domain-dag/scripts/valid
 
 Run each focused command once; run the stale-context and stale queue-control generation cases 20 times with `PI_RELIABILITY_SEED=2026072201`. The test harness added by the PR must print the seed on failure. Merge only after independent review confirms generation invalidation and exact fail-closed audit behavior.
 
+Operator waiver recorded 2026-07-23: canonical S0 PR `ststgc/pi-telegram#1` may merge without hosted GitHub Actions because the newly created fork had no registered workflow runs and the operator explicitly chose local-only validation for this PR. Required replacement evidence is clean Node `22.22.3` `npm ci` + full `npm run validate`, focused tests, 20/20 seeded race repetitions, Domain DAG, private tarball consumer import smoke, exact package inspection, and independent no-finding review. This waiver applies only to S0 PR #1; P0, P1, `dev -> main`, exact-tag release, and the completion audit retain their hosted OS-matrix requirements unless separately reviewed and explicitly changed.
+
 ## 4. Complete finding disposition inventory
 
 `FIXED UPSTREAM` means no implementation is planned; retain or add only a focused non-regression if the touched P0/P1 code could regress it. `RESIDUAL` identifies the owning slice below. `REJECTED/INVESTIGATE` gives the required evidence action and may not be silently promoted into implementation.
