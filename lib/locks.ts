@@ -340,6 +340,8 @@ function isAbandonedLockTransaction(path: string): boolean {
 
 const TELEGRAM_TRANSACTION_RECLAIM_PATTERN =
   /^owner\.reclaim\.(\d+)\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.json$/u;
+// Keep the pre-rename key so co-loaded @llblab and @ststgc package copies
+// serialize transaction recovery through one process-global set.
 const TELEGRAM_ACTIVE_TRANSACTION_RECLAIMS = Symbol.for(
   "@llblab/pi-telegram/active-transaction-reclaims",
 );

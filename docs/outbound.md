@@ -82,16 +82,16 @@ Voice replies use one fallback pipeline:
 
 1. configured `outboundHandlers` with `type: "voice"` in `telegram.json` order
 2. programmatic `registerTelegramOutboundHandler("voice", ...)` handlers
-3. registered voice synthesis providers from `@llblab/pi-telegram/voice`
+3. registered voice synthesis providers from `@ststgc/pi-telegram/voice`
 
 This makes provider extensions a zero-config convenience without overriding explicit operator-owned `telegram.json` handlers. If several synthesis providers are registered, they are tried in registration order; the first provider that returns a valid `.ogg`/`.opus` artifact handles the reply. Returning `undefined` passes to the next provider, while thrown errors or invalid files are recorded before the next fallback is tried.
 
 ## Voice Synthesis Provider API
 
-Voice replies can be delivered by synthesis providers registered through `@llblab/pi-telegram/voice`:
+Voice replies can be delivered by synthesis providers registered through `@ststgc/pi-telegram/voice`:
 
 ```ts
-import { registerTelegramVoiceSynthesisProvider } from "@llblab/pi-telegram/voice";
+import { registerTelegramVoiceSynthesisProvider } from "@ststgc/pi-telegram/voice";
 
 const dispose = registerTelegramVoiceSynthesisProvider(
   async (text, options) => {

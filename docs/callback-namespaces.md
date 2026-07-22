@@ -37,7 +37,7 @@ Layered extensions may intercept that message and handle their own namespace. If
 
 ## Extension sections
 
-[Telegram Extension Sections](./sections.md) are a higher-level UI contract over this namespace rule. A section owns a canonical extension identity such as `@llblab/pi-telegram-explorer`, but its Telegram `callback_data` should use the `pi-telegram` owned `section:` prefix plus a compact token, because Telegram limits callback payloads to 64 bytes.
+[Telegram Extension Sections](./sections.md) are a higher-level UI contract over this namespace rule. A section owns a canonical extension identity such as `@scope/pi-telegram-explorer`, but its Telegram `callback_data` should use the `pi-telegram` owned `section:` prefix plus a compact token, because Telegram limits callback payloads to 64 bytes.
 
 Conceptual form:
 

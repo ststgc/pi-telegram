@@ -1,10 +1,7 @@
 {
-  "name": "@llblab/pi-telegram",
+  "name": "@ststgc/pi-telegram",
   "version": "0.24.2",
-  "private": false,
-  "publishConfig": {
-    "access": "public"
-  },
+  "private": true,
   "description": "Telegram runtime adapter for Pi",
   "keywords": [
     "pi-package",
@@ -17,11 +14,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/llblab/pi-telegram.git"
+    "url": "https://github.com/ststgc/pi-telegram.git"
   },
-  "homepage": "https://github.com/llblab/pi-telegram",
+  "homepage": "https://github.com/ststgc/pi-telegram",
   "bugs": {
-    "url": "https://github.com/llblab/pi-telegram/issues"
+    "url": "https://github.com/ststgc/pi-telegram/issues"
   },
   "engines": {
     "node": ">=22.19.0"
@@ -63,7 +60,7 @@
     "extensions": [
       "./index.ts"
     ],
-    "image": "https://github.com/llblab/pi-telegram/raw/main/screenshot.png"
+    "image": "https://github.com/ststgc/pi-telegram/raw/main/screenshot.png"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": ">=0.80.6",

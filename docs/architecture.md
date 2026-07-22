@@ -294,7 +294,7 @@ Unknown callback data outside owned prefixes is forwarded as `[callback] <data>`
 - Raw update observation/consumption: [Updates](./updates.md).
 - Telegram-native slash commands: `registerTelegramCommand()` from [Public API](./public-api.md#commands).
 - Target-aware operational views and chat actions: [Telegram Delivery API](./delivery.md).
-- Normalized non-blocking Pi lifecycle events: [Telegram Activity API](./activity.md); the separate [`pi-telegram-extension-demo`](https://github.com/llblab/pi-telegram-extension-demo) project remains the companion-extension reference.
+- Normalized non-blocking Pi lifecycle events: [Telegram Activity API](./activity.md); the separate [`pi-telegram-extension-demo`](https://github.com/llblab/pi-telegram-extension-demo) project remains a historical upstream companion-extension reference and may still use legacy package coordinates.
 - Structured inline UI sections: [Sections](./sections.md).
 - Callback namespace discipline: [Callback Namespaces](./callback-namespaces.md).
 - Voice/STT/TTS providers: [Voice Integration](./voice.md).

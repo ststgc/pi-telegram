@@ -1,10 +1,12 @@
 # P0/P1 Reliability, Safety, Merge, and GitHub Release Execution Contract
 
-Status: plan quality gate clean after 3/3 review rounds and parent final audit
+Status: plan quality gate clean after 3/3 review rounds and parent final audit; amended by explicit operator decisions on 2026-07-22/23
 Baseline date: 2026-07-22
-Implementation base: `origin/dev` at `a674c55` (`0.24.2`)
-Release baseline: `origin/main` at `1a1d4a6`, tag `v0.24.2`
-Execution scope: prerequisite semantic port excluding Telegram `/new`, all residual P0, all residual P1, merge promotion, tag, and GitHub Release
+Canonical repository: `https://github.com/ststgc/pi-telegram` (`origin`); `https://github.com/llblab/pi-telegram` is read-only historical upstream
+Canonical package/import namespace: `@ststgc/pi-telegram` (breaking rename from `@llblab/pi-telegram`); GitHub-only distribution remains mandatory and the manifest stays `private: true` with no publish config
+Implementation base: canonical `origin/dev` at `a674c55` (`0.24.2`)
+Release baseline: canonical `origin/main` at `1a1d4a6`, tag `v0.24.2`
+Execution scope: prerequisite semantic port and canonical identity migration excluding Telegram `/new`, all residual P0, all residual P1, merge promotion, tag, and GitHub Release
 
 ## 0. Plan quality contract
 
@@ -53,11 +55,11 @@ The release guarantees:
 
 Fetched refs establish:
 
-- `origin/dev = a674c55b5b24042b1d35c74d265acfed0a7c9cf8` (`0.24.2: context compression hotfix`).
-- `origin/main = 1a1d4a67bfdeab2e7cd838c2dcfee36da369f518`, tag `v0.24.2`, merge PR `#141` from `llblab/dev`.
-- Recent release PRs `#139`, `#140`, and `#141` establish `dev -> main` as the release promotion path.
+- Canonical `origin/dev = a674c55b5b24042b1d35c74d265acfed0a7c9cf8` (`0.24.2: context compression hotfix`).
+- Canonical `origin/main = 1a1d4a67bfdeab2e7cd838c2dcfee36da369f518`, tag `v0.24.2`; this history entered through historical upstream merge PR `#141` from `llblab/dev`.
+- Historical upstream release PRs `#139`, `#140`, and `#141` establish the inherited `dev -> main` promotion path. All new PRs, merges, tags, and GitHub Releases target `ststgc/pi-telegram`; do not open further `llblab/pi-telegram` PRs.
 
-All prerequisite, P0, and P1 feature branches are created from the current accepted `dev` head and target **`dev`**. After each merge, the next branch starts from the newly fetched `origin/dev`. The final release PR is **`dev -> main`**. Never target feature PRs directly at `main`.
+All prerequisite, P0, and P1 feature branches are created from the current accepted canonical `dev` head and target **`dev`** in `ststgc/pi-telegram`. After each merge, the next branch starts from the newly fetched `origin/dev`. The final release PR is **`dev -> main`** in the canonical repository. Never target feature PRs directly at `main`, and never use the read-only `upstream` remote as a push/PR/release target.
 
 If `origin/dev` moves before implementation starts, first rebase the plan evidence onto the new head and re-run the upstream disposition scan; do not silently apply this contract to an unreviewed baseline. Once implementation starts, each PR records its exact base and head SHA.
 
@@ -311,7 +313,7 @@ A slice may add an id when source inspection finds another site, but it may not 
 
 **Outcome:** §3.2 behaviors are present on latest `dev`, and deterministic fault injection is available without shipping test-only policy.
 
-**Work:** copy this reviewed plan into the fresh worktree and verify its hash; perform the three-behavior semantic port; generation-bind queue control completion callbacks so old `onSettled` work cannot call status or dispatch after lifecycle replacement; implement and test the exact expiring audit policy from §3.3; add a test-only fault controller keyed by the bounded ids in §6; define serializable recovery contracts and version `1`; update the `/new` exclusion, audit-expiry record, and durable-retention disclosure draft. Do not activate durable storage yet.
+**Work:** copy this reviewed plan into the fresh worktree and verify its hash; migrate repository metadata and every current public package/import reference to canonical `ststgc/pi-telegram` / `@ststgc/pi-telegram` while preserving historical changelog facts and the legacy cross-version transaction-reclaim symbol key; perform the three-behavior semantic port; generation-bind queue control completion callbacks so old `onSettled` work cannot call status or dispatch after lifecycle replacement; implement and test the exact expiring audit policy from §3.3; add a test-only fault controller keyed by the bounded ids in §6; define serializable recovery contracts and version `1`; update the `/new` exclusion, audit-expiry record, and durable-retention disclosure draft. Do not activate durable storage yet.
 
 **Likely files:** this plan; current command/menu/model/status/binding/routing domains; package manifest/lockfile; `tests/commands.test.ts`, `tests/bindings.test.ts`, `tests/integration.test.ts`, `tests/queue.test.ts`, `tests/model.test.ts`, `tests/status.test.ts`; create the currently absent `tests/menu-model.test.ts` as the mirrored suite for changed `lib/menu-model.ts`; new recovery contract and mirrored test only if needed.
 
@@ -497,7 +499,7 @@ Create one stacked `reliability/p1-integration` branch from the P0-merged `origi
 ## 8. PR, merge, release, and rollback procedure
 
 1. Before any push, run `gh auth status`, `gh repo view --json nameWithOwner,defaultBranchRef`, and a read-only repository permission query. Confirm the authenticated identity can push branches, create/merge PRs, and create releases. Stop on missing permission without claiming completion.
-2. Use exactly three pre-release branches unless a reviewed correction requires otherwise: `reliability/custom-port` for S0, `reliability/p0-integration` for stacked P0-A..E commits, and `reliability/p1-integration` for stacked P1-A..C commits. Never mix P0 and P1 or change their order.
+2. Use exactly three pre-release branches in canonical `ststgc/pi-telegram` unless a reviewed correction requires otherwise: `reliability/custom-port` for S0, `reliability/p0-integration` for stacked P0-A..E commits, and `reliability/p1-integration` for stacked P1-A..C commits. Never mix P0 and P1 or change their order.
 3. Each of the three feature PRs targets `dev`, identifies base/head SHA, lists finding rows closed, includes focused/full command evidence and review disposition, and merges only the validated aggregate head. No force-push of reviewed heads.
 4. The single P0 integration PR merges to `dev` after the P0 gate. The single P1 integration PR merges only after P0 is present and revalidated on `origin/dev`. Fetch and verify `origin/dev` after each merge.
 5. P1-C prepares `0.25.0` as the final reviewed commit of `reliability/p1-integration`; the P1 aggregate gate and PR therefore include the manifest, both root lockfile version fields, consolidated `CHANGELOG.md`, workflows, and release docs. After the P1 PR merges, verify the resulting `origin/dev` still has all version fields at `0.25.0`. If `v0.25.0` already exists or baseline/version history changed, stop for a plan rebase rather than choosing another version silently.
@@ -543,17 +545,17 @@ SMOKE_DIR="$(mktemp -d)"
   npm install --ignore-scripts "$OLDPWD/$PACK_FILE"
   node --experimental-strip-types --input-type=module - <<'NODE'
 const paths = [
-  "@llblab/pi-telegram",
-  "@llblab/pi-telegram/inbound",
-  "@llblab/pi-telegram/outbound",
-  "@llblab/pi-telegram/delivery",
-  "@llblab/pi-telegram/activity",
-  "@llblab/pi-telegram/updates",
-  "@llblab/pi-telegram/commands",
-  "@llblab/pi-telegram/sections",
-  "@llblab/pi-telegram/status",
-  "@llblab/pi-telegram/voice",
-  "@llblab/pi-telegram/keyboard",
+  "@ststgc/pi-telegram",
+  "@ststgc/pi-telegram/inbound",
+  "@ststgc/pi-telegram/outbound",
+  "@ststgc/pi-telegram/delivery",
+  "@ststgc/pi-telegram/activity",
+  "@ststgc/pi-telegram/updates",
+  "@ststgc/pi-telegram/commands",
+  "@ststgc/pi-telegram/sections",
+  "@ststgc/pi-telegram/status",
+  "@ststgc/pi-telegram/voice",
+  "@ststgc/pi-telegram/keyboard",
 ];
 for (const path of paths) await import(path);
 console.log(`imported ${paths.length} public entrypoints`);
@@ -609,7 +611,7 @@ Do not declare completion until every item has linked command/review/PR/release 
 
 - [ ] Original dirty patch saved privately and hash verified as `b28d538d6f6b229cd64b600874a78b97c5909d210b8cc1cfad90f0d994ea75c7`; original worktree unchanged.
 - [ ] No cherry-pick or blind patch application from `eff2d10`/`bf76ab6`; four prerequisite behaviors are semantically ported and documented on current architecture.
-- [ ] Prerequisite PR merged to `dev`; Telegram `/new` remains excluded with no unsafe workaround, and the exact two-advisory audit policy passes before its deadline.
+- [ ] Prerequisite PR merged to canonical `ststgc/pi-telegram:dev`; repository/package/public imports use `ststgc` coordinates, the manifest is private with no npm publish config, historical changelog and legacy transaction-reclaim compatibility key remain intact, Telegram `/new` remains excluded with no unsafe workaround, and the exact two-advisory audit policy passes before its deadline.
 - [ ] Every §4 row has the stated implementation/regression/rejection evidence.
 - [ ] P0-A through P0-E focused commands, bounded fault ids, repeat counts, full gate, and three independent reviews pass.
 - [ ] The single P0 integration PR is merged to `dev` before P1 integration begins, and the merged ref is revalidated if its SHA differs.

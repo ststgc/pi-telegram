@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `Breaking Fork Identity`: Moved the canonical repository to `ststgc/pi-telegram` and the package/public import namespace from `@llblab/pi-telegram` to `@ststgc/pi-telegram`. Impact: Git installations and companion-extension imports must use the new coordinates; the private manifest fails closed against npm publication, and this release remains GitHub-only.
 - `Model Menu`: The Telegram model menu now opens on all authenticated models while keeping configured scoped models as an optional view. Impact: model discovery is complete by default without removing operator-curated shortcuts.
 - `Terminal Status`: Pi's terminal `telegram` status key is always cleared while Telegram menus and `/telegram-status` retain bridge state and diagnostics. Impact: the optional transport no longer occupies Pi's shared footer.
 - `Queue Lifecycle`: Agent-end cleanup ignores only stale-context status failures after typing teardown, and control settlement is fenced to its originating deferred-dispatch generation. Impact: real status failures still reject, while callbacks from a replaced session cannot update status or dispatch queued work through an old context.

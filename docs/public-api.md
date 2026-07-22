@@ -16,22 +16,22 @@ The 0.21 Activity surface requires Pi `0.80.6` or newer. This minimum belongs to
 Preferred public imports:
 
 ```ts
-import telegram from "@llblab/pi-telegram";
-import { registerTelegramSection } from "@llblab/pi-telegram/sections";
-import { registerTelegramStatusLineProvider } from "@llblab/pi-telegram/status";
-import { registerTelegramUpdateHandler } from "@llblab/pi-telegram/updates";
-import { registerTelegramCommand } from "@llblab/pi-telegram/commands";
-import { registerTelegramInboundHandler } from "@llblab/pi-telegram/inbound";
-import { registerTelegramOutboundHandler } from "@llblab/pi-telegram/outbound";
-import { sendTelegramView } from "@llblab/pi-telegram/delivery";
-import { registerTelegramActivityHandler } from "@llblab/pi-telegram/activity";
+import telegram from "@ststgc/pi-telegram";
+import { registerTelegramSection } from "@ststgc/pi-telegram/sections";
+import { registerTelegramStatusLineProvider } from "@ststgc/pi-telegram/status";
+import { registerTelegramUpdateHandler } from "@ststgc/pi-telegram/updates";
+import { registerTelegramCommand } from "@ststgc/pi-telegram/commands";
+import { registerTelegramInboundHandler } from "@ststgc/pi-telegram/inbound";
+import { registerTelegramOutboundHandler } from "@ststgc/pi-telegram/outbound";
+import { sendTelegramView } from "@ststgc/pi-telegram/delivery";
+import { registerTelegramActivityHandler } from "@ststgc/pi-telegram/activity";
 import {
   registerTelegramVoiceSynthesisProvider,
   registerTelegramVoiceTranscriptionProvider,
-} from "@llblab/pi-telegram/voice";
+} from "@ststgc/pi-telegram/voice";
 ```
 
-`0.12.0` intentionally removes the published `@llblab/pi-telegram/lib/*.ts` compatibility wildcard. Integrations should use the public API domain subpaths above. Package exports point at `/api/*.ts` membranes that re-export only stable companion-extension symbols; implementation modules under `lib/` remain package-private. Telegram command extensions use `/commands` as an explicit opt-in surface instead of automatically exposing arbitrary Pi slash commands to Telegram. See [Public API Smoke Examples](#public-api-smoke-examples) below for minimal companion-extension patterns that avoid implementation imports.
+The canonical package intentionally does not export an `@ststgc/pi-telegram/lib/*.ts` compatibility wildcard. Integrations should use the public API domain subpaths above. Package exports point at `/api/*.ts` membranes that re-export only stable companion-extension symbols; implementation modules under `lib/` remain package-private. Telegram command extensions use `/commands` as an explicit opt-in surface instead of automatically exposing arbitrary Pi slash commands to Telegram. See [Public API Smoke Examples](#public-api-smoke-examples) below for minimal companion-extension patterns that avoid implementation imports.
 
 ## User-Facing API
 
@@ -205,11 +205,11 @@ This inventory maps the complete bridge capability plane to its supported extens
 - **General configuration mutation:** Companions own their configuration and Settings state. pi-telegram does not expose unrestricted mutation of `telegram.json`, profile identity, pairing, rendering, queue, or transport settings.
 - **Process and session control:** Reload, new-session, fork, resume, process launch, and arbitrary Pi slash-command dispatch remain outside the Telegram companion API until Pi exposes safe async extension hooks.
 
-The 0.21 platform boundary lets a public-import-only consumer own reasoning, intermediate-prose, and tool-row policy while pi-telegram retains target selection, transport, authorization, lifecycle safety, and delivery ordering. Activity-specific examples live in this documentation; the separate [`pi-telegram-extension-demo`](https://github.com/llblab/pi-telegram-extension-demo) project remains the maintained companion-extension reference.
+The 0.21 platform boundary lets a public-import-only consumer own reasoning, intermediate-prose, and tool-row policy while pi-telegram retains target selection, transport, authorization, lifecycle safety, and delivery ordering. Activity-specific examples live in this documentation; the separate [`pi-telegram-extension-demo`](https://github.com/llblab/pi-telegram-extension-demo) project is a historical upstream companion-extension reference and may still use legacy package coordinates.
 
 ## Commands
 
-Import from `@llblab/pi-telegram/commands`. This registers Telegram slash commands only; it does not expose Pi slash commands and is unrelated to command-template handlers.
+Import from `@ststgc/pi-telegram/commands`. This registers Telegram slash commands only; it does not expose Pi slash commands and is unrelated to command-template handlers.
 
 ```ts
 const off = registerTelegramCommand({
@@ -237,7 +237,7 @@ Core commands stay reserved for bridge lifecycle, transport ownership, queue saf
 
 ## Sections
 
-Import from `@llblab/pi-telegram/sections`.
+Import from `@ststgc/pi-telegram/sections`.
 
 ```ts
 const unregister = registerTelegramSection({
@@ -273,7 +273,7 @@ Full behavior: [Extension Sections](./sections.md).
 
 ## Telegram Delivery API
 
-Import from `@llblab/pi-telegram/delivery`.
+Import from `@ststgc/pi-telegram/delivery`.
 
 ```ts
 const sent = await sendTelegramView(
@@ -294,7 +294,7 @@ Full behavior: [Telegram Delivery API](./delivery.md).
 
 ## Telegram Activity API
 
-Import from `@llblab/pi-telegram/activity`.
+Import from `@ststgc/pi-telegram/activity`.
 
 ```ts
 const off = registerTelegramActivityHandler({
@@ -315,7 +315,7 @@ Full behavior and consumer policy examples: [Telegram Activity API](./activity.m
 
 ## Status Lines
 
-Import from `@llblab/pi-telegram/status`.
+Import from `@ststgc/pi-telegram/status`.
 
 ```ts
 const off = registerTelegramStatusLineProvider(
@@ -336,7 +336,7 @@ Contract:
 
 ## Updates
 
-Import from `@llblab/pi-telegram/updates`.
+Import from `@ststgc/pi-telegram/updates`.
 
 ```ts
 const off = registerTelegramUpdateHandler(async (update) => {
@@ -354,7 +354,7 @@ Full behavior: [Updates](./updates.md).
 
 ## Inbound
 
-Import from `@llblab/pi-telegram/inbound`.
+Import from `@ststgc/pi-telegram/inbound`.
 
 ```ts
 const off = registerTelegramInboundHandler("document", async ({ file }) => {
@@ -375,7 +375,7 @@ Full behavior: [Inbound Handlers](./inbound.md).
 
 ## Outbound
 
-Import from `@llblab/pi-telegram/outbound`.
+Import from `@ststgc/pi-telegram/outbound`.
 
 ```ts
 const off = registerTelegramOutboundHandler("text", async (text) => {
@@ -389,7 +389,7 @@ Full behavior: [Outbound Handlers](./outbound.md).
 
 ## Voice Providers
 
-Import from `@llblab/pi-telegram/voice`.
+Import from `@ststgc/pi-telegram/voice`.
 
 ```ts
 const offStt = registerTelegramVoiceTranscriptionProvider(
@@ -417,13 +417,13 @@ Full behavior: [Voice Integration](./voice.md).
 
 ## Public API Smoke Examples
 
-Minimal companion-extension examples that import only stable `@llblab/pi-telegram/*` public membranes. Copy one into an extension `index.ts`, load it beside `pi-telegram`, and verify that it starts without importing any `@llblab/pi-telegram/lib/*` implementation path.
+Minimal companion-extension examples that import only stable `@ststgc/pi-telegram/*` public membranes. Copy one into an extension `index.ts`, load it beside `pi-telegram`, and verify that it starts without importing any `@ststgc/pi-telegram/lib/*` implementation path.
 
 ### Extension Sections
 
 ```ts
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { registerTelegramSection } from "@llblab/pi-telegram/sections";
+import { registerTelegramSection } from "@ststgc/pi-telegram/sections";
 
 export default function demoSection(pi: ExtensionAPI) {
   let unregister: (() => void) | undefined;
@@ -451,7 +451,7 @@ export default function demoSection(pi: ExtensionAPI) {
 
 ```ts
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { registerTelegramUpdateHandler } from "@llblab/pi-telegram/updates";
+import { registerTelegramUpdateHandler } from "@ststgc/pi-telegram/updates";
 
 export default function demoUpdates(pi: ExtensionAPI) {
   let unregister: (() => void) | undefined;
@@ -473,7 +473,7 @@ export default function demoUpdates(pi: ExtensionAPI) {
 
 ```ts
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { registerTelegramInboundHandler } from "@llblab/pi-telegram/inbound";
+import { registerTelegramInboundHandler } from "@ststgc/pi-telegram/inbound";
 
 export default function demoInbound(pi: ExtensionAPI) {
   let unregister: (() => void) | undefined;
@@ -495,7 +495,7 @@ export default function demoInbound(pi: ExtensionAPI) {
 
 ```ts
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { registerTelegramOutboundHandler } from "@llblab/pi-telegram/outbound";
+import { registerTelegramOutboundHandler } from "@ststgc/pi-telegram/outbound";
 
 export default function demoOutbound(pi: ExtensionAPI) {
   let unregister: (() => void) | undefined;
@@ -521,7 +521,7 @@ import {
   getTelegramVoiceSendTranscript,
   registerTelegramVoiceSynthesisProvider,
   registerTelegramVoiceTranscriptionProvider,
-} from "@llblab/pi-telegram/voice";
+} from "@ststgc/pi-telegram/voice";
 
 export default function demoVoice(pi: ExtensionAPI) {
   let unregisterTts: (() => void) | undefined;
@@ -562,8 +562,8 @@ async function synthesizeDemoOgg(_text: string): Promise<string> {
 
 ### Smoke Checklist
 
-- The extension imports only public package membranes: `@llblab/pi-telegram`, `/commands`, `/sections`, `/status`, `/delivery`, `/activity`, `/updates`, `/inbound`, `/outbound`, `/voice`, or `/keyboard`.
-- It does not import `@llblab/pi-telegram/lib/*`.
+- The extension imports only public package membranes: `@ststgc/pi-telegram`, `/commands`, `/sections`, `/status`, `/delivery`, `/activity`, `/updates`, `/inbound`, `/outbound`, `/voice`, or `/keyboard`.
+- It does not import `@ststgc/pi-telegram/lib/*`.
 - It registers on `session_start` and disposes on `session_shutdown`.
 - Stable high-level registrations use durable ids.
 - Failures are visible during manual testing through `/telegram-status` or extension-owned logging.
