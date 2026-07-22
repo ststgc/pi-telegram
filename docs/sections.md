@@ -29,7 +29,7 @@ Each section has one stable identity key. Use the same rules as the Extension Lo
 3. File basename for single-file extensions
 
 ```
-extensions/pi-telegram-extension-demo/package.json name=@llblab/pi-telegram-extension-demo → @llblab/pi-telegram-extension-demo
+extensions/pi-telegram-extension-demo/package.json name=@scope/pi-telegram-extension-demo → @scope/pi-telegram-extension-demo
 extensions/pi-telegram-extension-demo/index.ts without package.json              → pi-telegram-extension-demo
 extensions/pi-telegram-extension-demo.ts                                         → pi-telegram-extension-demo
 ```
@@ -39,12 +39,12 @@ The `id` is the owner identity. No separate `owner` field. Used for registry own
 ## 4. Registration Shape
 
 ```ts
-import { registerTelegramSection } from "@llblab/pi-telegram/sections";
+import { registerTelegramSection } from "@ststgc/pi-telegram/sections";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
   const unregister = registerTelegramSection({
-    id: "@llblab/pi-telegram-extension-demo",
+    id: "@scope/pi-telegram-extension-demo",
     label: "🧪 Demo submenu",
     order: 10,
     getLabel: () => `${flag ? "🟢" : "⚫️"} Demo submenu`,
@@ -129,9 +129,9 @@ unregister(); // removes from main menu, settings, and callback routing
 
 Two paths, same registry:
 
-**Typed import (preferred):** Extension imports `registerTelegramSection` from `@llblab/pi-telegram/sections`. The function reads from a `globalThis` registry set by `pi-telegram` at startup. In `0.12.0`, package-private `@llblab/pi-telegram/lib/*.ts` deep imports are no longer exported.
+**Typed import (preferred):** Extension imports `registerTelegramSection` from `@ststgc/pi-telegram/sections`. The function reads from a `globalThis` registry set by `pi-telegram` at startup. Package-private `@ststgc/pi-telegram/lib/*.ts` deep imports are not exported.
 
-**Relative import (local):** When the extension cannot resolve `@llblab/pi-telegram` as an npm package, use the public API membrane via a relative path:
+**Relative import (local):** When the extension cannot resolve `@ststgc/pi-telegram` as an npm package, use the public API membrane via a relative path:
 
 ```ts
 import { registerTelegramSection } from "../pi-telegram/api/sections.ts";
@@ -181,7 +181,7 @@ Ordered by `settings.order` (lower first), then `id` alphabetically.
 
 ### Token mapping
 
-Telegram limits `callback_data` to 64 bytes. Full npm names like `@llblab/pi-telegram-explorer` often exceed this. `pi-telegram` maps each registered section to a compact numeric token:
+Telegram limits `callback_data` to 64 bytes. Full npm names like `@scope/pi-telegram-explorer` often exceed this. `pi-telegram` maps each registered section to a compact numeric token:
 
 ```text
 section:<token>:<action>:<payload>
@@ -384,7 +384,7 @@ The platform inherits from Pi's own extension model:
 
 - `export default function(pi)` → `registerTelegramSection(section)`
 - `pi.on("shutdown", ...)` → disposer from `registerTelegramSection`
-- Typed imports → typed import from `@llblab/pi-telegram/sections`
+- Typed imports → typed import from `@ststgc/pi-telegram/sections`
 - `globalThis` registry → `__piTelegramSectionRegistry__` on `globalThis`
 - Identity from `package.json/name` → same identity rules as Locks Standard
 - Narrow typed context ports → `TelegramSectionContext` / `TelegramSectionCallbackContext`
@@ -441,11 +441,11 @@ Available programmatically via `getTelegramSectionDiagnostics()`. Main-menu/sett
 
 ## 15. Demo Extension
 
-[`@llblab/pi-telegram-extension-demo`](https://github.com/llblab/pi-telegram-extension-demo) is the maintained companion-extension reference:
+[`@llblab/pi-telegram-extension-demo`](https://github.com/llblab/pi-telegram-extension-demo) is a historical upstream companion-extension reference and may still use legacy package coordinates:
 
 - Main-menu and Settings surfaces with dynamic labels.
 - Managed section callbacks, buttons, edits, navigation, and cleanup.
-- Public `@llblab/pi-telegram/*` imports rather than package-private `/lib` paths.
+- Its section patterns remain useful, but replace any legacy package coordinates with current public `@ststgc/pi-telegram/*` imports before use.
 - Independent package and lifecycle ownership outside pi-telegram core.
 
 Use it as a template for section-based extensions. Activity-specific registration and delivery patterns remain in [Telegram Activity API](./activity.md); pi-telegram does not duplicate the demo as an in-package `examples/` directory.

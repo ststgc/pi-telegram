@@ -10,21 +10,17 @@ It is a **runtime adapter**, not a remote terminal. Start or supervise work in t
 
 Proactive push is enabled by default. `assistant.proactivePush` projects every completed public assistant text block from local or autonomous work—including visible checkpoints and the final answer—to the authorized Telegram target once and in order; set it explicitly to `false` to disable projection. It never mirrors local prompts, hidden reasoning, tool traffic, token deltas, Telegram-owned turns, or stale-generation work. See [Outbound](docs/outbound.md#proactive-public-output) and the [configuration reference](docs/public-api.md#configuration-api).
 
-This repository is an actively maintained fork of [`badlogic/pi-telegram`](https://github.com/badlogic/pi-telegram). It started from upstream commit [`cb34008`](https://github.com/badlogic/pi-telegram/commit/cb34008460b6c1ca036d92322f69d87f626be0fc) and has since diverged substantially.
+This repository is the independently maintained `ststgc/pi-telegram` fork of [`badlogic/pi-telegram`](https://github.com/badlogic/pi-telegram). Its lineage started from upstream commit [`cb34008`](https://github.com/badlogic/pi-telegram/commit/cb34008460b6c1ca036d92322f69d87f626be0fc), passed through the `llblab` fork, and now develops and releases from this repository as its canonical source.
 
 ## Install
 
-From npm:
+Install from the canonical GitHub repository:
 
 ```bash
-pi install npm:@llblab/pi-telegram
+pi install git:github.com/ststgc/pi-telegram
 ```
 
-From git:
-
-```bash
-pi install git:github.com/llblab/pi-telegram
-```
+The package manifest and public import namespace are `@ststgc/pi-telegram`. This release line is distributed through GitHub rather than npm; no `npm:@ststgc/pi-telegram` publication is claimed.
 
 The 0.21 extension platform requires Pi `0.80.6` or newer. Its Activity API uses the public `agent_settled` lifecycle event to keep retries/continuations under one activity identity and release that identity only after the run fully settles.
 
@@ -161,7 +157,7 @@ Named profile identifiers contain only lowercase ASCII letters and digits (maxim
 
 ### Operator Menu
 
-`/start` opens the Telegram-native control panel: status, prompt-template commands, model selection, thinking level, settings, queue controls, and extension sections. It is the primary Telegram UI; reaction shortcuts are secondary queue affordances.
+`/start` opens the Telegram-native control panel: status, prompt-template commands, model selection, thinking level, settings, queue controls, and extension sections. It is the primary Telegram UI; reaction shortcuts are secondary queue affordances. The model picker opens on all authenticated models by default, with configured scoped models available as an optional view. Pi's terminal `telegram` status key stays clear; connection and runtime diagnostics remain available in this menu and `/telegram-status`.
 
 ### Queue Runtime
 
@@ -277,6 +273,8 @@ Full validation:
 ```bash
 npm run validate
 ```
+
+`npm run audit` executes raw npm audit and then applies a fail-closed temporary policy for two findings pinned inside Pi's published shrinkwrap: `brace-expansion@5.0.6` (`GHSA-3jxr-9vmj-r5cp`) and `protobufjs@7.6.4` (`GHSA-j3f2-48v5-ccww`). It verifies exact advisory sources, graph, installed paths/versions, and rejects every other finding. The exception expires after 2026-08-21 UTC; see [BACKLOG.md](./BACKLOG.md).
 
 Project context:
 
