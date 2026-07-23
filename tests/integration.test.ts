@@ -15,6 +15,8 @@ import * as BusApi from "../lib/bus-api.ts";
 import * as BusLeader from "../lib/bus-leader.ts";
 import * as Bus from "../lib/bus.ts";
 import * as Delivery from "../lib/delivery.ts";
+import * as Locks from "../lib/locks.ts";
+import * as Polling from "../lib/polling.ts";
 import type { TelegramBridgeApiRuntime } from "../lib/telegram-api.ts";
 
 type RuntimeTestHandler = (context: TestContext) => void | Promise<void>;
@@ -43,6 +45,138 @@ async function getRuntimeTelegramExtension(): Promise<RuntimeTelegramExtension> 
   runtimeTelegramExtension = (await import("../index.ts")).default;
   return runtimeTelegramExtension;
 }
+
+test("Poll supervisor terminal failure stops bus transport and releases the exact lease", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-poll-terminal-"));
+  const socketPath = join(dir, "bus.sock");
+  const registry = Bus.createTelegramBusFollowerRegistry();
+  const events: string[] = [];
+  const ctx = { cwd: dir };
+  const pollingState = Polling.createTelegramPollingControllerState();
+  const terminalBinding = Polling.createTelegramPollingTerminalLeaseBinding();
+  let rejectPoll: ((error: Error) => void) | undefined;
+  const pollingController = Polling.createTelegramPollingControllerRuntime<
+    { update_id: number },
+    typeof ctx
+  >({
+    state: pollingState,
+    getConfig: () => ({ botToken: "123:abc", lastUpdateId: 1 }),
+    hasBotToken: () => true,
+    deleteWebhook: async () => {},
+    getUpdates: async () => {
+      events.push("poll:start");
+      return new Promise<never>((_resolve, reject) => {
+        rejectPoll = reject;
+      });
+    },
+    persistConfig: async () => {},
+    handleUpdate: async () => {},
+    stopTypingLoop: () => {},
+    updateStatus: () => {},
+    maxRestarts: 0,
+    supervisorSleep: async () => {},
+    onTerminalFailure: async (info) => {
+      await terminalBinding.handle(info);
+    },
+  });
+  const busRuntime = BusLeader.createTelegramBusLeaderRuntime({
+    socketPath,
+    followerRegistry: registry,
+    followerPruneIntervalMs: 5,
+    followerStaleAfterMs: 5,
+    startPolling: pollingController.start,
+    stopPolling: async () => {
+      events.push("poll:stop");
+      await pollingController.stop();
+    },
+  });
+  const lock = Locks.createTelegramLockRuntime<typeof ctx>({
+    key: "terminal-test",
+    locksPath: join(dir, "owners.json"),
+    pid: 4242,
+    instanceId: "leader",
+    isProcessAlive: () => true,
+  });
+  const lockedRuntime = Locks.createTelegramLockedPollingRuntime({
+    lock,
+    hasBotToken: () => true,
+    ownershipCheckMs: 5,
+    ownershipRefreshMs: 5,
+    startPolling: async () => {
+      events.push("health:start");
+      await busRuntime.startPolling(ctx);
+    },
+    stopPolling: async () => {
+      events.push("health:stop");
+      await busRuntime.stopPolling();
+    },
+    updateStatus: () => {},
+  });
+  terminalBinding.set(
+    Polling.createTelegramPollingTerminalLeaseHandler({
+      state: pollingState,
+      terminalizeTransportLease: lockedRuntime.terminalizeTransportLease,
+    }),
+  );
+  try {
+    assert.equal((await lockedRuntime.start(ctx)).ok, true);
+    assert.equal(lock.owns(ctx), true);
+    await waitForEventLoopCondition(() => rejectPoll !== undefined);
+    assert.equal(
+      (
+        await Bus.sendTelegramBusLocalEnvelope({
+          socketPath,
+          envelope: {
+            kind: "follower.register",
+            requestId: "follower:1",
+            registration: {
+              instanceId: "follower",
+              connectedAtMs: 1,
+              registrationGeneration: "follower:1",
+            },
+          },
+        })
+      )?.kind,
+      "bus.ack",
+    );
+    const failPoll = rejectPoll;
+    assert.ok(failPoll);
+    failPoll(new Error("simulated getUpdates transport failure"));
+    await waitForCondition(
+      () =>
+        !lock.owns(ctx) &&
+        pollingState.terminalizingGeneration === undefined &&
+        !Polling.isTelegramPollingControllerActive(pollingState),
+    );
+    assert.equal(lock.owns(ctx), false);
+    assert.deepEqual(events, [
+      "health:start",
+      "poll:start",
+      "health:stop",
+      "poll:stop",
+    ]);
+    assert.deepEqual(registry.list(), []);
+    await assert.rejects(
+      Bus.sendTelegramBusLocalEnvelope({
+        socketPath,
+        envelope: {
+          kind: "follower.heartbeat",
+          requestId: "follower:2",
+          instanceId: "follower",
+          sentAtMs: 2,
+        },
+        timeoutMs: 50,
+      }),
+    );
+    registry.register({ instanceId: "prune-probe", connectedAtMs: 0 });
+    await waitForTimeout(20);
+    assert.equal(registry.get("prune-probe")?.instanceId, "prune-probe");
+    assert.equal(events.filter((event) => event === "health:stop").length, 1);
+  } finally {
+    await busRuntime.stopPolling().catch(() => undefined);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 async function flushMicrotasks(iterations = 10): Promise<void> {
   for (let i = 0; i < iterations; i++) {

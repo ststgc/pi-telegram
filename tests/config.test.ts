@@ -700,6 +700,32 @@ test("Polling offset persistence cannot erase settings written after poll start"
   });
 });
 
+test("Failed polling offset persistence leaves the request offset unchanged", async () => {
+  const current: TelegramConfig = {
+    botToken: "123:abc",
+    lastUpdateId: 10,
+  };
+  const store = {
+    get: () => current,
+    persist: async () => {},
+  };
+  let attempted: TelegramConfig | undefined;
+  const persistOffset = createTelegramPollingOffsetPersister(
+    store,
+    async (next) => {
+      attempted = next;
+      throw new Error("disk unavailable");
+    },
+  );
+
+  await assert.rejects(
+    persistOffset({ lastUpdateId: 11 }),
+    /disk unavailable/,
+  );
+  assert.equal(store.get().lastUpdateId, 10);
+  assert.equal(attempted?.lastUpdateId, 11);
+});
+
 test("Stale same-profile polling persistence preserves settings from another instance", async () => {
   const agentDir = await mkdtemp(
     join(tmpdir(), "pi-telegram-cross-instance-settings-"),

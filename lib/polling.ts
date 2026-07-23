@@ -27,6 +27,45 @@ const TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_LIMIT = 3;
 const TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_MS = 1_000;
 const TELEGRAM_GET_UPDATES_CONFLICT_SLOW_RETRY_MS = 3_000;
 const TELEGRAM_POLLING_RETRY_MS = 3_000;
+export const TELEGRAM_POLLING_SUPERVISOR_DEFAULT_MAX_RESTARTS = 3;
+export const TELEGRAM_POLLING_SUPERVISOR_RESTART_BASE_MS = 250;
+export const TELEGRAM_POLLING_SUPERVISOR_RESTART_MAX_MS = 2_000;
+
+export type TelegramPollingFailurePhase =
+  | "bootstrap"
+  | "api"
+  | "persist"
+  | "handler"
+  | "retry-sleep"
+  | "loop-exit";
+
+export interface TelegramPollingSupervisorTerminalInfo {
+  phase: TelegramPollingFailurePhase;
+  restartCount: number;
+  generation: number;
+  startedAtMs: number;
+  failedAtMs: number;
+  permanent: boolean;
+}
+
+class TelegramPollingPhaseError extends Error {
+  readonly phase: TelegramPollingFailurePhase;
+  override readonly cause: unknown;
+
+  constructor(phase: TelegramPollingFailurePhase, cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = "TelegramPollingPhaseError";
+    this.phase = phase;
+    this.cause = cause;
+  }
+}
+
+export class TelegramPollingPermanentConfigError extends Error {
+  constructor(message = "Telegram bot token is not configured") {
+    super(message);
+    this.name = "TelegramPollingPermanentConfigError";
+  }
+}
 
 // Standard Telegram DM polling does not expose ordinary message-deletion events,
 // so queue removal stays reaction-driven while delete-like business updates remain defensive-only.
@@ -88,10 +127,12 @@ export interface TelegramPollingStartState {
 export interface TelegramPollingControllerState {
   pollingPromise?: Promise<void>;
   pollingController?: AbortController;
+  generation: number;
+  terminalizingGeneration?: number;
 }
 
 export function createTelegramPollingControllerState(): TelegramPollingControllerState {
-  return {};
+  return { generation: 0 };
 }
 
 export function isTelegramPollingControllerActive(
@@ -118,6 +159,12 @@ export interface TelegramPollingRuntimeDeps<
   runPollLoop: (ctx: TContext, signal: AbortSignal) => Promise<void>;
   updateStatus: (ctx: TContext, message?: string) => void;
   createAbortController?: () => AbortController;
+  getCurrentGeneration?: () => number;
+  getTerminalizingGeneration?: () => number | undefined;
+  setTerminalizingGeneration?: (generation: number | undefined) => void;
+  onTerminalFailure?: (
+    info: TelegramPollingSupervisorTerminalInfo,
+  ) => Promise<void> | void;
 }
 
 export type TelegramPollingControllerDeps<TContext> = Omit<
@@ -142,6 +189,16 @@ export interface TelegramPollingControllerRuntimeDeps<
   hasBotToken: () => boolean;
   stopTypingLoop: () => unknown;
   createAbortController?: () => AbortController;
+  maxRestarts?: number;
+  restartBaseDelayMs?: number;
+  restartMaxDelayMs?: number;
+  restartSeed?: string;
+  supervisorSleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  getNowMs?: () => number;
+  isPermanentError?: (error: unknown) => boolean;
+  onTerminalFailure?: (
+    info: TelegramPollingSupervisorTerminalInfo,
+  ) => Promise<void> | void;
 }
 
 export function createTelegramPollingControllerRuntime<
@@ -150,24 +207,43 @@ export function createTelegramPollingControllerRuntime<
 >(
   deps: TelegramPollingControllerRuntimeDeps<TUpdate, TContext>,
 ): TelegramPollingController<TContext> {
+  const state = deps.state ?? createTelegramPollingControllerState();
+  const runPollLoop = createTelegramPollLoopRunner<TUpdate, TContext>({
+    getConfig: deps.getConfig,
+    deleteWebhook: deps.deleteWebhook,
+    getUpdates: deps.getUpdates,
+    persistConfig: deps.persistConfig,
+    handleUpdate: deps.handleUpdate,
+    prepareUpdateBatch: deps.prepareUpdateBatch,
+    updateStatus: deps.updateStatus,
+    sleep: deps.sleep,
+    maxUpdateFailures: deps.maxUpdateFailures,
+    isPermanentError: deps.isPermanentError,
+    propagateStop: true,
+    recordRuntimeEvent: deps.recordRuntimeEvent,
+  });
   return createTelegramPollingController({
-    state: deps.state,
+    state,
     hasBotToken: deps.hasBotToken,
     stopTypingLoop: deps.stopTypingLoop,
-    runPollLoop: createTelegramPollLoopRunner<TUpdate, TContext>({
-      getConfig: deps.getConfig,
-      deleteWebhook: deps.deleteWebhook,
-      getUpdates: deps.getUpdates,
-      persistConfig: deps.persistConfig,
-      handleUpdate: deps.handleUpdate,
-      prepareUpdateBatch: deps.prepareUpdateBatch,
-      updateStatus: deps.updateStatus,
-      sleep: deps.sleep,
-      maxUpdateFailures: deps.maxUpdateFailures,
+    runPollLoop: createTelegramPollingSupervisorRunner({
+      runPollLoop,
+      nextGeneration: () => {
+        state.generation += 1;
+        return state.generation;
+      },
+      maxRestarts: deps.maxRestarts,
+      restartBaseDelayMs: deps.restartBaseDelayMs,
+      restartMaxDelayMs: deps.restartMaxDelayMs,
+      restartSeed: deps.restartSeed,
+      sleep: deps.supervisorSleep,
+      getNowMs: deps.getNowMs,
+      isPermanentError: deps.isPermanentError,
       recordRuntimeEvent: deps.recordRuntimeEvent,
     }),
     updateStatus: deps.updateStatus,
     createAbortController: deps.createAbortController,
+    onTerminalFailure: deps.onTerminalFailure,
     recordRuntimeEvent: deps.recordRuntimeEvent,
   });
 }
@@ -178,6 +254,11 @@ export function createTelegramPollingController<TContext>(
   const state = deps.state ?? createTelegramPollingControllerState();
   const runtimeDeps: TelegramPollingRuntimeDeps<TContext> = {
     ...deps,
+    getCurrentGeneration: () => state.generation,
+    getTerminalizingGeneration: () => state.terminalizingGeneration,
+    setTerminalizingGeneration: (generation) => {
+      state.terminalizingGeneration = generation;
+    },
     getPollingPromise: () => state.pollingPromise,
     setPollingPromise: (promise) => {
       state.pollingPromise = promise;
@@ -195,9 +276,201 @@ export function createTelegramPollingController<TContext>(
 }
 
 export function shouldStartTelegramPolling(
-  state: TelegramPollingStartState,
+  state: TelegramPollingStartState & { hasTerminalizingGeneration?: boolean },
 ): boolean {
-  return state.hasBotToken && !state.hasPollingPromise;
+  return (
+    state.hasBotToken &&
+    !state.hasPollingPromise &&
+    !state.hasTerminalizingGeneration
+  );
+}
+
+export interface TelegramPollingTerminalLeaseHandler {
+  (info: TelegramPollingSupervisorTerminalInfo): Promise<boolean>;
+}
+
+export interface TelegramPollingTerminalLeaseBinding {
+  handle: TelegramPollingTerminalLeaseHandler;
+  set: (handler: TelegramPollingTerminalLeaseHandler) => void;
+}
+
+export function createTelegramPollingTerminalLeaseBinding(): TelegramPollingTerminalLeaseBinding {
+  let handler: TelegramPollingTerminalLeaseHandler | undefined;
+  return {
+    handle: async (info) => (handler ? handler(info) : false),
+    set(nextHandler) {
+      handler = nextHandler;
+    },
+  };
+}
+
+export function createTelegramPollingTerminalLeaseHandler(deps: {
+  state: TelegramPollingControllerState;
+  terminalizeTransportLease: () => Promise<void>;
+}): TelegramPollingTerminalLeaseHandler {
+  return async (info) => {
+    if (
+      deps.state.generation !== info.generation ||
+      deps.state.terminalizingGeneration !== info.generation
+    ) {
+      return false;
+    }
+    await deps.terminalizeTransportLease();
+    return true;
+  };
+}
+
+class TelegramPollingTerminalError extends Error {
+  readonly info: TelegramPollingSupervisorTerminalInfo;
+
+  constructor(info: TelegramPollingSupervisorTerminalInfo, cause: unknown) {
+    super("Telegram polling supervisor terminalized", { cause });
+    this.name = "TelegramPollingTerminalError";
+    this.info = info;
+  }
+}
+
+function hashTelegramPollingSeed(seed: string): number {
+  let hash = 2166136261;
+  for (const character of seed) {
+    hash ^= character.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+export function getTelegramPollingRestartDelayMs(
+  seed: string,
+  generation: number,
+  restartCount: number,
+  baseDelayMs = TELEGRAM_POLLING_SUPERVISOR_RESTART_BASE_MS,
+  maxDelayMs = TELEGRAM_POLLING_SUPERVISOR_RESTART_MAX_MS,
+): number {
+  const bound = Math.min(
+    maxDelayMs,
+    Math.max(0, baseDelayMs) * 2 ** Math.max(0, restartCount - 1),
+  );
+  let value = hashTelegramPollingSeed(
+    `${seed}:${generation}:${restartCount}`,
+  );
+  value ^= value << 13;
+  value ^= value >>> 17;
+  value ^= value << 5;
+  const fraction = (value >>> 0) / 0xffffffff;
+  return Math.floor(bound * (0.5 + fraction * 0.5));
+}
+
+export interface TelegramPollingSupervisorRunnerDeps<TContext>
+  extends TelegramRuntimeEventRecorderPort {
+  runPollLoop: (ctx: TContext, signal: AbortSignal) => Promise<void>;
+  nextGeneration: () => number;
+  maxRestarts?: number;
+  restartBaseDelayMs?: number;
+  restartMaxDelayMs?: number;
+  restartSeed?: string;
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  getNowMs?: () => number;
+  isPermanentError?: (error: unknown) => boolean;
+}
+
+function getTelegramPollingFailure(error: unknown): {
+  phase: TelegramPollingFailurePhase;
+  cause: unknown;
+} {
+  if (error instanceof TelegramPollingPhaseError) {
+    return { phase: error.phase, cause: error.cause };
+  }
+  return { phase: "api", cause: error };
+}
+
+export function createTelegramPollingSupervisorRunner<TContext>(
+  deps: TelegramPollingSupervisorRunnerDeps<TContext>,
+): (ctx: TContext, signal: AbortSignal) => Promise<void> {
+  const maxRestarts = Math.max(
+    0,
+    deps.maxRestarts ?? TELEGRAM_POLLING_SUPERVISOR_DEFAULT_MAX_RESTARTS,
+  );
+  const sleep = deps.sleep ?? sleepTelegramPollingRetry;
+  const now = deps.getNowMs ?? Date.now;
+  const seed = deps.restartSeed ?? process.env.PI_RELIABILITY_SEED ?? "polling";
+  return async (ctx, signal) => {
+    const generation = deps.nextGeneration();
+    const startedAtMs = now();
+    let restartCount = 0;
+    for (;;) {
+      let failure: { phase: TelegramPollingFailurePhase; cause: unknown };
+      try {
+        await deps.runPollLoop(ctx, signal);
+        if (signal.aborted) return;
+        failure = {
+          phase: "loop-exit",
+          cause: new Error("Telegram polling loop exited unexpectedly"),
+        };
+      } catch (error) {
+        if (shouldStopTelegramPolling(signal.aborted, error)) return;
+        failure = getTelegramPollingFailure(error);
+      }
+      const permanent =
+        failure.cause instanceof TelegramPollingPermanentConfigError ||
+        deps.isPermanentError?.(failure.cause) === true;
+      const failedAtMs = now();
+      deps.recordRuntimeEvent?.("polling", failure.cause, {
+        phase: failure.phase,
+        restartCount,
+        generation,
+        startedAtMs,
+        failedAtMs,
+      });
+      if (permanent || restartCount >= maxRestarts) {
+        throw new TelegramPollingTerminalError(
+          {
+            phase: failure.phase,
+            restartCount,
+            generation,
+            startedAtMs,
+            failedAtMs,
+            permanent,
+          },
+          failure.cause,
+        );
+      }
+      restartCount += 1;
+      const delayMs = getTelegramPollingRestartDelayMs(
+        seed,
+        generation,
+        restartCount,
+        deps.restartBaseDelayMs,
+        deps.restartMaxDelayMs,
+      );
+      try {
+        await sleep(delayMs, signal);
+      } catch (error) {
+        if (shouldStopTelegramPolling(signal.aborted, error)) return;
+        const sleepFailedAtMs = now();
+        deps.recordRuntimeEvent?.("polling", error, {
+          phase: "retry-sleep",
+          restartCount,
+          generation,
+          startedAtMs,
+          failedAtMs: sleepFailedAtMs,
+        });
+        if (restartCount >= maxRestarts) {
+          throw new TelegramPollingTerminalError(
+            {
+              phase: "retry-sleep",
+              restartCount,
+              generation,
+              startedAtMs,
+              failedAtMs: sleepFailedAtMs,
+              permanent: false,
+            },
+            error,
+          );
+        }
+      }
+      if (signal.aborted) return;
+    }
+  };
 }
 
 export async function stopTelegramPollingRuntime<TContext>(
@@ -244,22 +517,58 @@ export function startTelegramPollingRuntime<TContext>(
     !shouldStartTelegramPolling({
       hasBotToken: deps.hasBotToken(),
       hasPollingPromise: !!deps.getPollingPromise(),
+      hasTerminalizingGeneration:
+        deps.getTerminalizingGeneration?.() !== undefined,
     })
   ) {
     return;
   }
   const controller = deps.createAbortController?.() ?? new AbortController();
   deps.setPollingController(controller);
+  let terminalInfo: TelegramPollingSupervisorTerminalInfo | undefined;
   let promise: Promise<void>;
-  promise = deps.runPollLoop(ctx, controller.signal).finally(() => {
-    if (deps.getPollingPromise() === promise) deps.setPollingPromise(undefined);
-    if (deps.getPollingController() === controller) {
-      deps.setPollingController(undefined);
-    }
-    updateTelegramPollingStatusSafely(deps.updateStatus, ctx, {
-      recordRuntimeEvent: deps.recordRuntimeEvent,
+  promise = deps
+    .runPollLoop(ctx, controller.signal)
+    .catch((error) => {
+      if (error instanceof TelegramPollingTerminalError) {
+        terminalInfo = error.info;
+        deps.setTerminalizingGeneration?.(error.info.generation);
+        return;
+      }
+      deps.recordRuntimeEvent?.("polling", error, { phase: "controller" });
+    })
+    .finally(() => {
+      if (deps.getPollingPromise() === promise)
+        deps.setPollingPromise(undefined);
+      if (deps.getPollingController() === controller) {
+        deps.setPollingController(undefined);
+      }
+      updateTelegramPollingStatusSafely(deps.updateStatus, ctx, {
+        recordRuntimeEvent: deps.recordRuntimeEvent,
+      });
+    })
+    .then(async () => {
+      if (!terminalInfo) return;
+      const generation = terminalInfo.generation;
+      try {
+        if (
+          !controller.signal.aborted &&
+          deps.getCurrentGeneration?.() === generation &&
+          deps.getTerminalizingGeneration?.() === generation
+        ) {
+          await deps.onTerminalFailure?.(terminalInfo);
+        }
+      } catch (error) {
+        deps.recordRuntimeEvent?.("polling", error, {
+          phase: "terminal-hook",
+          generation,
+        });
+      } finally {
+        if (deps.getTerminalizingGeneration?.() === generation) {
+          deps.setTerminalizingGeneration?.(undefined);
+        }
+      }
     });
-  });
   deps.setPollingPromise(promise);
   updateTelegramPollingStatusSafely(deps.updateStatus, ctx, {
     recordRuntimeEvent: deps.recordRuntimeEvent,
@@ -896,6 +1205,10 @@ export function createTelegramThreadCapabilityMonitor<TContext>(
   };
 }
 
+interface TelegramPollingAdmissionState {
+  admittedUpdates: Set<number>;
+}
+
 export interface TelegramPollLoopDeps<
   TUpdate extends TelegramUpdate,
   TContext = unknown,
@@ -915,6 +1228,8 @@ export interface TelegramPollLoopDeps<
   onStatusReset: () => void;
   sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   maxUpdateFailures?: number;
+  admissionState?: TelegramPollingAdmissionState;
+  isPermanentError?: (error: unknown) => boolean;
 }
 
 export interface TelegramPollLoopRunnerDeps<
@@ -933,6 +1248,8 @@ export interface TelegramPollLoopRunnerDeps<
   updateStatus: (ctx: TContext, message?: string) => void;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   maxUpdateFailures?: number;
+  isPermanentError?: (error: unknown) => boolean;
+  propagateStop?: boolean;
 }
 
 export function sleepTelegramPollingRetry(
@@ -967,11 +1284,23 @@ export function createTelegramPollLoopRunner<
   deps: TelegramPollLoopRunnerDeps<TUpdate, TContext>,
 ): (ctx: TContext, signal: AbortSignal) => Promise<void> {
   const sleep = deps.sleep ?? sleepTelegramPollingRetry;
-  return (ctx, signal) =>
-    runTelegramPollLoop({
+  let activeSignal: AbortSignal | undefined;
+  let admissionState: TelegramPollingAdmissionState | undefined;
+  return (ctx, signal) => {
+    if (activeSignal !== signal) {
+      activeSignal = signal;
+      admissionState = { admittedUpdates: new Set<number>() };
+    }
+    let config: TelegramPollingConfig;
+    try {
+      config = deps.getConfig();
+    } catch (error) {
+      return Promise.reject(new TelegramPollingPhaseError("bootstrap", error));
+    }
+    return runTelegramPollLoop({
       ctx,
       signal,
-      config: deps.getConfig(),
+      config,
       deleteWebhook: deps.deleteWebhook,
       getUpdates: deps.getUpdates,
       persistConfig: deps.persistConfig,
@@ -990,8 +1319,15 @@ export function createTelegramPollLoopRunner<
       },
       sleep,
       maxUpdateFailures: deps.maxUpdateFailures,
+      admissionState,
+      isPermanentError: deps.isPermanentError,
       recordRuntimeEvent: deps.recordRuntimeEvent,
+    }).then((outcome) => {
+      if (outcome === "stopped" && deps.propagateStop) {
+        throw new DOMException("Telegram polling stopped", "AbortError");
+      }
     });
+  };
 }
 
 function getTelegramPollingErrorMessage(error: unknown): string {
@@ -1007,26 +1343,39 @@ export function isTelegramGetUpdatesConflictError(error: unknown): boolean {
 export async function runTelegramPollLoop<
   TUpdate extends TelegramUpdate,
   TContext = unknown,
->(deps: TelegramPollLoopDeps<TUpdate, TContext>): Promise<void> {
-  if (!deps.config.botToken) return;
+>(deps: TelegramPollLoopDeps<TUpdate, TContext>): Promise<"stopped" | void> {
+  if (!deps.config.botToken) {
+    throw new TelegramPollingPhaseError(
+      "bootstrap",
+      new TelegramPollingPermanentConfigError(),
+    );
+  }
   try {
     await deps.deleteWebhook(deps.signal);
-  } catch {
-    // ignore
+  } catch (error) {
+    if (shouldStopTelegramPolling(deps.signal.aborted, error)) return "stopped";
+    throw new TelegramPollingPhaseError("bootstrap", error);
   }
   if (deps.config.lastUpdateId === undefined) {
+    let updates: TUpdate[];
     try {
-      const updates = await deps.getUpdates(
+      updates = await deps.getUpdates(
         buildTelegramInitialSyncRequest(),
         deps.signal,
       );
-      const lastUpdateId = getLatestTelegramUpdateId(updates);
-      if (lastUpdateId !== undefined) {
+    } catch (error) {
+      if (shouldStopTelegramPolling(deps.signal.aborted, error)) return "stopped";
+      throw new TelegramPollingPhaseError("bootstrap", error);
+    }
+    const lastUpdateId = getLatestTelegramUpdateId(updates);
+    if (lastUpdateId !== undefined) {
+      const nextConfig = { ...deps.config, lastUpdateId };
+      try {
+        await deps.persistConfig(nextConfig);
         deps.config.lastUpdateId = lastUpdateId;
-        await deps.persistConfig(deps.config);
+      } catch (error) {
+        throw new TelegramPollingPhaseError("persist", error);
       }
-    } catch {
-      // ignore
     }
   }
   const maxUpdateFailures = Math.max(
@@ -1034,7 +1383,17 @@ export async function runTelegramPollLoop<
     deps.maxUpdateFailures ?? TELEGRAM_POLLING_DEFAULT_MAX_UPDATE_FAILURES,
   );
   const updateFailures = new Map<number, number>();
-  const admittedUpdates = new Set<number>();
+  const admittedUpdates =
+    deps.admissionState?.admittedUpdates ?? new Set<number>();
+  const persistOffset = async (lastUpdateId: number): Promise<void> => {
+    const nextConfig = { ...deps.config, lastUpdateId };
+    try {
+      await deps.persistConfig(nextConfig);
+      deps.config.lastUpdateId = lastUpdateId;
+    } catch (error) {
+      throw new TelegramPollingPhaseError("persist", error);
+    }
+  };
   let handledUpdateFailureRethrown = false;
   let consecutiveGetUpdatesConflicts = 0;
   while (!deps.signal.aborted) {
@@ -1047,19 +1406,18 @@ export async function runTelegramPollLoop<
       consecutiveGetUpdatesConflicts = 0;
       for (const update of updates) {
         if (admittedUpdates.has(update.update_id)) {
-          deps.config.lastUpdateId = update.update_id;
-          await deps.persistConfig(deps.config);
+          await persistOffset(update.update_id);
           admittedUpdates.delete(update.update_id);
           continue;
         }
         try {
           await deps.handleUpdate(update, deps.ctx);
           admittedUpdates.add(update.update_id);
-          deps.config.lastUpdateId = update.update_id;
           updateFailures.delete(update.update_id);
-          await deps.persistConfig(deps.config);
+          await persistOffset(update.update_id);
           admittedUpdates.delete(update.update_id);
         } catch (error) {
+          if (error instanceof TelegramPollingPhaseError) throw error;
           if (admittedUpdates.has(update.update_id)) throw error;
           const failureCount = (updateFailures.get(update.update_id) ?? 0) + 1;
           updateFailures.set(update.update_id, failureCount);
@@ -1077,35 +1435,48 @@ export async function runTelegramPollLoop<
             `skipping Telegram update ${update.update_id} after ${failureCount} failures: ${message}`,
           );
           admittedUpdates.add(update.update_id);
-          deps.config.lastUpdateId = update.update_id;
           updateFailures.delete(update.update_id);
-          await deps.persistConfig(deps.config);
+          await persistOffset(update.update_id);
           admittedUpdates.delete(update.update_id);
         }
       }
     } catch (error) {
-      if (shouldStopTelegramPolling(deps.signal.aborted, error)) return;
-      if (handledUpdateFailureRethrown) {
-        handledUpdateFailureRethrown = false;
-      } else {
-        deps.recordRuntimeEvent?.("polling", error, { phase: "loop" });
+      if (shouldStopTelegramPolling(deps.signal.aborted, error)) return "stopped";
+      if (error instanceof TelegramPollingPhaseError) throw error;
+      if (deps.isPermanentError?.(error)) {
+        throw new TelegramPollingPhaseError("api", error);
       }
+      const handlerFailure = handledUpdateFailureRethrown;
+      handledUpdateFailureRethrown = false;
       if (isTelegramGetUpdatesConflictError(error)) {
+        deps.recordRuntimeEvent?.("polling", error, { phase: "loop" });
         consecutiveGetUpdatesConflicts += 1;
-        await deps.sleep(
-          consecutiveGetUpdatesConflicts <
-            TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_LIMIT
-            ? TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_MS
-            : TELEGRAM_GET_UPDATES_CONFLICT_SLOW_RETRY_MS,
-          deps.signal,
-        );
+        try {
+          await deps.sleep(
+            consecutiveGetUpdatesConflicts <
+              TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_LIMIT
+              ? TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_MS
+              : TELEGRAM_GET_UPDATES_CONFLICT_SLOW_RETRY_MS,
+            deps.signal,
+          );
+        } catch (sleepError) {
+          throw new TelegramPollingPhaseError("retry-sleep", sleepError);
+        }
         continue;
       }
       consecutiveGetUpdatesConflicts = 0;
+      if (!handlerFailure) {
+        throw new TelegramPollingPhaseError("api", error);
+      }
       deps.onErrorStatus(getTelegramPollingErrorMessage(error));
-      await deps.sleep(TELEGRAM_POLLING_RETRY_MS, deps.signal);
-      if (deps.signal.aborted) return;
+      try {
+        await deps.sleep(TELEGRAM_POLLING_RETRY_MS, deps.signal);
+      } catch (sleepError) {
+        throw new TelegramPollingPhaseError("retry-sleep", sleepError);
+      }
+      if (deps.signal.aborted) return "stopped";
       deps.onStatusReset();
     }
   }
+  return "stopped";
 }

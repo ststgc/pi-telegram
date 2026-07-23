@@ -9,7 +9,8 @@
 import { randomUUID } from "node:crypto";
 import { createWriteStream, openAsBlob } from "node:fs";
 import { mkdir, readdir, stat, unlink, writeFile } from "node:fs/promises";
-import { request as requestHttps } from "node:https";
+import type { ClientRequest, IncomingMessage } from "node:http";
+import { request as requestHttps, type RequestOptions } from "node:https";
 import { join } from "node:path";
 import { resolveTelegramTempDir } from "./paths.ts";
 import { Readable, Transform } from "node:stream";
@@ -18,6 +19,46 @@ import { pipeline } from "node:stream/promises";
 export const TELEGRAM_API_BASE = "https://api.telegram.org";
 
 export const TELEGRAM_FILE_MAX_BYTES = 50 * 1024 * 1024;
+
+/** Bounded deadline classes applied independently to every Bot API attempt. */
+export const TELEGRAM_API_DEADLINES_MS = {
+  read: 15_000,
+  mutation: 30_000,
+  download: 60_000,
+  longPollNetworkGrace: 10_000,
+} as const;
+
+export type TelegramApiMethodClass =
+  | "long-poll"
+  | "read"
+  | "mutation"
+  | "download";
+
+const TELEGRAM_API_READ_METHODS = new Set(["getChat", "getFile", "getMe"]);
+
+export function getTelegramApiMethodClass(
+  method: string,
+): TelegramApiMethodClass {
+  if (method === "getUpdates") return "long-poll";
+  if (method === "downloadFile") return "download";
+  if (TELEGRAM_API_READ_METHODS.has(method)) return "read";
+  return "mutation";
+}
+
+export function getTelegramApiAttemptDeadlineMs(
+  method: string,
+  body: Record<string, unknown> = {},
+): number {
+  const methodClass = getTelegramApiMethodClass(method);
+  if (methodClass === "long-poll") {
+    const timeoutSeconds =
+      typeof body.timeout === "number" && Number.isFinite(body.timeout)
+        ? Math.max(0, body.timeout)
+        : 0;
+    return timeoutSeconds * 1_000 + TELEGRAM_API_DEADLINES_MS.longPollNetworkGrace;
+  }
+  return TELEGRAM_API_DEADLINES_MS[methodClass];
+}
 
 export function getTelegramInboundFileByteLimitFromEnv(
   env: NodeJS.ProcessEnv,
@@ -332,10 +373,11 @@ interface TelegramApiResponse<T> {
 
 export interface TelegramApiCallOptions {
   signal?: AbortSignal;
+  deadlineMs?: number;
   maxAttempts?: number;
   retrySafety?: "safe" | "non-idempotent";
   retryBaseDelayMs?: number;
-  sleep?: (ms: number) => Promise<void>;
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
 interface TelegramGetFileResult {
@@ -345,6 +387,7 @@ interface TelegramGetFileResult {
 
 export interface TelegramFileDownloadOptions {
   signal?: AbortSignal;
+  deadlineMs?: number;
   maxFileSizeBytes?: number;
 }
 
@@ -510,6 +553,19 @@ function sanitizeFileName(name: string): string {
   return name.replace(/[^a-zA-Z0-9._-]+/g, "_");
 }
 
+export class TelegramApiTimeoutError extends Error {
+  readonly kind = "timeout" as const;
+  readonly method: string;
+  readonly deadlineMs: number;
+
+  constructor(method: string, deadlineMs: number) {
+    super(`Telegram API ${method} timed out after ${deadlineMs}ms.`);
+    this.name = "TelegramApiTimeoutError";
+    this.method = method;
+    this.deadlineMs = deadlineMs;
+  }
+}
+
 class TelegramApiMalformedSuccessError extends Error {
   constructor(method: string, detail: string) {
     super(`Telegram API ${method} ${detail}`);
@@ -536,7 +592,7 @@ export function isTelegramApiCommitUnknownError(
   return error instanceof TelegramApiCommitUnknownError;
 }
 
-class TelegramApiHttpError extends Error {
+export class TelegramApiHttpError extends Error {
   readonly status: number | undefined;
   readonly retryAfterSeconds: number | undefined;
   constructor(
@@ -580,11 +636,19 @@ export function isTelegramApiMethodRetrySafe(method: string): boolean {
   return TELEGRAM_RETRY_SAFE_METHODS.has(method);
 }
 
-function isRetryableTelegramApiError(error: unknown): boolean {
+export function isTelegramApiPermanentAuthError(error: unknown): boolean {
   return (
     error instanceof TelegramApiHttpError &&
-    (error.status === 429 ||
-      (error.status !== undefined && error.status >= 500))
+    (error.status === 401 || error.status === 403)
+  );
+}
+
+function isRetryableTelegramApiError(error: unknown): boolean {
+  return (
+    (error instanceof TelegramApiHttpError &&
+      (error.status === 429 ||
+        (error.status !== undefined && error.status >= 500))) ||
+    isTelegramTransportFailure(error)
   );
 }
 
@@ -602,8 +666,131 @@ function getTelegramRetryDelayMs(
   return Math.max(0, baseDelayMs * 2 ** attempt);
 }
 
-function sleepTelegramRetry(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+type TelegramRetryTimer = ReturnType<typeof setTimeout>;
+type TelegramRetrySetTimeout = (
+  callback: () => void,
+  ms: number,
+) => TelegramRetryTimer;
+type TelegramRetryClearTimeout = (timer: TelegramRetryTimer) => void;
+
+let telegramRetrySetTimeout: TelegramRetrySetTimeout = setTimeout;
+let telegramRetryClearTimeout: TelegramRetryClearTimeout = clearTimeout;
+
+export function setTelegramApiRetryTimerForTesting(
+  setTimer: TelegramRetrySetTimeout,
+  clearTimer: TelegramRetryClearTimeout,
+): () => void {
+  const previousSet = telegramRetrySetTimeout;
+  const previousClear = telegramRetryClearTimeout;
+  telegramRetrySetTimeout = setTimer;
+  telegramRetryClearTimeout = clearTimer;
+  return () => {
+    telegramRetrySetTimeout = previousSet;
+    telegramRetryClearTimeout = previousClear;
+  };
+}
+
+function createTelegramAbortError(): DOMException {
+  return new DOMException("Aborted", "AbortError");
+}
+
+function sleepTelegramRetry(
+  ms: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (signal?.aborted) return Promise.reject(createTelegramAbortError());
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer: TelegramRetryTimer;
+    const cleanup = () => {
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      telegramRetryClearTimeout(timer);
+      cleanup();
+      reject(createTelegramAbortError());
+    };
+    timer = telegramRetrySetTimeout(finish, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
+}
+
+async function sleepTelegramRetryCancellable(
+  ms: number,
+  signal: AbortSignal | undefined,
+  sleep: (ms: number, signal?: AbortSignal) => Promise<void>,
+): Promise<void> {
+  if (signal?.aborted) throw createTelegramAbortError();
+  if (!signal) {
+    await sleep(ms, signal);
+    return;
+  }
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(createTelegramAbortError());
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    await Promise.race([sleep(ms, signal), aborted]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+async function runTelegramApiAttempt<T>(
+  method: string,
+  deadlineMs: number,
+  callerSignal: AbortSignal | undefined,
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  if (callerSignal?.aborted) throw createTelegramAbortError();
+  const controller = new AbortController();
+  let timedOut = false;
+  let callerAbortReject: ((error: DOMException) => void) | undefined;
+  const callerAbort = new Promise<never>((_resolve, reject) => {
+    callerAbortReject = reject;
+  });
+  const onCallerAbort = () => {
+    const error = createTelegramAbortError();
+    controller.abort(error);
+    callerAbortReject?.(error);
+  };
+  callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
+  let timeoutReject: ((error: TelegramApiTimeoutError) => void) | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timeoutReject = reject;
+  });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    const error = new TelegramApiTimeoutError(method, deadlineMs);
+    controller.abort(error);
+    timeoutReject?.(error);
+  }, deadlineMs);
+  try {
+    return await Promise.race([
+      operation(controller.signal),
+      timeout,
+      callerAbort,
+    ]);
+  } catch (error) {
+    if (callerSignal?.aborted && !timedOut) throw createTelegramAbortError();
+    if (timedOut && !(error instanceof TelegramApiTimeoutError)) {
+      throw new TelegramApiTimeoutError(method, deadlineMs);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    callerSignal?.removeEventListener("abort", onCallerAbort);
+  }
 }
 
 function assertTelegramFileSizeWithinLimit(
@@ -731,6 +918,7 @@ function getTelegramNetworkFamily(
 
 function isTelegramTransportFailure(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
+  if (error instanceof TelegramApiTimeoutError) return true;
   if (error.name === "AbortError") return false;
   if (error instanceof TypeError && /fetch failed/i.test(error.message)) {
     return true;
@@ -787,6 +975,32 @@ async function buildTelegramMultipartBody(
   };
 }
 
+type TelegramHttpsRequest = (
+  url: URL,
+  options: RequestOptions,
+  callback: (response: IncomingMessage) => void,
+) => ClientRequest;
+
+let telegramHttpsRequest: TelegramHttpsRequest =
+  requestHttps as TelegramHttpsRequest;
+let observeTelegramHttpsSignalForTesting:
+  | ((signal: AbortSignal | undefined) => void)
+  | undefined;
+
+export function setTelegramApiHttpsRequestForTesting(
+  requestImpl: TelegramHttpsRequest,
+  observeSignal?: (signal: AbortSignal | undefined) => void,
+): () => void {
+  const previousRequest = telegramHttpsRequest;
+  const previousObserver = observeTelegramHttpsSignalForTesting;
+  telegramHttpsRequest = requestImpl;
+  observeTelegramHttpsSignalForTesting = observeSignal;
+  return () => {
+    telegramHttpsRequest = previousRequest;
+    observeTelegramHttpsSignalForTesting = previousObserver;
+  };
+}
+
 async function telegramHttpsFetch(
   input: string | URL | Request,
   init: RequestInit,
@@ -800,8 +1014,18 @@ async function telegramHttpsFetch(
   if (body && !headers.has("content-length")) {
     headers.set("content-length", String(body.byteLength));
   }
+  observeTelegramHttpsSignalForTesting?.(init.signal ?? undefined);
   return new Promise<Response>((resolve, reject) => {
-    const req = requestHttps(
+    let responseSettled = false;
+    let responseStream: { destroy(error?: Error): void } | undefined;
+    let onAbort: (() => void) | undefined;
+    const cleanupAbortListener = () => {
+      if (onAbort && init.signal) {
+        init.signal.removeEventListener("abort", onAbort);
+        onAbort = undefined;
+      }
+    };
+    const req = telegramHttpsRequest(
       url,
       {
         method: init.method ?? "GET",
@@ -809,6 +1033,12 @@ async function telegramHttpsFetch(
         headers: Object.fromEntries(headers.entries()),
       },
       (res) => {
+        responseSettled = true;
+        responseStream = res;
+        const cleanupResponse = () => cleanupAbortListener();
+        res.once("end", cleanupResponse);
+        res.once("close", cleanupResponse);
+        res.once("error", cleanupResponse);
         const responseHeaders = new Headers();
         for (const [key, value] of Object.entries(res.headers)) {
           if (Array.isArray(value)) responseHeaders.set(key, value.join(", "));
@@ -823,17 +1053,29 @@ async function telegramHttpsFetch(
         );
       },
     );
-    req.on("error", reject);
+    req.once("error", (error: Error) => {
+      cleanupAbortListener();
+      reject(error);
+    });
+    req.once("close", () => {
+      if (responseSettled) return;
+      cleanupAbortListener();
+      reject(
+        Object.assign(
+          new Error("Telegram HTTPS request closed before response headers"),
+          { code: "ECONNRESET" },
+        ),
+      );
+    });
     if (init.signal) {
-      if (init.signal.aborted)
-        req.destroy(new DOMException("Aborted", "AbortError"));
-      else {
-        init.signal.addEventListener(
-          "abort",
-          () => req.destroy(new DOMException("Aborted", "AbortError")),
-          { once: true },
-        );
-      }
+      onAbort = () => {
+        const error = createTelegramAbortError();
+        req.destroy(error);
+        responseStream?.destroy(error);
+        cleanupAbortListener();
+      };
+      if (init.signal.aborted) onAbort();
+      else init.signal.addEventListener("abort", onAbort, { once: true });
     }
     req.end(body);
   });
@@ -975,7 +1217,11 @@ function withTelegramTransportDiagnostics(
 
 async function callTelegramWithRetry<TResponse>(
   method: string,
-  request: (family?: TelegramNetworkFamily) => Promise<Response>,
+  body: Record<string, unknown>,
+  request: (
+    family: TelegramNetworkFamily | undefined,
+    signal: AbortSignal,
+  ) => Promise<Response>,
   options: TelegramApiCallOptions | undefined,
 ): Promise<TResponse> {
   const retrySafe =
@@ -985,22 +1231,37 @@ async function callTelegramWithRetry<TResponse>(
   const maxAttempts = Math.max(1, options?.maxAttempts ?? 3);
   const retryBaseDelayMs = options?.retryBaseDelayMs ?? 500;
   const sleep = options?.sleep ?? sleepTelegramRetry;
+  const deadlineMs = Math.max(
+    1,
+    options?.deadlineMs ?? getTelegramApiAttemptDeadlineMs(method, body),
+  );
   for (let attempt = 0; ; attempt += 1) {
     try {
-      return unwrapTelegramApiResult(
+      return await runTelegramApiAttempt(
         method,
-        await parseTelegramApiResponse<TResponse>(
-          await callTelegramTransportRequest(request, retrySafe),
-          method,
-        ),
+        deadlineMs,
+        options?.signal,
+        async (signal) =>
+          unwrapTelegramApiResult(
+            method,
+            await parseTelegramApiResponse<TResponse>(
+              await callTelegramTransportRequest(
+                (family) => request(family, signal),
+                retrySafe,
+              ),
+              method,
+            ),
+          ),
       );
     } catch (error) {
       const retryable = isRetryableTelegramApiError(error);
       if (!retrySafe) {
         if (error instanceof TelegramApiHttpError && error.status === 429) {
           if (attempt >= maxAttempts - 1) throw error;
-          await sleep(
+          await sleepTelegramRetryCancellable(
             getTelegramRetryDelayMs(error, attempt, retryBaseDelayMs),
+            options?.signal,
+            sleep,
           );
           continue;
         }
@@ -1016,7 +1277,11 @@ async function callTelegramWithRetry<TResponse>(
         throw error;
       }
       if (attempt >= maxAttempts - 1 || !retryable) throw error;
-      await sleep(getTelegramRetryDelayMs(error, attempt, retryBaseDelayMs));
+      await sleepTelegramRetryCancellable(
+        getTelegramRetryDelayMs(error, attempt, retryBaseDelayMs),
+        options?.signal,
+        sleep,
+      );
     }
   }
 }
@@ -1072,14 +1337,15 @@ export async function callTelegram<TResponse>(
   const configuredBotToken = assertTelegramBotTokenConfigured(botToken);
   return callTelegramWithRetry(
     method,
-    async (family) =>
+    body,
+    async (family, signal) =>
       telegramFetch(
         `${TELEGRAM_API_BASE}/bot${configuredBotToken}/${method}`,
         {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body),
-          signal: options?.signal,
+          signal,
         },
         family,
       ),
@@ -1097,10 +1363,19 @@ export async function fetchTelegramBotIdentity(
   fetchImpl: typeof fetch = fetch,
 ): Promise<TelegramBotIdentityResponse> {
   const url = `${TELEGRAM_API_BASE}/bot${botToken}/getMe`;
-  const response = await callTelegramTransportRequest((family) =>
-    fetchImpl === fetch ? telegramFetch(url, {}, family) : fetchImpl(url),
+  return runTelegramApiAttempt(
+    "getMe",
+    getTelegramApiAttemptDeadlineMs("getMe"),
+    undefined,
+    async (signal) => {
+      const response = await callTelegramTransportRequest((family) =>
+        fetchImpl === fetch
+          ? telegramFetch(url, { signal }, family)
+          : fetchImpl(url, { signal }),
+      );
+      return response.json() as Promise<TelegramBotIdentityResponse>;
+    },
   );
-  return response.json() as Promise<TelegramBotIdentityResponse>;
 }
 
 /**
@@ -1122,7 +1397,8 @@ export async function callTelegramMultipart<TResponse>(
   const fileBlob = await openAsBlob(filePath);
   return callTelegramWithRetry(
     method,
-    async (family) => {
+    fields,
+    async (family, signal) => {
       if (family) {
         const multipart = await buildTelegramMultipartBody(
           fields,
@@ -1136,7 +1412,7 @@ export async function callTelegramMultipart<TResponse>(
             method: "POST",
             headers: { "content-type": multipart.contentType },
             body: multipart.body as unknown as BodyInit,
-            signal: options?.signal,
+            signal,
           },
           family,
         );
@@ -1151,7 +1427,7 @@ export async function callTelegramMultipart<TResponse>(
         {
           method: "POST",
           body: form,
-          signal: options?.signal,
+          signal,
         },
       );
     },
@@ -1179,26 +1455,39 @@ export async function downloadTelegramFile(
     tempDir,
     `${randomUUID()}-${sanitizeFileName(suggestedName)}`,
   );
-  const response = await callTelegramTransportRequest((family) =>
-    telegramFetch(
-      `${TELEGRAM_API_BASE}/file/bot${configuredBotToken}/${file.file_path}`,
-      { signal: options?.signal },
-      family,
-    ),
-  );
-  if (!response.ok) {
-    throw new Error(`Failed to download Telegram file: ${response.status}`);
-  }
-  const contentLength = response.headers?.get("content-length");
-  assertTelegramFileSizeWithinLimit(
-    contentLength ? Number.parseInt(contentLength, 10) : undefined,
-    options?.maxFileSizeBytes,
-  );
   try {
-    await writeTelegramDownloadResponse(
-      response,
-      targetPath,
-      options?.maxFileSizeBytes,
+    await runTelegramApiAttempt(
+      "downloadFile",
+      Math.max(
+        1,
+        options?.deadlineMs ??
+          getTelegramApiAttemptDeadlineMs("downloadFile"),
+      ),
+      options?.signal,
+      async (signal) => {
+        const response = await callTelegramTransportRequest((family) =>
+          telegramFetch(
+            `${TELEGRAM_API_BASE}/file/bot${configuredBotToken}/${file.file_path}`,
+            { signal },
+            family,
+          ),
+        );
+        if (!response.ok) {
+          throw new Error(
+            `Failed to download Telegram file: ${response.status}`,
+          );
+        }
+        const contentLength = response.headers?.get("content-length");
+        assertTelegramFileSizeWithinLimit(
+          contentLength ? Number.parseInt(contentLength, 10) : undefined,
+          options?.maxFileSizeBytes,
+        );
+        await writeTelegramDownloadResponse(
+          response,
+          targetPath,
+          options?.maxFileSizeBytes,
+        );
+      },
     );
   } catch (error) {
     await removeTelegramPartialDownload(targetPath);

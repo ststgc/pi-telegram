@@ -636,23 +636,25 @@ export function createTelegramConfigStore(
 }
 
 export function createTelegramPollingOffsetPersister(
-  configStore: Pick<TelegramConfigStore, "get" | "set" | "persist">,
-  persist: () => Promise<void> = () => configStore.persist(),
+  configStore: Pick<TelegramConfigStore, "get" | "persist">,
+  persist: (config?: TelegramConfig) => Promise<void> = (config) =>
+    configStore.persist(config),
 ): (pollingConfig: { lastUpdateId?: number }) => Promise<void> {
   return async (pollingConfig) => {
     const nextOffset = pollingConfig.lastUpdateId;
-    if (typeof nextOffset === "number") {
-      const current = configStore.get();
-      const currentOffset = current.lastUpdateId;
-      configStore.set({
-        ...current,
-        lastUpdateId:
-          typeof currentOffset === "number"
-            ? Math.max(currentOffset, nextOffset)
-            : nextOffset,
-      });
+    if (typeof nextOffset !== "number") {
+      await persist();
+      return;
     }
-    await persist();
+    const current = configStore.get();
+    const currentOffset = current.lastUpdateId;
+    await persist({
+      ...current,
+      lastUpdateId:
+        typeof currentOffset === "number"
+          ? Math.max(currentOffset, nextOffset)
+          : nextOffset,
+    });
   };
 }
 

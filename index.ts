@@ -822,6 +822,8 @@ export default function (pi: Pi.ExtensionAPI) {
     });
   const telegramBusFollowerRegistration =
     telegramBusFollowerAssembly.registration;
+  const pollingTerminalLeaseBinding =
+    Polling.createTelegramPollingTerminalLeaseBinding();
   const pollingRuntime = Polling.createTelegramPollingControllerRuntime({
     state: pollingControllerState,
     getConfig: configStore.get,
@@ -835,6 +837,18 @@ export default function (pi: Pi.ExtensionAPI) {
     }),
     stopTypingLoop: typing.stop,
     updateStatus,
+    isPermanentError: TelegramApi.isTelegramApiPermanentAuthError,
+    async onTerminalFailure(info) {
+      recordRuntimeEvent("polling", "Telegram polling terminalized", {
+        phase: info.phase,
+        restartCount: info.restartCount,
+        generation: info.generation,
+        startedAtMs: info.startedAtMs,
+        failedAtMs: info.failedAtMs,
+        permanent: info.permanent,
+      });
+      await pollingTerminalLeaseBinding.handle(info);
+    },
     recordRuntimeEvent,
   });
   const recoverStaleTelegramTopicApiError =
@@ -938,6 +952,13 @@ export default function (pi: Pi.ExtensionAPI) {
     updateStatus,
     recordRuntimeEvent,
   });
+  pollingTerminalLeaseBinding.set(
+    Polling.createTelegramPollingTerminalLeaseHandler({
+      state: pollingControllerState,
+      terminalizeTransportLease:
+        lockedPollingRuntime.terminalizeTransportLease,
+    }),
+  );
   const disconnectTelegramAndDeleteCurrentThread =
     Sync.createTelegramManualThreadDisconnectHandler({
       instanceId: telegramInstanceId,
