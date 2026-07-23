@@ -212,6 +212,13 @@ function makeSnapshot(
             committedAtMs: 390 + index,
           }]
         : [],
+      unitProgress: delivered
+        ? [{
+            unitIndex: 0,
+            operationId: `operation-${index}`,
+            outcome: "committed" as const,
+          }]
+        : [],
       ...(uncertain
         ? {
             uncertainty: {
@@ -574,6 +581,19 @@ test("strict outbound record parsing rejects state-specific metadata, unordered 
     receipts.push({ ...receipts[0], unitIndex: 1 });
     delivered.nextUnitIndex = 2;
   }, /duplicate id/);
+  expectInvalid((value) => {
+    delete records(value, "outbound")[3]!.unitProgress;
+  }, /missing field/);
+  expectInvalid((value) => {
+    const delivered = records(value, "outbound")[3]!;
+    (delivered.unitProgress as Array<Record<string, unknown>>)[0]!.outcome =
+      "skipped";
+  }, /reason/);
+  expectInvalid((value) => {
+    const delivered = records(value, "outbound")[3]!;
+    (delivered.unitProgress as Array<Record<string, unknown>>)[0]!.operationId =
+      "other-operation";
+  }, /committed progress must exactly match receipts/);
   expectInvalid((value) => {
     records(value, "outbound")[0]!.turnId = "wrong-turn";
   }, /mismatched source turn/);
@@ -1331,7 +1351,7 @@ test("outbound planning strictly validates semantic payloads, filenames, operati
       replyToMessageId: 0,
       guestQueryId: "guest-query-1",
       units: [{
-        kind: "guest",
+        kind: "guest-text",
         operationId: "guest-operation",
         method: "answerGuestQuery",
         markdown: "Guest answer",
@@ -1407,9 +1427,12 @@ test("outbound fallback branches preserve stable operations and strict state on 
         fileName: "result.png",
         mediaKind: "photo",
         caption: "Result",
-        fallback: {
-          trigger: "known-failure",
-          operationIds: ["fallback-text", "fallback-file"],
+        branch: {
+          success: { kind: "terminal" },
+          knownFailure: {
+            kind: "operation",
+            operationId: "fallback-text",
+          },
         },
       },
       {
@@ -1450,6 +1473,12 @@ test("outbound fallback branches preserve stable operations and strict state on 
     assert.equal(fallbackPending.state, "pending");
     assert.equal(fallbackPending.nextUnitIndex, 1);
     assert.equal(fallbackPending.receipts.length, 0);
+    assert.deepEqual(fallbackPending.unitProgress, [{
+      unitIndex: 0,
+      operationId: "rich-primary",
+      outcome: "skipped",
+      reason: "known-failure",
+    }]);
     const reopened = reopenStore(harness);
     const claimed = reopened.claimOutboundUnit({
       recordId: outbound.recordId,
@@ -1482,9 +1511,12 @@ test("outbound state parser accepts a Rich success that skips declared fallback 
           fileName: "result.png",
           mediaKind: "photo",
           caption: "Result",
-          fallback: {
-            trigger: "known-failure",
-            operationIds: ["unused-text", "unused-file"],
+          branch: {
+            success: { kind: "terminal" },
+            knownFailure: {
+              kind: "operation",
+              operationId: "unused-text",
+            },
           },
         },
         {
@@ -1523,6 +1555,21 @@ test("outbound state parser accepts a Rich success that skips declared fallback 
     assert.equal(delivered.state, "delivered");
     assert.equal(delivered.nextUnitIndex, 3);
     assert.deepEqual(delivered.receipts.map((receipt) => receipt.unitIndex), [0]);
+    assert.deepEqual(delivered.unitProgress, [
+      { unitIndex: 0, operationId: "rich-success", outcome: "committed" },
+      {
+        unitIndex: 1,
+        operationId: "unused-text",
+        outcome: "skipped",
+        reason: "branch",
+      },
+      {
+        unitIndex: 2,
+        operationId: "unused-file",
+        outcome: "skipped",
+        reason: "branch",
+      },
+    ]);
     assert.equal(
       readStoreSnapshot(harness.rootPath).inbound.find(
         (entry) => entry.recordId === inbound.recordId,
@@ -1576,17 +1623,11 @@ test("outbound parser rejects invalid methods, modes, fields, and fallback graph
     spool: [Buffer.from("file")],
   });
   expectRejected([{
-    kind: "guest",
-    operationId: "guest-mixed-content",
-    method: "answerGuestQuery",
+    kind: "guest-text",
+    operationId: "guest-wrong-method",
+    method: "sendMessage",
     markdown: "text",
-    spoolRefIndex: 0,
-    fileName: "file.pdf",
-    mediaKind: "document",
-  }], /exactly one of markdown or attachment/, {
-    guest: true,
-    spool: [Buffer.from("file")],
-  });
+  }], /guest-text units require answerGuestQuery/, { guest: true });
   expectRejected([
     {
       kind: "rich-media",
@@ -1596,7 +1637,9 @@ test("outbound parser rejects invalid methods, modes, fields, and fallback graph
       fileName: "result.png",
       mediaKind: "photo",
       caption: "Result",
-      fallback: { trigger: "known-failure", operationIds: ["missing"] },
+      branch: {
+        knownFailure: { kind: "operation", operationId: "missing" },
+      },
     },
   ], /references an unknown operation/, { spool: [Buffer.from("image")] });
   expectRejected([
@@ -1608,9 +1651,8 @@ test("outbound parser rejects invalid methods, modes, fields, and fallback graph
       fileName: "result.png",
       mediaKind: "photo",
       caption: "Result",
-      fallback: {
-        trigger: "known-failure",
-        operationIds: ["ordered-file", "ordered-text"],
+      branch: {
+        knownFailure: { kind: "operation", operationId: "ordered-root" },
       },
     },
     {
@@ -1628,31 +1670,26 @@ test("outbound parser rejects invalid methods, modes, fields, and fallback graph
       fileName: "result.png",
       mediaKind: "photo",
     },
-  ], /ordered contiguous trailing branch/, { spool: [Buffer.from("image")] });
+  ], /must reference a later operation/, { spool: [Buffer.from("image")] });
   expectRejected([
     {
-      kind: "rich-media",
-      operationId: "cycle-a",
+      kind: "final-text",
+      operationId: "first",
       method: "sendRichMessage",
-      spoolRefIndex: 0,
-      fileName: "a.png",
-      mediaKind: "photo",
-      caption: "A",
-      fallback: { trigger: "known-failure", operationIds: ["cycle-b"] },
+      content: "First",
+      contentMode: "rich-markdown",
     },
     {
-      kind: "rich-media",
-      operationId: "cycle-b",
+      kind: "final-text",
+      operationId: "second",
       method: "sendRichMessage",
-      spoolRefIndex: 1,
-      fileName: "b.png",
-      mediaKind: "photo",
-      caption: "B",
-      fallback: { trigger: "known-failure", operationIds: ["cycle-a"] },
+      content: "Second",
+      contentMode: "rich-markdown",
+      branch: {
+        success: { kind: "operation", operationId: "first" },
+      },
     },
-  ], /must not form a cycle/, {
-    spool: [Buffer.from("a"), Buffer.from("b")],
-  });
+  ], /must reference a later operation/);
 });
 
 test("outbound publication is quota-fenced and digest verification fails closed", () => {

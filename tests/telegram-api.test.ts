@@ -448,7 +448,8 @@ test("Non-idempotent Telegram API calls retry explicit 429 but report 5xx commit
         }),
       (error) =>
         isTelegramApiCommitUnknownError(error) &&
-        error.method === "sendMessage",
+        error.method === "sendMessage" &&
+        error.reason === "response-lost",
     );
     assert.equal(calls, 2);
     assert.deepEqual(sleeps, [2000]);
@@ -702,7 +703,9 @@ test("Telegram multipart 5xx reports commit unknown without replay", async () =>
           "demo.txt",
           { retryBaseDelayMs: 0, sleep: async () => {} },
         ),
-      (error) => isTelegramApiCommitUnknownError(error),
+      (error) =>
+        isTelegramApiCommitUnknownError(error) &&
+        error.reason === "response-lost",
     );
     assert.equal(calls, 1);
     assert.deepEqual(contentTypes, ["blob"]);
@@ -812,7 +815,9 @@ test("Non-idempotent malformed success becomes commit-unknown", async () => {
         callTelegram("123:abc", "createForumTopic", {}, {
           maxAttempts: 1,
         }),
-      isTelegramApiCommitUnknownError,
+      (error) =>
+        isTelegramApiCommitUnknownError(error) &&
+        error.reason === "malformed-success",
     );
   } finally {
     restoreFetch();
@@ -1421,7 +1426,9 @@ test("HTTPS close before headers retries reads and marks mutations commit-unknow
         callTelegram("123:abc", "sendMessage", {}, {
           maxAttempts: 1,
         }),
-      isTelegramApiCommitUnknownError,
+      (error) =>
+        isTelegramApiCommitUnknownError(error) &&
+        error.reason === "connection-lost-after-write",
     );
     assert.equal(calls, 1);
   } finally {
@@ -1480,7 +1487,9 @@ test("Telegram API timeout preserves retry and commit-unknown classification", a
         deadlineMs: 5,
         maxAttempts: 1,
       }),
-      isTelegramApiCommitUnknownError,
+      (error) =>
+        isTelegramApiCommitUnknownError(error) &&
+        error.reason === "timeout-after-write",
     );
   } finally {
     restoreFetch();

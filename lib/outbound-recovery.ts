@@ -1,8 +1,8 @@
 /**
  * Durable Telegram outbound planning and source spooling
  * Zones: telegram outbound, recovery, filesystem
- * Owns pure final-reply unit planning and descriptor-based source capture before
- * recovery publication; it does not own agent lifecycle wiring or Telegram mutations.
+ * Owns final-reply unit planning, descriptor-based source capture, and receipt-aware
+ * one-unit Telegram execution; it does not own agent lifecycle or entrypoint wiring.
  */
 
 import { createHash } from "node:crypto";
@@ -12,9 +12,13 @@ import { basename, isAbsolute } from "node:path";
 
 import {
   getTelegramGuestAttachmentTransport,
+  getTelegramMultipartTargetFields,
   getTelegramRichOutboundAttachmentMediaKind,
   isTelegramOutboundPhotoAttachmentPath,
+  isTelegramRichAttachmentCommitUnknownError,
+  sendTelegramOutboundBinaryReplyUnit,
   TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES,
+  type TelegramOutboundBinaryReplyUnitDeps,
 } from "./outbound-attachments.ts";
 import {
   planTelegramDurableOutboundReply,
@@ -24,15 +28,34 @@ import {
   type RecoveryOutboundDrainItem,
   type RecoveryOutboundMediaKind,
   type RecoveryOutboundPlanInput,
+  type RecoveryIdentity,
+  type RecoveryIdentityClaim,
+  type RecoveryOutboundButton,
+  type RecoveryOutboundReceipt,
+  type RecoveryOutboundReceiptResult,
   type RecoveryOutboundRecord,
+  type RecoveryOutboundUncertaintyReason,
   type RecoveryOutboundUnit,
   type RecoveryStore,
 } from "./recovery.ts";
 import { renderTelegramMessage } from "./rendering.ts";
 import {
   normalizeTelegramNativeMarkdown,
+  sendTelegramGuestMarkdownReplyUnit,
+  sendTelegramNativeMarkdownReplyUnit,
+  sendTelegramRenderedReplyUnit,
   splitTelegramNativeMarkdown,
+  TelegramReplyMalformedSuccessError,
 } from "./replies.ts";
+import {
+  isTelegramApiCommitUnknownError,
+  TelegramApiHttpError,
+  type TelegramAnswerGuestQueryOptions,
+  type TelegramGuestCachedMediaResult,
+  type TelegramSendMessageBody,
+  type TelegramSendRichMessageBody,
+  type TelegramSentMessage,
+} from "./telegram-api.ts";
 
 export interface TelegramDurableOutboundSourceDescriptor {
   path: string;
@@ -178,9 +201,14 @@ function getTextChunks(
   );
 }
 
+interface TelegramDurableOutboundTransformedReply
+  extends TelegramDurableOutboundReplyPlan {
+  fallbackMarkdown?: string;
+}
+
 function planTelegramDurableOutboundFromReply(
   options: TelegramDurableOutboundPlanOptions,
-  reply: TelegramDurableOutboundReplyPlan,
+  reply: TelegramDurableOutboundTransformedReply,
 ): TelegramDurableOutboundPlannedIntent {
   const attachments = options.queuedAttachments.map(cloneSource);
   const generatedVoice = (options.generatedVoice ?? []).map(cloneSource);
@@ -199,45 +227,100 @@ function planTelegramDurableOutboundFromReply(
       throw new Error("Durable Guest outbound supports one attachment");
     }
     const attachment = attachments[0];
+    let guestSource: TelegramDurableOutboundSourceDescriptor | undefined;
+    let guestMediaKind: RecoveryOutboundMediaKind | undefined;
     if (attachment) {
       if (generatedVoice.length > 0) {
         throw new Error("Durable Guest attachment plan cannot include generated voice");
       }
-      const spoolRefIndex = addSource(attachment);
-      units.push({
-        kind: "guest",
-        operationId: operationId(0),
-        method: "answerGuestQuery",
-        spoolRefIndex,
-        fileName: attachment.fileName,
-        mediaKind: getGuestMediaKind(attachment.path),
-        ...(reply.markdown ? { caption: capGuestCaption(reply.markdown) } : {}),
-      });
+      guestSource = attachment;
+      guestMediaKind = getGuestMediaKind(attachment.path);
     } else if (reply.voiceReplies.length > 0) {
       if (generatedVoice.length !== 1) {
         throw new Error("Durable Guest voice plan requires one generated voice source");
       }
-      const voiceSource = generatedVoice[0];
-      if (!voiceSource) {
-        throw new Error("Durable Guest voice source is missing");
-      }
-      assertGeneratedVoiceSource(voiceSource);
-      const spoolRefIndex = addSource(voiceSource);
+      guestSource = generatedVoice[0];
+      if (!guestSource) throw new Error("Durable Guest voice source is missing");
+      assertGeneratedVoiceSource(guestSource);
+      guestMediaKind = "voice";
+    }
+    if (guestSource && guestMediaKind) {
+      const spoolRefIndex = addSource(guestSource);
+      const stageOperationId = operationId(0);
+      const answerOperationId = operationId(1);
+      const cleanupOperationId = operationId(2);
+      const fallbackText = reply.markdown || reply.fallbackMarkdown;
+      const hasFallback = !!fallbackText;
+      const extractionCleanupOperationId = operationId(3);
+      const fallbackOperationId = operationId(4);
+      const stageMethod = guestMediaKind === "photo"
+        ? "sendPhoto"
+        : guestMediaKind === "audio"
+          ? "sendAudio"
+          : guestMediaKind === "voice"
+            ? "sendVoice"
+            : "sendDocument";
       units.push({
-        kind: "guest",
-        operationId: operationId(0),
-        method: "answerGuestQuery",
+        kind: "guest-stage",
+        operationId: stageOperationId,
+        method: stageMethod,
         spoolRefIndex,
-        fileName: voiceSource.fileName,
-        mediaKind: "voice",
-        ...(reply.markdown ? { caption: capGuestCaption(reply.markdown) } : {}),
+        fileName: guestSource.fileName,
+        mediaKind: guestMediaKind,
+        ...(hasFallback
+          ? {
+              branch: {
+                knownFailure: {
+                  kind: "operation" as const,
+                  operationId: fallbackOperationId,
+                },
+                receiptFailure: {
+                  kind: "operation" as const,
+                  operationId: extractionCleanupOperationId,
+                },
+              },
+            }
+          : {}),
       });
+      units.push({
+        kind: "guest-answer",
+        operationId: answerOperationId,
+        method: "answerGuestQuery",
+        stageOperationId,
+        fileName: guestSource.fileName,
+        mediaKind: guestMediaKind,
+        ...(reply.markdown ? { caption: capGuestCaption(reply.markdown) } : {}),
+        branch: {
+          success: { kind: "operation", operationId: cleanupOperationId },
+        },
+      });
+      units.push({
+        kind: "guest-cleanup",
+        operationId: cleanupOperationId,
+        method: "deleteMessage",
+        stageOperationId,
+        branch: { success: { kind: "terminal" } },
+      });
+      if (hasFallback) {
+        units.push({
+          kind: "guest-cleanup",
+          operationId: extractionCleanupOperationId,
+          method: "deleteMessage",
+          stageOperationId,
+        });
+        units.push({
+          kind: "guest-text",
+          operationId: fallbackOperationId,
+          method: "answerGuestQuery",
+          markdown: fallbackText,
+        });
+      }
     } else if (textChunks[0]) {
       if (generatedVoice.length > 0) {
         throw new Error("Durable Guest text plan cannot include generated voice");
       }
       units.push({
-        kind: "guest",
+        kind: "guest-text",
         operationId: operationId(0),
         method: "answerGuestQuery",
         markdown: textChunks[0],
@@ -317,9 +400,16 @@ function planTelegramDurableOutboundFromReply(
     if (richUnit?.kind !== "rich-media") {
       throw new Error("Durable Rich media fallback root is missing");
     }
-    richUnit.fallback = {
-      trigger: "known-failure",
-      operationIds: units.slice(1).map((unit) => unit.operationId),
+    const firstFallbackUnit = units[1];
+    if (!firstFallbackUnit) {
+      throw new Error("Durable Rich media fallback is empty");
+    }
+    richUnit.branch = {
+      success: { kind: "terminal" },
+      knownFailure: {
+        kind: "operation",
+        operationId: firstFallbackUnit.operationId,
+      },
     };
   } else {
     for (const chunk of textChunks) {
@@ -335,9 +425,11 @@ function planTelegramDurableOutboundFromReply(
           : "html",
       });
     }
+    const voiceUnitIndices: number[] = [];
     for (const voiceSource of generatedVoice) {
       assertGeneratedVoiceSource(voiceSource);
       const spoolRefIndex = addSource(voiceSource);
+      voiceUnitIndices.push(units.length);
       units.push({
         kind: "voice",
         operationId: operationId(units.length),
@@ -349,6 +441,49 @@ function planTelegramDurableOutboundFromReply(
           ? { caption: voiceSource.caption }
           : {}),
       });
+    }
+    if (
+      textChunks.length === 0 &&
+      attachments.length === 0 &&
+      voiceUnitIndices.length > 0
+    ) {
+      const fallbackChunks = getTextChunks(
+        reply.fallbackMarkdown ?? reply.voiceText ?? "",
+        options.renderingMode,
+      );
+      const firstFallbackIndex = units.length;
+      for (const chunk of fallbackChunks) {
+        units.push({
+          kind: "final-text",
+          operationId: operationId(units.length),
+          method: options.renderingMode === "rich"
+            ? "sendRichMessage"
+            : "sendMessage",
+          content: chunk,
+          contentMode: options.renderingMode === "rich"
+            ? "rich-markdown"
+            : "html",
+        });
+      }
+      const firstFallback = units[firstFallbackIndex];
+      if (!firstFallback) {
+        throw new Error("Durable voice-only delivery requires text fallback");
+      }
+      for (const voiceIndex of voiceUnitIndices) {
+        const voiceUnit = units[voiceIndex];
+        if (voiceUnit?.kind !== "voice") {
+          throw new Error("Durable voice fallback root is missing");
+        }
+        voiceUnit.branch = {
+          knownFailure: {
+            kind: "operation",
+            operationId: firstFallback.operationId,
+          },
+          ...(voiceIndex === voiceUnitIndices.at(-1)
+            ? { success: { kind: "terminal" as const } }
+            : {}),
+        };
+      }
     }
     if (
       units.length === 0 &&
@@ -406,12 +541,15 @@ function planTelegramDurableOutboundFromReply(
 export function planTelegramDurableOutbound(
   options: TelegramDurableOutboundPlanOptions,
 ): TelegramDurableOutboundPlannedIntent {
-  return planTelegramDurableOutboundFromReply(
-    options,
-    planTelegramDurableOutboundReply(options.finalMarkdown, {
-      automaticVoice: options.automaticVoice,
-    }),
-  );
+  const reply = planTelegramDurableOutboundReply(options.finalMarkdown, {
+    automaticVoice: options.automaticVoice,
+  });
+  return planTelegramDurableOutboundFromReply(options, {
+    ...reply,
+    ...(!reply.markdown && reply.voiceText
+      ? { fallbackMarkdown: reply.voiceText }
+      : {}),
+  });
 }
 
 async function openNodeSource(
@@ -507,10 +645,13 @@ export async function readTelegramDurableOutboundSource(
 async function transformTelegramDurableOutboundReply(
   reply: TelegramDurableOutboundReplyPlan,
   transformReply: TelegramDurableOutboundCommitDeps["transformReply"],
-): Promise<TelegramDurableOutboundReplyPlan> {
+): Promise<TelegramDurableOutboundTransformedReply> {
   const markdown = reply.markdown
     ? await transformReply(reply.markdown)
     : reply.markdown;
+  const fallbackMarkdown = !markdown && reply.voiceText
+    ? await transformReply(reply.voiceText)
+    : undefined;
   const buttons = [];
   for (const button of reply.buttons) {
     buttons.push({
@@ -518,7 +659,12 @@ async function transformTelegramDurableOutboundReply(
       label: await transformReply(button.label),
     });
   }
-  return { ...reply, markdown, buttons };
+  return {
+    ...reply,
+    markdown,
+    buttons,
+    ...(fallbackMarkdown ? { fallbackMarkdown } : {}),
+  };
 }
 
 /**
@@ -558,4 +704,587 @@ export async function commitTelegramDurableOutbound(
     throw new Error("Committed durable outbound plan could not be verified");
   }
   return committed;
+}
+
+export type TelegramDurableOutboundAdapterOutcome =
+  | {
+      kind: "committed";
+      method: string;
+      messageId?: number;
+      result?: RecoveryOutboundReceiptResult;
+      transition?: "success" | "receipt-failure";
+    }
+  | { kind: "known-not-committed" }
+  | {
+      kind: "commit-unknown";
+      reason: RecoveryOutboundUncertaintyReason;
+    }
+  | { kind: "not-started" };
+
+export interface TelegramDurableOutboundAdapterInput {
+  identity: RecoveryIdentity;
+  unit: RecoveryOutboundUnit;
+  spool: readonly Uint8Array[];
+  receipts: readonly RecoveryOutboundReceipt[];
+  replyToMessageId?: number;
+  replyMarkup?: unknown;
+  guestQueryId?: string;
+}
+
+export interface TelegramDurableOutboundUnitAdapter {
+  execute: (
+    input: TelegramDurableOutboundAdapterInput,
+  ) => Promise<TelegramDurableOutboundAdapterOutcome>;
+}
+
+export interface TelegramDurableOutboundMutationGate {
+  canStart: (
+    identity: RecoveryIdentity,
+    unit: RecoveryOutboundUnit,
+  ) => boolean;
+  isActive: (identity: RecoveryIdentity) => boolean;
+}
+
+export interface TelegramDurableOutboundUnitAdapterDeps
+  extends TelegramOutboundBinaryReplyUnitDeps {
+  gate: TelegramDurableOutboundMutationGate;
+  sendMessage: (
+    body: TelegramSendMessageBody,
+  ) => Promise<TelegramSentMessage>;
+  sendRichMessage: (
+    body: TelegramSendRichMessageBody,
+  ) => Promise<TelegramSentMessage>;
+  answerGuestQuery: (
+    guestQueryId: string,
+    text?: string,
+    options?: TelegramAnswerGuestQueryOptions,
+  ) => Promise<void>;
+  deleteMessage: (chatId: number, messageId: number) => Promise<void>;
+}
+
+function getSpoolBytes(
+  input: TelegramDurableOutboundAdapterInput,
+  spoolRefIndex: number,
+): Uint8Array {
+  const bytes = input.spool[spoolRefIndex];
+  if (!bytes) {
+    throw new Error("Verified durable outbound spool is missing");
+  }
+  return bytes;
+}
+
+function classifyTelegramDurableOutboundError(
+  error: unknown,
+  started: boolean,
+): TelegramDurableOutboundAdapterOutcome {
+  if (!started) return { kind: "not-started" };
+  if (isTelegramApiCommitUnknownError(error)) {
+    return { kind: "commit-unknown", reason: error.reason };
+  }
+  if (
+    error instanceof TelegramApiHttpError &&
+    error.status !== undefined &&
+    error.status < 500
+  ) {
+    return { kind: "known-not-committed" };
+  }
+  if (error instanceof TelegramReplyMalformedSuccessError) {
+    return { kind: "commit-unknown", reason: "malformed-success" };
+  }
+  if (isTelegramRichAttachmentCommitUnknownError(error)) {
+    if (error instanceof Error && isTelegramApiCommitUnknownError(error.cause)) {
+      return { kind: "commit-unknown", reason: error.cause.reason };
+    }
+    return { kind: "commit-unknown", reason: "malformed-success" };
+  }
+  return { kind: "commit-unknown", reason: "commit-unknown" };
+}
+
+interface TelegramGuestStagingMessage {
+  message_id?: number;
+  document?: { file_id?: string };
+  photo?: Array<{ file_id?: string; file_size?: number }>;
+  audio?: { file_id?: string };
+  voice?: { file_id?: string };
+}
+
+function readGuestStagingResult(
+  value: unknown,
+  mediaKind: RecoveryOutboundMediaKind,
+): Extract<RecoveryOutboundReceiptResult, { kind: "guest-staging" }> {
+  if (typeof value !== "object" || value === null) {
+    throw new TelegramReplyMalformedSuccessError("Guest staging upload");
+  }
+  const message = value as TelegramGuestStagingMessage;
+  const stagingMessageId = message.message_id;
+  if (
+    typeof stagingMessageId !== "number" ||
+    !Number.isSafeInteger(stagingMessageId) ||
+    stagingMessageId <= 0
+  ) {
+    throw new TelegramReplyMalformedSuccessError("Guest staging upload");
+  }
+  let fileId: string | undefined;
+  if (mediaKind === "photo") {
+    fileId = [...(message.photo ?? [])]
+      .sort((left, right) => (left.file_size ?? 0) - (right.file_size ?? 0))
+      .at(-1)?.file_id;
+  } else if (mediaKind === "audio") {
+    fileId = message.audio?.file_id;
+  } else if (mediaKind === "voice") {
+    fileId = message.voice?.file_id;
+  } else if (mediaKind === "document") {
+    fileId = message.document?.file_id;
+  }
+  return {
+    kind: "guest-staging",
+    stagingMessageId,
+    mediaKind,
+    ...(fileId ? { fileId } : {}),
+  };
+}
+
+function findGuestStagingReceipt(
+  input: TelegramDurableOutboundAdapterInput,
+  stageOperationId: string,
+): Extract<RecoveryOutboundReceiptResult, { kind: "guest-staging" }> {
+  const result = input.receipts.find(
+    (receipt) => receipt.operationId === stageOperationId,
+  )?.result;
+  if (result?.kind !== "guest-staging") {
+    throw new Error("Durable Guest staging receipt is missing");
+  }
+  return result;
+}
+
+function buildGuestCachedMediaResult(
+  unit: Extract<RecoveryOutboundUnit, { kind: "guest-answer" }>,
+  fileId: string,
+): TelegramGuestCachedMediaResult {
+  const caption = unit.caption ? { caption: unit.caption } : {};
+  if (unit.mediaKind === "photo") {
+    return {
+      type: "photo",
+      id: "attachment-1",
+      photo_file_id: fileId,
+      ...caption,
+    };
+  }
+  if (unit.mediaKind === "audio") {
+    return {
+      type: "audio",
+      id: "attachment-1",
+      audio_file_id: fileId,
+      ...caption,
+    };
+  }
+  if (unit.mediaKind === "voice") {
+    return {
+      type: "voice",
+      id: "attachment-1",
+      voice_file_id: fileId,
+      title: unit.fileName,
+      ...caption,
+    };
+  }
+  return {
+    type: "document",
+    id: "attachment-1",
+    title: unit.fileName,
+    document_file_id: fileId,
+    ...caption,
+  };
+}
+
+/**
+ * Creates the concrete one-unit adapter. Every branch invokes exactly one
+ * non-idempotent Telegram mutation port after the injected gate admits it.
+ */
+export function createTelegramDurableOutboundUnitAdapter(
+  deps: TelegramDurableOutboundUnitAdapterDeps,
+): TelegramDurableOutboundUnitAdapter {
+  return {
+    async execute(input) {
+      let started = false;
+      const startMutation = (): void => {
+        if (started) {
+          throw new Error("Durable outbound unit attempted multiple mutations");
+        }
+        if (!deps.gate.canStart(input.identity, input.unit)) {
+          throw new Error("Durable outbound mutation gate denied start");
+        }
+        started = true;
+      };
+      const unitDeps = {
+        sendMessage: (body: TelegramSendMessageBody) => {
+          startMutation();
+          return deps.sendMessage(body);
+        },
+        sendRichMessage: (body: TelegramSendRichMessageBody) => {
+          startMutation();
+          return deps.sendRichMessage(body);
+        },
+        sendMultipartBytes: (
+          method: string,
+          fields: Record<string, string>,
+          fileField: string,
+          bytes: Uint8Array,
+          fileName: string,
+        ) => {
+          startMutation();
+          return deps.sendMultipartBytes(
+            method,
+            fields,
+            fileField,
+            bytes,
+            fileName,
+          );
+        },
+        answerGuestQuery: (
+          guestQueryId: string,
+          text?: string,
+          options?: TelegramAnswerGuestQueryOptions,
+        ) => {
+          startMutation();
+          return deps.answerGuestQuery(guestQueryId, text, options);
+        },
+      };
+      try {
+        let receipt: {
+          method: string;
+          messageId?: number;
+          result?: RecoveryOutboundReceiptResult;
+          transition?: "success" | "receipt-failure";
+        };
+        const unit = input.unit;
+        if (unit.kind === "final-text") {
+          receipt = unit.method === "sendRichMessage"
+            ? await sendTelegramNativeMarkdownReplyUnit(
+                input.identity.target.chatId,
+                unit.content,
+                unitDeps,
+                {
+                  target: input.identity.target,
+                  replyToMessageId: input.replyToMessageId,
+                  replyMarkup: input.replyMarkup,
+                },
+              )
+            : await sendTelegramRenderedReplyUnit(
+                input.identity.target.chatId,
+                unit.content,
+                unit.contentMode === "html" ? "html" : "plain",
+                unitDeps,
+                {
+                  target: input.identity.target,
+                  replyToMessageId: input.replyToMessageId,
+                  replyMarkup: input.replyMarkup,
+                },
+              );
+        } else if (unit.kind === "rich-media") {
+          receipt = await sendTelegramOutboundBinaryReplyUnit(
+            {
+              method: "sendRichMessage",
+              chatId: input.identity.target.chatId,
+              target: input.identity.target,
+              replyToMessageId: input.replyToMessageId,
+              replyMarkup: input.replyMarkup,
+              bytes: getSpoolBytes(input, unit.spoolRefIndex),
+              fileName: unit.fileName,
+              mediaKind: unit.mediaKind,
+              ...(unit.caption !== undefined ? { caption: unit.caption } : {}),
+            },
+            unitDeps,
+          );
+        } else if (unit.kind === "attachment" || unit.kind === "voice") {
+          const method = unit.kind === "voice"
+            ? "sendVoice"
+            : unit.mediaKind === "photo"
+              ? "sendPhoto"
+              : "sendDocument";
+          receipt = await sendTelegramOutboundBinaryReplyUnit(
+            {
+              method,
+              chatId: input.identity.target.chatId,
+              target: input.identity.target,
+              replyToMessageId: input.replyToMessageId,
+              ...(unit.kind === "voice" && input.replyMarkup !== undefined
+                ? { replyMarkup: input.replyMarkup }
+                : {}),
+              bytes: getSpoolBytes(input, unit.spoolRefIndex),
+              fileName: unit.fileName,
+              mediaKind: unit.mediaKind,
+              ...(unit.caption !== undefined ? { caption: unit.caption } : {}),
+            },
+            unitDeps,
+          );
+        } else if (unit.kind === "guest-text") {
+          if (!input.guestQueryId) {
+            throw new Error("Durable Guest query identity is missing");
+          }
+          receipt = await sendTelegramGuestMarkdownReplyUnit(
+            input.guestQueryId,
+            unit.markdown,
+            unitDeps,
+          );
+        } else if (unit.kind === "guest-stage") {
+          const fileField = unit.mediaKind === "photo"
+            ? "photo"
+            : unit.mediaKind === "audio"
+              ? "audio"
+              : unit.mediaKind === "voice"
+                ? "voice"
+                : "document";
+          const result = await unitDeps.sendMultipartBytes(
+            unit.method,
+            {
+              chat_id: String(input.identity.target.chatId),
+              ...getTelegramMultipartTargetFields(input.identity.target),
+            },
+            fileField,
+            getSpoolBytes(input, unit.spoolRefIndex),
+            unit.fileName,
+          );
+          const staging = readGuestStagingResult(result, unit.mediaKind);
+          if (!staging.fileId && !unit.branch?.receiptFailure) {
+            throw new TelegramReplyMalformedSuccessError(
+              "Guest staging upload file id",
+            );
+          }
+          receipt = {
+            method: unit.method,
+            messageId: staging.stagingMessageId,
+            result: staging,
+            ...(!staging.fileId
+              ? { transition: "receipt-failure" as const }
+              : {}),
+          };
+        } else if (unit.kind === "guest-answer") {
+          if (!input.guestQueryId) {
+            throw new Error("Durable Guest query identity is missing");
+          }
+          const staging = findGuestStagingReceipt(
+            input,
+            unit.stageOperationId,
+          );
+          if (!staging.fileId) {
+            throw new Error("Durable Guest staged file id is missing");
+          }
+          await unitDeps.answerGuestQuery(input.guestQueryId, undefined, {
+            result: buildGuestCachedMediaResult(unit, staging.fileId),
+          });
+          receipt = {
+            method: "answerGuestQuery",
+            result: { kind: "guest-answer" },
+          };
+        } else if (unit.kind === "guest-cleanup") {
+          const staging = findGuestStagingReceipt(
+            input,
+            unit.stageOperationId,
+          );
+          startMutation();
+          await deps.deleteMessage(
+            input.identity.target.chatId,
+            staging.stagingMessageId,
+          );
+          receipt = {
+            method: "deleteMessage",
+            result: {
+              kind: "guest-cleanup",
+              stagingMessageId: staging.stagingMessageId,
+            },
+          };
+        } else {
+          throw new Error("Unsupported durable outbound unit");
+        }
+        if (!deps.gate.isActive(input.identity)) {
+          return {
+            kind: "commit-unknown",
+            reason: "authority-lost-after-start",
+          };
+        }
+        if (receipt.method !== unit.method) {
+          return { kind: "commit-unknown", reason: "malformed-success" };
+        }
+        return { kind: "committed", ...receipt };
+      } catch (error) {
+        return classifyTelegramDurableOutboundError(error, started);
+      }
+    },
+  };
+}
+
+export interface TelegramDurableOutboundExecutorDeps {
+  store: Pick<
+    RecoveryStore,
+    | "activateOutbound"
+    | "claimOutboundUnit"
+    | "recordOutboundReceipt"
+    | "releaseOutboundUnitNotStarted"
+    | "recordOutboundSafeFailure"
+    | "markOutboundUncertain"
+  >;
+  claim: RecoveryIdentityClaim;
+  adapter: TelegramDurableOutboundUnitAdapter;
+  createReplyMarkup?: (
+    buttons: readonly RecoveryOutboundButton[],
+  ) => unknown;
+  recordOwnership?: (input: {
+    identity: RecoveryIdentity;
+    messageId: number;
+  }) => void;
+  recordRuntimeEvent?: (
+    category: string,
+    error: unknown,
+    details?: Record<string, unknown>,
+  ) => void;
+}
+
+export interface TelegramDurableOutboundExecutionResult {
+  record: RecoveryOutboundRecord;
+  outcome: TelegramDurableOutboundAdapterOutcome;
+}
+
+function buildTelegramDurableOutboundAdapterInput(
+  claimed: RecoveryOutboundDrainItem,
+  deps: TelegramDurableOutboundExecutorDeps,
+): TelegramDurableOutboundAdapterInput {
+  const execution = claimed.execution;
+  return {
+    identity: deps.claim.identity,
+    unit: execution.unit,
+    spool: claimed.spool,
+    receipts: claimed.record.receipts,
+    ...(execution.isFirstExecutedUnit && execution.replyToMessageId > 0
+      ? { replyToMessageId: execution.replyToMessageId }
+      : {}),
+    ...(execution.guestQueryId
+      ? { guestQueryId: execution.guestQueryId }
+      : {}),
+  };
+}
+
+/** Claims and executes exactly one durable outbound unit. */
+export async function executeNextTelegramDurableOutboundUnit(
+  recordId: string,
+  deps: TelegramDurableOutboundExecutorDeps,
+): Promise<TelegramDurableOutboundExecutionResult> {
+  const activated = deps.store.activateOutbound(recordId, deps.claim);
+  const claimed = deps.store.claimOutboundUnit({
+    recordId: activated.recordId,
+    claim: deps.claim,
+  });
+  const execution = claimed.execution;
+  let outcome: TelegramDurableOutboundAdapterOutcome | undefined;
+  let replyMarkup: unknown;
+  try {
+    if (execution.acceptsFinalButtons && execution.buttons.length > 0) {
+      replyMarkup = deps.createReplyMarkup?.(execution.buttons);
+      if (replyMarkup === undefined) outcome = { kind: "not-started" };
+    }
+  } catch {
+    outcome = { kind: "not-started" };
+  }
+  if (!outcome) {
+    const input = {
+      ...buildTelegramDurableOutboundAdapterInput(claimed, deps),
+      ...(replyMarkup !== undefined ? { replyMarkup } : {}),
+    };
+    try {
+      outcome = await deps.adapter.execute(input);
+    } catch (error) {
+      outcome = classifyTelegramDurableOutboundError(error, true);
+    }
+  }
+  const activeUnit = claimed.record.activeUnit;
+  if (!activeUnit) {
+    throw new Error("Durable outbound claim returned no active attempt");
+  }
+  if (outcome.kind === "committed") {
+    const unit = execution.unit;
+    const hasValidMessageId =
+      outcome.messageId !== undefined &&
+      Number.isSafeInteger(outcome.messageId) &&
+      outcome.messageId > 0;
+    const resultMatches = unit.kind === "guest-stage"
+      ? hasValidMessageId &&
+        outcome.result?.kind === "guest-staging" &&
+        outcome.result.stagingMessageId === outcome.messageId &&
+        outcome.result.mediaKind === unit.mediaKind
+      : unit.kind === "guest-answer"
+        ? outcome.messageId === undefined &&
+          outcome.result?.kind === "guest-answer"
+        : unit.kind === "guest-cleanup"
+          ? outcome.messageId === undefined &&
+            outcome.result?.kind === "guest-cleanup"
+          : unit.kind === "guest-text"
+            ? outcome.messageId === undefined && outcome.result === undefined
+            : hasValidMessageId && outcome.result === undefined;
+    if (outcome.method !== unit.method || !resultMatches) {
+      outcome = { kind: "commit-unknown", reason: "malformed-success" };
+    } else {
+      const committedOutcome = outcome;
+      let record: RecoveryOutboundRecord | undefined;
+      try {
+        record = deps.store.recordOutboundReceipt({
+          recordId,
+          claim: deps.claim,
+          attemptId: activeUnit.attemptId,
+          operationId: execution.unit.operationId,
+          method: committedOutcome.method,
+          ...(committedOutcome.messageId !== undefined
+            ? { messageId: committedOutcome.messageId }
+            : {}),
+          ...(committedOutcome.result
+            ? { result: committedOutcome.result }
+            : {}),
+          ...(committedOutcome.transition
+            ? { transition: committedOutcome.transition }
+            : {}),
+        });
+      } catch {
+        outcome = {
+          kind: "commit-unknown",
+          reason: "confirmed-before-receipt",
+        };
+      }
+      if (record) {
+        if (
+          committedOutcome.messageId !== undefined &&
+          execution.unit.kind !== "guest-stage"
+        ) {
+          try {
+            deps.recordOwnership?.({
+              identity: deps.claim.identity,
+              messageId: committedOutcome.messageId,
+            });
+          } catch (error) {
+            try {
+              deps.recordRuntimeEvent?.("delivery", error, {
+                phase: "durable-outbound-ownership",
+                recordId,
+                operationId: execution.unit.operationId,
+              });
+            } catch {
+              // Diagnostics must never roll back or block a committed receipt.
+            }
+          }
+        }
+        return { record, outcome: committedOutcome };
+      }
+    }
+  }
+  const failureInput = {
+    recordId,
+    claim: deps.claim,
+    attemptId: activeUnit.attemptId,
+  };
+  const record = outcome.kind === "commit-unknown"
+    ? deps.store.markOutboundUncertain({
+        ...failureInput,
+        reason: outcome.reason,
+      })
+    : outcome.kind === "not-started"
+      ? deps.store.releaseOutboundUnitNotStarted(failureInput)
+      : deps.store.recordOutboundSafeFailure(failureInput);
+  return { record, outcome };
 }

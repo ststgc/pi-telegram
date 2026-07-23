@@ -14,16 +14,25 @@ import test from "node:test";
 
 import {
   commitTelegramDurableOutbound,
+  createTelegramDurableOutboundUnitAdapter,
+  executeNextTelegramDurableOutboundUnit,
   planTelegramDurableOutbound,
   readTelegramDurableOutboundSource,
+  type TelegramDurableOutboundAdapterInput,
   type TelegramDurableOutboundPlanOptions,
+  type TelegramDurableOutboundUnitAdapterDeps,
 } from "../lib/outbound-recovery.ts";
 import {
   openRecoveryStore,
   RecoveryQuotaExceededError,
   type RecoveryIdentity,
+  type RecoveryOutboundUnit,
   type RecoveryStore,
 } from "../lib/recovery.ts";
+import {
+  TelegramApiCommitUnknownError,
+  TelegramApiHttpError,
+} from "../lib/telegram-api.ts";
 
 const identityTransform = async (text: string): Promise<string> => text;
 
@@ -91,6 +100,57 @@ async function removeHarness(harness: DurableHarness): Promise<void> {
   await rm(harness.tempDir, { recursive: true, force: true });
 }
 
+function createUnitAdapterHarness(
+  overrides: Partial<TelegramDurableOutboundUnitAdapterDeps> = {},
+) {
+  const calls: string[] = [];
+  const base: TelegramDurableOutboundUnitAdapterDeps = {
+    gate: {
+      canStart: () => true,
+      isActive: () => true,
+    },
+    sendMessage: async () => {
+      calls.push("sendMessage");
+      return { message_id: 101 };
+    },
+    sendRichMessage: async () => {
+      calls.push("sendRichMessage");
+      return { message_id: 102 };
+    },
+    sendMultipartBytes: async (method) => {
+      calls.push(method);
+      return { message_id: 103 };
+    },
+    answerGuestQuery: async () => {
+      calls.push("answerGuestQuery");
+    },
+    deleteMessage: async () => {
+      calls.push("deleteMessage");
+    },
+  };
+  return {
+    calls,
+    adapter: createTelegramDurableOutboundUnitAdapter({
+      ...base,
+      ...overrides,
+      gate: overrides.gate ?? base.gate,
+    }),
+  };
+}
+
+function adapterInput(
+  unit: RecoveryOutboundUnit,
+  overrides: Partial<TelegramDurableOutboundAdapterInput> = {},
+): TelegramDurableOutboundAdapterInput {
+  return {
+    identity: IDENTITY,
+    unit,
+    spool: [],
+    receipts: [],
+    ...overrides,
+  };
+}
+
 test("durable outbound planner is deterministic and preserves rich versus ordinary unit order", () => {
   const harnessView = { inboundRecordId: "inbound-1", turnId: "turn-1" };
   const richOptions = baseOptions(harnessView, {
@@ -113,9 +173,12 @@ test("durable outbound planner is deterministic and preserves rich versus ordina
       fileName: "report.png",
       mediaKind: "photo",
       caption: "Final **answer**.",
-      fallback: {
-        trigger: "known-failure",
-        operationIds: ["outbound-unit-0001", "outbound-unit-0002"],
+      branch: {
+        success: { kind: "terminal" },
+        knownFailure: {
+          kind: "operation",
+          operationId: "outbound-unit-0001",
+        },
       },
     },
     {
@@ -209,15 +272,26 @@ test("durable outbound planner preserves generated voice and Guest precedence", 
       { path: "/private/source/guest.mp3", fileName: "guest.mp3" },
     ],
   }));
-  assert.deepEqual(guestAttachment.recoveryPlan.units, [{
-    kind: "guest",
-    operationId: "outbound-unit-0000",
-    method: "answerGuestQuery",
-    spoolRefIndex: 0,
-    fileName: "guest.mp3",
-    mediaKind: "audio",
-    caption: "Guest caption.",
-  }]);
+  assert.deepEqual(
+    guestAttachment.recoveryPlan.units.map((unit) => [unit.kind, unit.method]),
+    [
+      ["guest-stage", "sendAudio"],
+      ["guest-answer", "answerGuestQuery"],
+      ["guest-cleanup", "deleteMessage"],
+      ["guest-cleanup", "deleteMessage"],
+      ["guest-text", "answerGuestQuery"],
+    ],
+  );
+  assert.deepEqual(guestAttachment.recoveryPlan.units[0]?.branch, {
+    knownFailure: {
+      kind: "operation",
+      operationId: "outbound-unit-0004",
+    },
+    receiptFailure: {
+      kind: "operation",
+      operationId: "outbound-unit-0003",
+    },
+  });
   assert.deepEqual(guestAttachment.recoveryPlan.buttons, []);
 
   const guestAttachmentWins = planTelegramDurableOutbound(baseOptions(harnessView, {
@@ -229,7 +303,7 @@ test("durable outbound planner preserves generated voice and Guest precedence", 
     ],
   }));
   assert.equal(guestAttachmentWins.recoveryPlan.voice, undefined);
-  assert.equal(guestAttachmentWins.recoveryPlan.units[0]?.kind, "guest");
+  assert.equal(guestAttachmentWins.recoveryPlan.units[0]?.kind, "guest-stage");
 
   const guestVoice = planTelegramDurableOutbound(baseOptions(harnessView, {
     replyToMessageId: 0,
@@ -240,14 +314,16 @@ test("durable outbound planner preserves generated voice and Guest precedence", 
       { path: "/private/source/guest.opus", fileName: "guest.opus" },
     ],
   }));
-  assert.deepEqual(guestVoice.recoveryPlan.units, [{
-    kind: "guest",
-    operationId: "outbound-unit-0000",
-    method: "answerGuestQuery",
-    spoolRefIndex: 0,
-    fileName: "guest.opus",
-    mediaKind: "voice",
-  }]);
+  assert.deepEqual(
+    guestVoice.recoveryPlan.units.map((unit) => [unit.kind, unit.method]),
+    [
+      ["guest-stage", "sendVoice"],
+      ["guest-answer", "answerGuestQuery"],
+      ["guest-cleanup", "deleteMessage"],
+      ["guest-cleanup", "deleteMessage"],
+      ["guest-text", "answerGuestQuery"],
+    ],
+  );
   assert.deepEqual(guestVoice.recoveryPlan.voice, {
     text: "Speak automatically.",
     automatic: true,
@@ -272,10 +348,16 @@ test("durable planner rejects path-like filenames and caps Guest captions by cod
     finalMarkdown: caption,
     queuedAttachments: [{ path: "/private/source/file.pdf", fileName: "file.pdf" }],
   }));
-  const unit = guest.recoveryPlan.units[0];
-  assert.equal(unit?.kind, "guest");
-  assert.equal(Array.from(unit?.kind === "guest" ? unit.caption ?? "" : "").length, 1024);
-  assert.equal(unit?.kind === "guest" ? unit.caption : undefined, "😀".repeat(1024));
+  const unit = guest.recoveryPlan.units[1];
+  assert.equal(unit?.kind, "guest-answer");
+  assert.equal(
+    Array.from(unit?.kind === "guest-answer" ? unit.caption ?? "" : "").length,
+    1024,
+  );
+  assert.equal(
+    unit?.kind === "guest-answer" ? unit.caption : undefined,
+    "😀".repeat(1024),
+  );
 });
 
 test("descriptor reader rejects source mutation, missing files, and over-limit files", async () => {
@@ -386,7 +468,7 @@ test("commit transforms Markdown and button labels before rendering and publicat
   }
 });
 
-test("commit preserves voice semantics without transforming voice-only text", async () => {
+test("commit preserves voice metadata while transforming deterministic voice-only fallback", async () => {
   const harness = await createHarness();
   try {
     const voicePath = join(harness.tempDir, "voice.ogg");
@@ -406,13 +488,18 @@ test("commit preserves voice semantics without transforming voice-only text", as
         },
       },
     );
-    assert.deepEqual(calls, []);
+    assert.deepEqual(calls, ["Speak this answer."]);
     const payload = JSON.parse(Buffer.from(committed.payload).toString("utf8")) as {
       finalMarkdown: string;
       voice?: { text: string; automatic: boolean };
+      units: Array<{ kind: string; content?: string }>;
     };
     assert.equal(payload.finalMarkdown, "");
     assert.deepEqual(payload.voice, { text: "Speak this answer.", automatic: true });
+    assert.deepEqual(
+      payload.units.map((unit) => [unit.kind, unit.content]),
+      [["voice", undefined], ["final-text", "Speak this answer."]],
+    );
   } finally {
     await removeHarness(harness);
   }
@@ -532,5 +619,1138 @@ test("missing and quota-rejected source plans leave dispatching inbound with no 
     );
   } finally {
     await removeHarness(quotaHarness);
+  }
+});
+
+test("one-unit adapter distinguishes pre-start denial, safe rejection, and exact ambiguity", async () => {
+  const finalUnit: RecoveryOutboundUnit = {
+    kind: "final-text",
+    operationId: "operation-text",
+    method: "sendMessage",
+    content: "answer",
+    contentMode: "plain",
+  };
+
+  const denied = createUnitAdapterHarness({
+    gate: { canStart: () => false, isActive: () => true },
+  });
+  assert.deepEqual(
+    await denied.adapter.execute(adapterInput(finalUnit)),
+    { kind: "not-started" },
+  );
+  assert.deepEqual(denied.calls, []);
+
+  const invalidMarkup = createUnitAdapterHarness();
+  assert.deepEqual(
+    await invalidMarkup.adapter.execute(adapterInput(finalUnit, {
+      replyMarkup: {
+        inline_keyboard: [[{ text: "bad", callback_data: "x".repeat(65) }]],
+      },
+    })),
+    { kind: "not-started" },
+  );
+  assert.deepEqual(invalidMarkup.calls, []);
+
+  const rejected = createUnitAdapterHarness({
+    sendMessage: async () => {
+      throw new TelegramApiHttpError("bad request", 400, undefined);
+    },
+  });
+  assert.deepEqual(
+    await rejected.adapter.execute(adapterInput(finalUnit)),
+    { kind: "known-not-committed" },
+  );
+
+  const timedOut = createUnitAdapterHarness({
+    sendMessage: async () => {
+      throw new TelegramApiCommitUnknownError(
+        "sendMessage",
+        new Error("deadline"),
+        "timeout-after-write",
+      );
+    },
+  });
+  assert.deepEqual(
+    await timedOut.adapter.execute(adapterInput(finalUnit)),
+    { kind: "commit-unknown", reason: "timeout-after-write" },
+  );
+
+  const malformed = createUnitAdapterHarness({
+    sendMessage: async () => ({ message_id: 0 }),
+  });
+  assert.deepEqual(
+    await malformed.adapter.execute(adapterInput(finalUnit)),
+    { kind: "commit-unknown", reason: "malformed-success" },
+  );
+
+  const authorityLost = createUnitAdapterHarness({
+    gate: { canStart: () => true, isActive: () => false },
+  });
+  assert.deepEqual(
+    await authorityLost.adapter.execute(adapterInput(finalUnit)),
+    { kind: "commit-unknown", reason: "authority-lost-after-start" },
+  );
+  assert.deepEqual(authorityLost.calls, ["sendMessage"]);
+});
+
+test("one-unit adapter executes attachment, voice, and Guest branches exactly once", async () => {
+  for (const [unit, expectedCall] of [
+    [{
+      kind: "attachment",
+      operationId: "photo",
+      method: "sendPhoto",
+      spoolRefIndex: 0,
+      fileName: "photo.png",
+      mediaKind: "photo",
+    }, "sendPhoto"],
+    [{
+      kind: "attachment",
+      operationId: "document",
+      method: "sendDocument",
+      spoolRefIndex: 0,
+      fileName: "report.pdf",
+      mediaKind: "document",
+    }, "sendDocument"],
+    [{
+      kind: "voice",
+      operationId: "voice",
+      method: "sendVoice",
+      spoolRefIndex: 0,
+      fileName: "answer.ogg",
+      mediaKind: "voice",
+    }, "sendVoice"],
+  ] as const) {
+    const harness = createUnitAdapterHarness();
+    assert.deepEqual(
+      await harness.adapter.execute(adapterInput(unit, {
+        spool: [Buffer.from("verified bytes")],
+      })),
+      { kind: "committed", method: expectedCall, messageId: 103 },
+    );
+    assert.deepEqual(harness.calls, [expectedCall]);
+  }
+
+  const guestText = createUnitAdapterHarness();
+  assert.deepEqual(
+    await guestText.adapter.execute(adapterInput({
+      kind: "guest-text",
+      operationId: "guest-text",
+      method: "answerGuestQuery",
+      markdown: "Guest answer",
+    }, { guestQueryId: "guest-query" })),
+    { kind: "committed", method: "answerGuestQuery" },
+  );
+  assert.deepEqual(guestText.calls, ["answerGuestQuery"]);
+
+  const guestStage = createUnitAdapterHarness({
+    sendMultipartBytes: async (method) => {
+      guestStage.calls.push(method);
+      return { message_id: 110, voice: { file_id: "voice-file" } };
+    },
+  });
+  assert.deepEqual(
+    await guestStage.adapter.execute(adapterInput({
+      kind: "guest-stage",
+      operationId: "guest-stage",
+      method: "sendVoice",
+      spoolRefIndex: 0,
+      fileName: "guest.ogg",
+      mediaKind: "voice",
+    }, { spool: [Buffer.from("guest voice")] })),
+    {
+      kind: "committed",
+      method: "sendVoice",
+      messageId: 110,
+      result: {
+        kind: "guest-staging",
+        stagingMessageId: 110,
+        mediaKind: "voice",
+        fileId: "voice-file",
+      },
+    },
+  );
+  assert.deepEqual(guestStage.calls, ["sendVoice"]);
+
+  const stageReceipt = {
+    unitIndex: 0,
+    operationId: "guest-stage",
+    method: "sendVoice",
+    messageId: 110,
+    result: {
+      kind: "guest-staging" as const,
+      stagingMessageId: 110,
+      mediaKind: "voice" as const,
+      fileId: "voice-file",
+    },
+    committedAtMs: 1,
+  };
+  const guestAnswer = createUnitAdapterHarness();
+  assert.deepEqual(
+    await guestAnswer.adapter.execute(adapterInput({
+      kind: "guest-answer",
+      operationId: "guest-answer",
+      method: "answerGuestQuery",
+      stageOperationId: "guest-stage",
+      fileName: "guest.ogg",
+      mediaKind: "voice",
+    }, { guestQueryId: "guest-query", receipts: [stageReceipt] })),
+    {
+      kind: "committed",
+      method: "answerGuestQuery",
+      result: { kind: "guest-answer" },
+    },
+  );
+  assert.deepEqual(guestAnswer.calls, ["answerGuestQuery"]);
+
+  const guestCleanup = createUnitAdapterHarness();
+  assert.deepEqual(
+    await guestCleanup.adapter.execute(adapterInput({
+      kind: "guest-cleanup",
+      operationId: "guest-cleanup",
+      method: "deleteMessage",
+      stageOperationId: "guest-stage",
+    }, { receipts: [stageReceipt] })),
+    {
+      kind: "committed",
+      method: "deleteMessage",
+      result: { kind: "guest-cleanup", stagingMessageId: 110 },
+    },
+  );
+  assert.deepEqual(guestCleanup.calls, ["deleteMessage"]);
+
+  const missingSpool = createUnitAdapterHarness();
+  assert.deepEqual(
+    await missingSpool.adapter.execute(adapterInput({
+      kind: "voice",
+      operationId: "missing",
+      method: "sendVoice",
+      spoolRefIndex: 0,
+      fileName: "missing.ogg",
+      mediaKind: "voice",
+    })),
+    { kind: "not-started" },
+  );
+  assert.deepEqual(missingSpool.calls, []);
+});
+
+test("executor persists each text receipt before restart continuation without confirmed resend", async () => {
+  const harness = await createHarness();
+  try {
+    const markdown = [
+      "a".repeat(32_000),
+      "",
+      "b".repeat(2_000),
+      "",
+      '<!-- telegram_button label=Continue prompt="Continue safely." -->',
+    ].join("\n");
+    const committed = await commitTelegramDurableOutbound(
+      baseOptions(harness, { finalMarkdown: markdown }),
+      { store: harness.store, transformReply: identityTransform },
+    );
+    const bodies: Array<Record<string, unknown>> = [];
+    const ownership: number[] = [];
+    const adapter = createTelegramDurableOutboundUnitAdapter({
+      gate: { canStart: () => true, isActive: () => true },
+      sendMessage: async () => {
+        throw new Error("ordinary transport must not run");
+      },
+      sendRichMessage: async (body) => {
+        bodies.push(body);
+        return { message_id: bodies.length + 200 };
+      },
+      sendMultipartBytes: async () => {
+        throw new Error("multipart transport must not run");
+      },
+      answerGuestQuery: async () => {
+        throw new Error("Guest transport must not run");
+      },
+      deleteMessage: async () => {
+        throw new Error("Guest cleanup transport must not run");
+      },
+    });
+    const deps = {
+      claim: { identity: IDENTITY },
+      adapter,
+      createReplyMarkup: () => ({
+        inline_keyboard: [[{ text: "Continue", callback_data: "continue" }]],
+      }),
+      recordOwnership: ({ messageId }: { messageId: number }) => {
+        ownership.push(messageId);
+      },
+    };
+    const first = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      { ...deps, store: harness.store },
+    );
+    assert.equal(first.record.state, "pending");
+    assert.deepEqual(first.record.receipts.map((receipt) => receipt.unitIndex), [0]);
+
+    const reopened = openRecoveryStore({
+      profile: "default",
+      rootPath: harness.store.rootPath,
+      isIdentityAuthenticated: () => true,
+    });
+    const second = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      { ...deps, store: reopened },
+    );
+    assert.equal(second.record.state, "delivered");
+    assert.deepEqual(
+      second.record.receipts.map((receipt) => receipt.unitIndex),
+      [0, 1],
+    );
+    assert.equal(bodies.length, 2);
+    assert.deepEqual(bodies[0]?.reply_parameters, {
+      message_id: 45,
+      allow_sending_without_reply: true,
+    });
+    assert.equal("reply_markup" in (bodies[0] ?? {}), false);
+    assert.equal("reply_parameters" in (bodies[1] ?? {}), false);
+    assert.deepEqual(bodies[1]?.reply_markup, {
+      inline_keyboard: [[{ text: "Continue", callback_data: "continue" }]],
+    });
+    assert.deepEqual(ownership, [201, 202]);
+    await assert.rejects(
+      executeNextTelegramDurableOutboundUnit(
+        committed.record.recordId,
+        { ...deps, store: reopened },
+      ),
+      /Invalid outbound transition delivered/,
+    );
+    assert.equal(bodies.length, 2);
+  } finally {
+    await removeHarness(harness);
+  }
+});
+
+test("Rich primary success skips fallback while safe rejection selects it as the first reply", async () => {
+  const successHarness = await createHarness();
+  try {
+    const sourcePath = join(successHarness.tempDir, "result.png");
+    await writeFile(sourcePath, "image bytes");
+    const committed = await commitTelegramDurableOutbound(
+      baseOptions(successHarness, {
+        finalMarkdown: "Result\n\n<!-- telegram_button: Open -->",
+        queuedAttachments: [{ path: sourcePath, fileName: "result.png" }],
+      }),
+      { store: successHarness.store, transformReply: identityTransform },
+    );
+    const multipart: Array<Record<string, string>> = [];
+    const adapter = createTelegramDurableOutboundUnitAdapter({
+      gate: { canStart: () => true, isActive: () => true },
+      sendMessage: async () => ({ message_id: 1 }),
+      sendRichMessage: async () => ({ message_id: 2 }),
+      sendMultipartBytes: async (_method, fields) => {
+        multipart.push(fields);
+        return { message_id: 303 };
+      },
+      answerGuestQuery: async () => {},
+      deleteMessage: async () => {},
+    });
+    const result = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      {
+        store: successHarness.store,
+        claim: { identity: IDENTITY },
+        adapter,
+        createReplyMarkup: () => ({
+          inline_keyboard: [[{ text: "Open", callback_data: "open" }]],
+        }),
+      },
+    );
+    assert.equal(result.record.state, "delivered");
+    assert.deepEqual(result.record.receipts.map((receipt) => receipt.unitIndex), [0]);
+    assert.equal(multipart.length, 1);
+    assert.equal(multipart[0]?.reply_parameters, JSON.stringify({
+      message_id: 45,
+      allow_sending_without_reply: true,
+    }));
+    assert.equal(multipart[0]?.reply_markup, JSON.stringify({
+      inline_keyboard: [[{ text: "Open", callback_data: "open" }]],
+    }));
+  } finally {
+    await removeHarness(successHarness);
+  }
+
+  const fallbackHarness = await createHarness();
+  try {
+    const sourcePath = join(fallbackHarness.tempDir, "result.png");
+    await writeFile(sourcePath, "image bytes");
+    const committed = await commitTelegramDurableOutbound(
+      baseOptions(fallbackHarness, {
+        finalMarkdown: "Result\n\n<!-- telegram_button: Open -->",
+        queuedAttachments: [{ path: sourcePath, fileName: "result.png" }],
+      }),
+      { store: fallbackHarness.store, transformReply: identityTransform },
+    );
+    const rejected = createUnitAdapterHarness({
+      sendMultipartBytes: async () => {
+        throw new TelegramApiHttpError("unsupported", 400, undefined);
+      },
+    });
+    const first = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      {
+        store: fallbackHarness.store,
+        claim: { identity: IDENTITY },
+        adapter: rejected.adapter,
+        createReplyMarkup: () => ({
+          inline_keyboard: [[{ text: "Open", callback_data: "open" }]],
+        }),
+      },
+    );
+    assert.deepEqual(first.outcome, { kind: "known-not-committed" });
+    assert.equal(first.record.nextUnitIndex, 1);
+    assert.deepEqual(first.record.receipts, []);
+
+    const richBodies: Array<Record<string, unknown>> = [];
+    const fallback = createUnitAdapterHarness({
+      sendRichMessage: async (body) => {
+        richBodies.push(body);
+        return { message_id: 404 };
+      },
+    });
+    const second = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      {
+        store: fallbackHarness.store,
+        claim: { identity: IDENTITY },
+        adapter: fallback.adapter,
+        createReplyMarkup: () => ({
+          inline_keyboard: [[{ text: "Open", callback_data: "open" }]],
+        }),
+      },
+    );
+    assert.equal(second.record.state, "pending");
+    assert.deepEqual(second.record.receipts.map((receipt) => receipt.unitIndex), [1]);
+    assert.deepEqual(richBodies[0]?.reply_parameters, {
+      message_id: 45,
+      allow_sending_without_reply: true,
+    });
+    assert.deepEqual(richBodies[0]?.reply_markup, {
+      inline_keyboard: [[{ text: "Open", callback_data: "open" }]],
+    });
+  } finally {
+    await removeHarness(fallbackHarness);
+  }
+});
+
+test("Rich ambiguity blocks fallback and receipt commit failure becomes durable uncertainty", async () => {
+  const richHarness = await createHarness();
+  try {
+    const sourcePath = join(richHarness.tempDir, "result.png");
+    await writeFile(sourcePath, "image bytes");
+    const committed = await commitTelegramDurableOutbound(
+      baseOptions(richHarness, {
+        queuedAttachments: [{ path: sourcePath, fileName: "result.png" }],
+      }),
+      { store: richHarness.store, transformReply: identityTransform },
+    );
+    let mutations = 0;
+    const adapter = createUnitAdapterHarness({
+      sendMultipartBytes: async () => {
+        mutations += 1;
+        throw new TelegramApiCommitUnknownError(
+          "sendRichMessage",
+          new Error("response lost"),
+          "response-lost",
+        );
+      },
+    }).adapter;
+    const uncertain = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      {
+        store: richHarness.store,
+        claim: { identity: IDENTITY },
+        adapter,
+      },
+    );
+    assert.equal(uncertain.record.state, "delivery-uncertain");
+    assert.equal(uncertain.record.uncertainty?.reason, "response-lost");
+    assert.equal(mutations, 1);
+    await assert.rejects(
+      executeNextTelegramDurableOutboundUnit(
+        committed.record.recordId,
+        { store: richHarness.store, claim: { identity: IDENTITY }, adapter },
+      ),
+      /Invalid outbound transition delivery-uncertain/,
+    );
+    assert.equal(mutations, 1);
+  } finally {
+    await removeHarness(richHarness);
+  }
+
+  const receiptHarness = await createHarness();
+  try {
+    const committed = await commitTelegramDurableOutbound(
+      baseOptions(receiptHarness),
+      { store: receiptHarness.store, transformReply: identityTransform },
+    );
+    const adapter = createUnitAdapterHarness().adapter;
+    const uncertain = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      {
+        store: {
+          activateOutbound: receiptHarness.store.activateOutbound.bind(receiptHarness.store),
+          claimOutboundUnit: receiptHarness.store.claimOutboundUnit.bind(receiptHarness.store),
+          recordOutboundReceipt: () => {
+            throw new Error("snapshot unavailable");
+          },
+          releaseOutboundUnitNotStarted:
+            receiptHarness.store.releaseOutboundUnitNotStarted.bind(receiptHarness.store),
+          recordOutboundSafeFailure:
+            receiptHarness.store.recordOutboundSafeFailure.bind(receiptHarness.store),
+          markOutboundUncertain:
+            receiptHarness.store.markOutboundUncertain.bind(receiptHarness.store),
+        },
+        claim: { identity: IDENTITY },
+        adapter,
+      },
+    );
+    assert.equal(uncertain.record.state, "delivery-uncertain");
+    assert.equal(
+      uncertain.record.uncertainty?.reason,
+      "confirmed-before-receipt",
+    );
+  } finally {
+    await removeHarness(receiptHarness);
+  }
+});
+
+test("executor releases not-started units without consuming attempts or selecting fallback", async () => {
+  const harness = await createHarness();
+  try {
+    const sourcePath = join(harness.tempDir, "result.png");
+    await writeFile(sourcePath, "image bytes");
+    const committed = await commitTelegramDurableOutbound(
+      baseOptions(harness, {
+        finalMarkdown: "Result\n\n<!-- telegram_button: Open -->",
+        queuedAttachments: [{ path: sourcePath, fileName: "result.png" }],
+      }),
+      { store: harness.store, transformReply: identityTransform },
+    );
+    let mutations = 0;
+    const adapter = createUnitAdapterHarness({
+      sendMultipartBytes: async () => {
+        mutations += 1;
+        return { message_id: 1 };
+      },
+    }).adapter;
+    const result = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      {
+        store: harness.store,
+        claim: { identity: IDENTITY },
+        adapter,
+      },
+    );
+    assert.deepEqual(result.outcome, { kind: "not-started" });
+    assert.equal(result.record.state, "pending");
+    assert.equal(result.record.nextUnitIndex, 0);
+    assert.equal(result.record.automaticAttemptCount, 0);
+    assert.deepEqual(result.record.receipts, []);
+    assert.equal(mutations, 0);
+    assert.throws(
+      () => harness.store.releaseOutboundUnitNotStarted({
+        recordId: committed.record.recordId,
+        claim: { identity: IDENTITY },
+        attemptId: "stale-attempt",
+      }),
+      /active attempt claim denied/,
+    );
+  } finally {
+    await removeHarness(harness);
+  }
+});
+
+test("ownership projection failure cannot roll a confirmed receipt back to uncertainty", async () => {
+  const harness = await createHarness();
+  try {
+    const committed = await commitTelegramDurableOutbound(
+      baseOptions(harness),
+      { store: harness.store, transformReply: identityTransform },
+    );
+    let sends = 0;
+    const adapter = createUnitAdapterHarness({
+      sendRichMessage: async () => {
+        sends += 1;
+        return { message_id: 505 };
+      },
+    }).adapter;
+    const events: Array<{
+      category: string;
+      message: string;
+      details?: Record<string, unknown>;
+    }> = [];
+    const delivered = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      {
+        store: harness.store,
+        claim: { identity: IDENTITY },
+        adapter,
+        recordOwnership: () => {
+          throw new Error("ownership projection failed");
+        },
+        recordRuntimeEvent: (category, error, details) => {
+          events.push({
+            category,
+            message: (error as Error).message,
+            details,
+          });
+        },
+      },
+    );
+    assert.equal(delivered.record.state, "delivered");
+    assert.deepEqual(events, [{
+      category: "delivery",
+      message: "ownership projection failed",
+      details: {
+        phase: "durable-outbound-ownership",
+        recordId: committed.record.recordId,
+        operationId: "outbound-unit-0000",
+      },
+    }]);
+    assert.equal(sends, 1);
+    assert.deepEqual(
+      harness.store.listClaimableOutboundRecords({ identity: IDENTITY }),
+      [],
+    );
+    await assert.rejects(
+      executeNextTelegramDurableOutboundUnit(committed.record.recordId, {
+        store: harness.store,
+        claim: { identity: IDENTITY },
+        adapter,
+      }),
+      /Invalid outbound transition delivered/,
+    );
+    assert.equal(sends, 1);
+  } finally {
+    await removeHarness(harness);
+  }
+});
+
+test("voice-only branches skip fallback on success, select it once on safe failure, and stop on ambiguity", async () => {
+  const makeVoicePlan = async (harness: DurableHarness) => {
+    const firstPath = join(harness.tempDir, "first.ogg");
+    const secondPath = join(harness.tempDir, "second.ogg");
+    await writeFile(firstPath, "first voice");
+    await writeFile(secondPath, "second voice");
+    return commitTelegramDurableOutbound(
+      baseOptions(harness, {
+        finalMarkdown: [
+          "<!-- telegram_voice: First spoken part. -->",
+          "<!-- telegram_voice: Second spoken part. -->",
+        ].join("\n"),
+        generatedVoice: [
+          { path: firstPath, fileName: "first.ogg" },
+          { path: secondPath, fileName: "second.ogg" },
+        ],
+      }),
+      { store: harness.store, transformReply: identityTransform },
+    );
+  };
+
+  const successHarness = await createHarness();
+  try {
+    const committed = await makeVoicePlan(successHarness);
+    const adapter = createUnitAdapterHarness().adapter;
+    const first = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      { store: successHarness.store, claim: { identity: IDENTITY }, adapter },
+    );
+    assert.equal(first.record.state, "pending");
+    const reopened = openRecoveryStore({
+      profile: "default",
+      rootPath: successHarness.store.rootPath,
+      isIdentityAuthenticated: () => true,
+    });
+    const second = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      { store: reopened, claim: { identity: IDENTITY }, adapter },
+    );
+    assert.equal(second.record.state, "delivered");
+    assert.deepEqual(
+      second.record.receipts.map((receipt) => receipt.unitIndex),
+      [0, 1],
+    );
+    assert.deepEqual(second.record.unitProgress, [
+      {
+        unitIndex: 0,
+        operationId: "outbound-unit-0000",
+        outcome: "committed",
+      },
+      {
+        unitIndex: 1,
+        operationId: "outbound-unit-0001",
+        outcome: "committed",
+      },
+      {
+        unitIndex: 2,
+        operationId: "outbound-unit-0002",
+        outcome: "skipped",
+        reason: "branch",
+      },
+    ]);
+  } finally {
+    await removeHarness(successHarness);
+  }
+
+  const partialHarness = await createHarness();
+  try {
+    const committed = await makeVoicePlan(partialHarness);
+    let voiceStarts = 0;
+    const adapter = createUnitAdapterHarness({
+      sendMultipartBytes: async () => {
+        voiceStarts += 1;
+        if (voiceStarts === 2) {
+          throw new TelegramApiHttpError("voice rejected", 400, undefined);
+        }
+        return { message_id: 610 };
+      },
+    }).adapter;
+    await executeNextTelegramDurableOutboundUnit(committed.record.recordId, {
+      store: partialHarness.store,
+      claim: { identity: IDENTITY },
+      adapter,
+    });
+    const reopened = openRecoveryStore({
+      profile: "default",
+      rootPath: partialHarness.store.rootPath,
+      isIdentityAuthenticated: () => true,
+    });
+    const failed = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      { store: reopened, claim: { identity: IDENTITY }, adapter },
+    );
+    assert.deepEqual(failed.outcome, { kind: "known-not-committed" });
+    assert.equal(failed.record.nextUnitIndex, 2);
+    assert.deepEqual(
+      failed.record.receipts.map((receipt) => receipt.unitIndex),
+      [0],
+    );
+    assert.deepEqual(failed.record.unitProgress.slice(0, 2), [
+      {
+        unitIndex: 0,
+        operationId: "outbound-unit-0000",
+        outcome: "committed",
+      },
+      {
+        unitIndex: 1,
+        operationId: "outbound-unit-0001",
+        outcome: "skipped",
+        reason: "known-failure",
+      },
+    ]);
+    const fallbackCalls: string[] = [];
+    const fallback = createUnitAdapterHarness({
+      sendRichMessage: async () => {
+        fallbackCalls.push("fallback");
+        return { message_id: 611 };
+      },
+    }).adapter;
+    const delivered = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      { store: reopened, claim: { identity: IDENTITY }, adapter: fallback },
+    );
+    assert.equal(delivered.record.state, "delivered");
+    assert.deepEqual(fallbackCalls, ["fallback"]);
+    assert.equal(voiceStarts, 2);
+  } finally {
+    await removeHarness(partialHarness);
+  }
+
+  const firstFailureHarness = await createHarness();
+  try {
+    const committed = await makeVoicePlan(firstFailureHarness);
+    let voiceStarts = 0;
+    const adapter = createUnitAdapterHarness({
+      sendMultipartBytes: async () => {
+        voiceStarts += 1;
+        throw new TelegramApiHttpError("voice rejected", 400, undefined);
+      },
+    }).adapter;
+    const failed = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      {
+        store: firstFailureHarness.store,
+        claim: { identity: IDENTITY },
+        adapter,
+      },
+    );
+    assert.equal(failed.record.nextUnitIndex, 2);
+    assert.deepEqual(failed.record.unitProgress, [
+      {
+        unitIndex: 0,
+        operationId: "outbound-unit-0000",
+        outcome: "skipped",
+        reason: "known-failure",
+      },
+      {
+        unitIndex: 1,
+        operationId: "outbound-unit-0001",
+        outcome: "skipped",
+        reason: "branch",
+      },
+    ]);
+    assert.equal(voiceStarts, 1);
+  } finally {
+    await removeHarness(firstFailureHarness);
+  }
+
+  const ambiguousHarness = await createHarness();
+  try {
+    const committed = await makeVoicePlan(ambiguousHarness);
+    let starts = 0;
+    const adapter = createUnitAdapterHarness({
+      sendMultipartBytes: async () => {
+        starts += 1;
+        throw new TelegramApiCommitUnknownError(
+          "sendVoice",
+          new Error("lost"),
+          "response-lost",
+        );
+      },
+    }).adapter;
+    const uncertain = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      {
+        store: ambiguousHarness.store,
+        claim: { identity: IDENTITY },
+        adapter,
+      },
+    );
+    assert.equal(uncertain.record.state, "delivery-uncertain");
+    assert.deepEqual(uncertain.record.unitProgress, []);
+    assert.equal(starts, 1);
+    const reopened = openRecoveryStore({
+      profile: "default",
+      rootPath: ambiguousHarness.store.rootPath,
+      isIdentityAuthenticated: () => true,
+    });
+    await assert.rejects(
+      executeNextTelegramDurableOutboundUnit(committed.record.recordId, {
+        store: reopened,
+        claim: { identity: IDENTITY },
+        adapter,
+      }),
+      /delivery-uncertain/,
+    );
+    assert.equal(starts, 1);
+  } finally {
+    await removeHarness(ambiguousHarness);
+  }
+});
+
+test("Guest media persists staged file ids across answer and cleanup reopen boundaries", async () => {
+  const harness = await createHarness();
+  try {
+    const sourcePath = join(harness.tempDir, "guest.pdf");
+    await writeFile(sourcePath, "guest bytes");
+    const committed = await commitTelegramDurableOutbound(
+      baseOptions(harness, {
+        replyToMessageId: 0,
+        guestQueryId: "guest-query",
+        finalMarkdown: "Guest answer.",
+        queuedAttachments: [{ path: sourcePath, fileName: "guest.pdf" }],
+      }),
+      { store: harness.store, transformReply: identityTransform },
+    );
+    const calls: Array<Record<string, unknown>> = [];
+    const adapter = createTelegramDurableOutboundUnitAdapter({
+      gate: { canStart: () => true, isActive: () => true },
+      sendMessage: async () => ({ message_id: 1 }),
+      sendRichMessage: async () => ({ message_id: 2 }),
+      sendMultipartBytes: async (method) => {
+        calls.push({ phase: "stage", method });
+        return {
+          message_id: 701,
+          document: { file_id: "durable-file-id" },
+        };
+      },
+      answerGuestQuery: async (_guestQueryId, _text, options) => {
+        calls.push({ phase: "answer", result: options?.result });
+      },
+      deleteMessage: async (chatId, messageId) => {
+        calls.push({ phase: "cleanup", chatId, messageId });
+      },
+    });
+    const first = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      { store: harness.store, claim: { identity: IDENTITY }, adapter },
+    );
+    assert.equal(first.record.nextUnitIndex, 1);
+    assert.equal(first.record.receipts[0]?.result?.kind, "guest-staging");
+
+    const afterStage = openRecoveryStore({
+      profile: "default",
+      rootPath: harness.store.rootPath,
+      isIdentityAuthenticated: () => true,
+    });
+    const second = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      { store: afterStage, claim: { identity: IDENTITY }, adapter },
+    );
+    assert.equal(second.record.nextUnitIndex, 2);
+
+    const afterAnswer = openRecoveryStore({
+      profile: "default",
+      rootPath: harness.store.rootPath,
+      isIdentityAuthenticated: () => true,
+    });
+    const third = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      { store: afterAnswer, claim: { identity: IDENTITY }, adapter },
+    );
+    assert.equal(third.record.state, "delivered");
+    assert.deepEqual(calls, [
+      { phase: "stage", method: "sendDocument" },
+      {
+        phase: "answer",
+        result: {
+          type: "document",
+          id: "attachment-1",
+          title: "guest.pdf",
+          document_file_id: "durable-file-id",
+          caption: "Guest answer.",
+        },
+      },
+      { phase: "cleanup", chatId: 100, messageId: 701 },
+    ]);
+    assert.deepEqual(third.record.unitProgress.map((progress) => [
+      progress.unitIndex,
+      progress.outcome,
+    ]), [
+      [0, "committed"],
+      [1, "committed"],
+      [2, "committed"],
+      [3, "skipped"],
+      [4, "skipped"],
+    ]);
+  } finally {
+    await removeHarness(harness);
+  }
+});
+
+test("Guest media faults are phase-exact across reopen and ambiguity never selects fallback", async () => {
+  const makeGuestPlan = async (harness: DurableHarness) => {
+    const sourcePath = join(harness.tempDir, "guest.pdf");
+    await writeFile(sourcePath, "guest bytes");
+    return commitTelegramDurableOutbound(
+      baseOptions(harness, {
+        replyToMessageId: 0,
+        guestQueryId: "guest-query",
+        finalMarkdown: "Guest fallback.",
+        queuedAttachments: [{ path: sourcePath, fileName: "guest.pdf" }],
+      }),
+      { store: harness.store, transformReply: identityTransform },
+    );
+  };
+  const reopen = (harness: DurableHarness) => openRecoveryStore({
+    profile: "default",
+    rootPath: harness.store.rootPath,
+    isIdentityAuthenticated: () => true,
+  });
+
+  const safeStageHarness = await createHarness();
+  try {
+    const committed = await makeGuestPlan(safeStageHarness);
+    const stage = createUnitAdapterHarness({
+      sendMultipartBytes: async () => {
+        throw new TelegramApiHttpError("stage rejected", 400, undefined);
+      },
+    }).adapter;
+    const failed = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      { store: safeStageHarness.store, claim: { identity: IDENTITY }, adapter: stage },
+    );
+    assert.equal(failed.record.nextUnitIndex, 4);
+    assert.deepEqual(failed.record.receipts, []);
+    let answers = 0;
+    const fallback = createUnitAdapterHarness({
+      answerGuestQuery: async () => {
+        answers += 1;
+      },
+    }).adapter;
+    const delivered = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      { store: reopen(safeStageHarness), claim: { identity: IDENTITY }, adapter: fallback },
+    );
+    assert.equal(delivered.record.state, "delivered");
+    assert.equal(answers, 1);
+  } finally {
+    await removeHarness(safeStageHarness);
+  }
+
+  const extractionHarness = await createHarness();
+  try {
+    const committed = await makeGuestPlan(extractionHarness);
+    const calls: string[] = [];
+    const stage = createUnitAdapterHarness({
+      sendMultipartBytes: async () => ({ message_id: 710 }),
+    }).adapter;
+    const extracted = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      { store: extractionHarness.store, claim: { identity: IDENTITY }, adapter: stage },
+    );
+    assert.equal(extracted.record.nextUnitIndex, 3);
+    assert.equal(extracted.record.receipts[0]?.result?.kind, "guest-staging");
+    const cleanup = createUnitAdapterHarness({
+      deleteMessage: async () => {
+        calls.push("cleanup");
+      },
+    }).adapter;
+    const cleaned = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      { store: reopen(extractionHarness), claim: { identity: IDENTITY }, adapter: cleanup },
+    );
+    assert.equal(cleaned.record.nextUnitIndex, 4);
+    const fallback = createUnitAdapterHarness({
+      answerGuestQuery: async () => {
+        calls.push("fallback");
+      },
+    }).adapter;
+    const delivered = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      { store: reopen(extractionHarness), claim: { identity: IDENTITY }, adapter: fallback },
+    );
+    assert.equal(delivered.record.state, "delivered");
+    assert.deepEqual(calls, ["cleanup", "fallback"]);
+  } finally {
+    await removeHarness(extractionHarness);
+  }
+
+  for (const phase of ["answer", "cleanup"] as const) {
+    const harness = await createHarness();
+    try {
+      const committed = await makeGuestPlan(harness);
+      const adapter = createTelegramDurableOutboundUnitAdapter({
+        gate: { canStart: () => true, isActive: () => true },
+        sendMessage: async () => ({ message_id: 1 }),
+        sendRichMessage: async () => ({ message_id: 2 }),
+        sendMultipartBytes: async () => ({
+          message_id: 715,
+          document: { file_id: "file-715" },
+        }),
+        answerGuestQuery: async () => {
+          if (phase === "answer") {
+            throw new TelegramApiHttpError("answer rejected", 400, undefined);
+          }
+        },
+        deleteMessage: async () => {
+          if (phase === "cleanup") {
+            throw new TelegramApiHttpError("cleanup rejected", 400, undefined);
+          }
+        },
+      });
+      let store = harness.store;
+      await executeNextTelegramDurableOutboundUnit(
+        committed.record.recordId,
+        { store, claim: { identity: IDENTITY }, adapter },
+      );
+      store = reopen(harness);
+      let result = await executeNextTelegramDurableOutboundUnit(
+        committed.record.recordId,
+        { store, claim: { identity: IDENTITY }, adapter },
+      );
+      if (phase === "cleanup") {
+        store = reopen(harness);
+        result = await executeNextTelegramDurableOutboundUnit(
+          committed.record.recordId,
+          { store, claim: { identity: IDENTITY }, adapter },
+        );
+      }
+      assert.deepEqual(result.outcome, { kind: "known-not-committed" });
+      assert.equal(result.record.state, "retryable-pending");
+      assert.equal(result.record.nextUnitIndex, phase === "answer" ? 1 : 2);
+      assert.equal(
+        result.record.unitProgress.some((progress) => progress.unitIndex === 4),
+        false,
+      );
+      assert.doesNotThrow(() => reopen(harness));
+    } finally {
+      await removeHarness(harness);
+    }
+  }
+
+  for (const phase of ["stage", "answer", "cleanup"] as const) {
+    const harness = await createHarness();
+    try {
+      const committed = await makeGuestPlan(harness);
+      let store = harness.store;
+      let mutationCount = 0;
+      const adapter = createTelegramDurableOutboundUnitAdapter({
+        gate: { canStart: () => true, isActive: () => true },
+        sendMessage: async () => ({ message_id: 1 }),
+        sendRichMessage: async () => ({ message_id: 2 }),
+        sendMultipartBytes: async () => {
+          mutationCount += 1;
+          if (phase === "stage") {
+            throw new TelegramApiCommitUnknownError(
+              "sendDocument",
+              new Error("lost"),
+              "response-lost",
+            );
+          }
+          return { message_id: 720, document: { file_id: "file-720" } };
+        },
+        answerGuestQuery: async () => {
+          mutationCount += 1;
+          if (phase === "answer") {
+            throw new TelegramApiCommitUnknownError(
+              "answerGuestQuery",
+              new Error("lost"),
+              "response-lost",
+            );
+          }
+        },
+        deleteMessage: async () => {
+          mutationCount += 1;
+          if (phase === "cleanup") {
+            throw new TelegramApiCommitUnknownError(
+              "deleteMessage",
+              new Error("lost"),
+              "response-lost",
+            );
+          }
+        },
+      });
+      let result = await executeNextTelegramDurableOutboundUnit(
+        committed.record.recordId,
+        { store, claim: { identity: IDENTITY }, adapter },
+      );
+      if (phase !== "stage") {
+        store = reopen(harness);
+        result = await executeNextTelegramDurableOutboundUnit(
+          committed.record.recordId,
+          { store, claim: { identity: IDENTITY }, adapter },
+        );
+      }
+      if (phase === "cleanup") {
+        store = reopen(harness);
+        result = await executeNextTelegramDurableOutboundUnit(
+          committed.record.recordId,
+          { store, claim: { identity: IDENTITY }, adapter },
+        );
+      }
+      assert.equal(result.record.state, "delivery-uncertain", phase);
+      const beforeRetry = mutationCount;
+      const reopened = reopen(harness);
+      await assert.rejects(
+        executeNextTelegramDurableOutboundUnit(committed.record.recordId, {
+          store: reopened,
+          claim: { identity: IDENTITY },
+          adapter,
+        }),
+        /delivery-uncertain/,
+      );
+      assert.equal(mutationCount, beforeRetry, phase);
+      assert.equal(
+        result.record.unitProgress.some((progress) => progress.unitIndex === 4),
+        false,
+        phase,
+      );
+    } finally {
+      await removeHarness(harness);
+    }
   }
 });

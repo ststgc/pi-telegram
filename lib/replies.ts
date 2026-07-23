@@ -639,6 +639,122 @@ function findTelegramNativeMarkdownSplitIndex(
   return hardLimit;
 }
 
+export interface TelegramSingleReplyUnitOptions<TReplyMarkup = unknown>
+  extends TelegramReplyTargetOptions {
+  replyMarkup?: TReplyMarkup;
+}
+
+export interface TelegramSingleReplyUnitReceipt {
+  method: "sendMessage" | "sendRichMessage" | "answerGuestQuery";
+  messageId?: number;
+}
+
+export class TelegramReplyMalformedSuccessError extends Error {
+  readonly kind = "malformed-success" as const;
+
+  constructor(method: string) {
+    super(`Telegram ${method} success returned an invalid message_id.`);
+    this.name = "TelegramReplyMalformedSuccessError";
+  }
+}
+
+function validateTelegramReplyMessageId(
+  method: "sendMessage" | "sendRichMessage",
+  messageId: number,
+): number {
+  if (!Number.isSafeInteger(messageId) || messageId <= 0) {
+    throw new TelegramReplyMalformedSuccessError(method);
+  }
+  return messageId;
+}
+
+function getTelegramSingleReplyParameters(
+  messageId: number | undefined,
+): TelegramReplyParameters | undefined {
+  return messageId !== undefined && messageId > 0
+    ? { message_id: messageId, allow_sending_without_reply: true }
+    : undefined;
+}
+
+/** Sends exactly one already-rendered ordinary Telegram message mutation. */
+export async function sendTelegramRenderedReplyUnit<TReplyMarkup = unknown>(
+  chatId: number,
+  content: string,
+  contentMode: "html" | "plain",
+  deps: Pick<TelegramReplyDeliveryDeps<TReplyMarkup>, "sendMessage">,
+  options: TelegramSingleReplyUnitOptions<TReplyMarkup> = {},
+): Promise<TelegramSingleReplyUnitReceipt> {
+  assertTelegramInlineKeyboardCallbackData(options.replyMarkup);
+  const replyParameters = getTelegramSingleReplyParameters(
+    options.replyToMessageId,
+  );
+  const parseMode: "HTML" | undefined =
+    contentMode === "html" ? "HTML" : undefined;
+  const sent = await deps.sendMessage({
+    chat_id: chatId,
+    text: content,
+    ...(parseMode ? { parse_mode: parseMode } : {}),
+    ...(options.replyMarkup ? { reply_markup: options.replyMarkup } : {}),
+    ...(replyParameters ? { reply_parameters: replyParameters } : {}),
+    ...(options.target ? getTelegramTargetThreadParams(options.target) : {}),
+  });
+  return {
+    method: "sendMessage",
+    messageId: validateTelegramReplyMessageId("sendMessage", sent.message_id),
+  };
+}
+
+/** Sends exactly one already-split native Rich Markdown mutation. */
+export async function sendTelegramNativeMarkdownReplyUnit<
+  TReplyMarkup = unknown,
+>(
+  chatId: number,
+  markdown: string,
+  deps: {
+    sendRichMessage: (
+      body: TelegramSendRichMessageBody,
+    ) => Promise<TelegramSentMessage>;
+  },
+  options: TelegramSingleReplyUnitOptions<TReplyMarkup> = {},
+): Promise<TelegramSingleReplyUnitReceipt> {
+  assertTelegramInlineKeyboardCallbackData(options.replyMarkup);
+  const replyParameters = getTelegramSingleReplyParameters(
+    options.replyToMessageId,
+  );
+  const sent = await deps.sendRichMessage({
+    chat_id: chatId,
+    rich_message: { markdown, skip_entity_detection: true },
+    ...(options.replyMarkup ? { reply_markup: options.replyMarkup } : {}),
+    ...(replyParameters ? { reply_parameters: replyParameters } : {}),
+    ...(options.target ? getTelegramTargetThreadParams(options.target) : {}),
+  });
+  return {
+    method: "sendRichMessage",
+    messageId: validateTelegramReplyMessageId(
+      "sendRichMessage",
+      sent.message_id,
+    ),
+  };
+}
+
+/** Sends exactly one Guest Rich Markdown answer mutation. */
+export async function sendTelegramGuestMarkdownReplyUnit(
+  guestQueryId: string,
+  markdown: string,
+  deps: {
+    answerGuestQuery: (
+      guestQueryId: string,
+      text?: string,
+      options?: { parseMode?: string; richMessage?: TelegramInputRichMessage },
+    ) => Promise<void>;
+  },
+): Promise<TelegramSingleReplyUnitReceipt> {
+  await deps.answerGuestQuery(guestQueryId, undefined, {
+    richMessage: { markdown, skip_entity_detection: true },
+  });
+  return { method: "answerGuestQuery" };
+}
+
 export async function sendTelegramNativeMarkdownReply<TReplyMarkup = unknown>(
   chatId: number,
   replyToMessageId: number | undefined,

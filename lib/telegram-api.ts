@@ -573,15 +573,28 @@ class TelegramApiMalformedSuccessError extends Error {
   }
 }
 
+export type TelegramApiCommitUnknownReason =
+  | "commit-unknown"
+  | "timeout-after-write"
+  | "connection-lost-after-write"
+  | "malformed-success"
+  | "response-lost";
+
 export class TelegramApiCommitUnknownError extends Error {
   readonly kind = "commit-unknown" as const;
   readonly method: string;
+  readonly reason: TelegramApiCommitUnknownReason;
   override readonly cause: unknown;
 
-  constructor(method: string, cause: unknown) {
+  constructor(
+    method: string,
+    cause: unknown,
+    reason: TelegramApiCommitUnknownReason = "commit-unknown",
+  ) {
     super(`Telegram API ${method} may have committed before transport failed.`);
     this.name = "TelegramApiCommitUnknownError";
     this.method = method;
+    this.reason = reason;
     this.cause = cause;
   }
 }
@@ -1272,7 +1285,15 @@ async function callTelegramWithRetry<TResponse>(
             error.status !== undefined &&
             error.status >= 500)
         ) {
-          throw new TelegramApiCommitUnknownError(method, error);
+          const reason: TelegramApiCommitUnknownReason =
+            error instanceof TelegramApiMalformedSuccessError
+              ? "malformed-success"
+              : error instanceof TelegramApiTimeoutError
+                ? "timeout-after-write"
+                : error instanceof TelegramApiHttpError
+                  ? "response-lost"
+                  : "connection-lost-after-write";
+          throw new TelegramApiCommitUnknownError(method, error, reason);
         }
         throw error;
       }

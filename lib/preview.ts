@@ -210,6 +210,25 @@ export type TelegramAssistantPreviewRuntime<
     ) => Promise<boolean>;
   };
 
+export function createTelegramNativeMarkdownPreviewReceiptFinalizer<
+  TReceipt,
+>(deps: {
+  getState: () => TelegramPreviewRuntimeState | undefined;
+  discard?: () => void;
+  sendUnit: () => Promise<TReceipt>;
+}): () => Promise<TReceipt | undefined> {
+  return async () => {
+    const state = deps.getState();
+    if (state?.flushPromise) {
+      await state.flushPromise.catch(() => {});
+      if (deps.getState() !== state) return undefined;
+    }
+    const receipt = await deps.sendUnit();
+    if (deps.getState() === state) deps.discard?.();
+    return receipt;
+  };
+}
+
 export function createTelegramNativeMarkdownPreviewFinalizer<
   TReplyMarkup,
 >(deps: {

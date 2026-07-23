@@ -110,12 +110,15 @@ class TelegramRichAttachmentCommitUnknownError extends Error {
   }
 }
 
-function isTelegramRichAttachmentCommitUnknownError(error: unknown): boolean {
+export function isTelegramRichAttachmentCommitUnknownError(
+  error: unknown,
+): boolean {
   return (
     error instanceof TelegramRichAttachmentCommitUnknownError ||
     (typeof error === "object" &&
       error !== null &&
-      (error as { kind?: unknown }).kind === "commit-unknown")
+      "kind" in error &&
+      Reflect.get(error, "kind") === "commit-unknown")
   );
 }
 
@@ -348,7 +351,7 @@ function formatTelegramOutboundMessageToolResultText(chatId: number): string {
   return ["", `Sent Telegram message to ${chatId}.`].join("\n");
 }
 
-function getTelegramMultipartTargetFields(
+export function getTelegramMultipartTargetFields(
   target: TelegramTarget | undefined,
 ): Record<string, string> {
   if (!target) return {};
@@ -548,6 +551,108 @@ export function registerTelegramOutboundMessageTool(
       }
     },
   });
+}
+
+export interface TelegramOutboundBinaryReplyUnitOptions {
+  method: "sendRichMessage" | "sendPhoto" | "sendDocument" | "sendVoice";
+  chatId: number;
+  target?: TelegramTarget;
+  replyToMessageId?: number;
+  replyMarkup?: unknown;
+  bytes: Uint8Array;
+  fileName: string;
+  mediaKind: TelegramRichOutboundAttachmentMediaKind | "document" | "voice";
+  caption?: string;
+}
+
+export interface TelegramOutboundBinaryReplyUnitDeps {
+  sendMultipartBytes: (
+    method: string,
+    fields: Record<string, string>,
+    fileField: string,
+    bytes: Uint8Array,
+    fileName: string,
+  ) => Promise<unknown>;
+}
+
+export interface TelegramOutboundBinaryReplyUnitReceipt {
+  method: "sendRichMessage" | "sendPhoto" | "sendDocument" | "sendVoice";
+  messageId: number;
+}
+
+function readTelegramMutationMessageId(result: unknown): number {
+  if (typeof result !== "object" || result === null || !("message_id" in result)) {
+    throw new TelegramRichAttachmentCommitUnknownError(
+      new Error("Successful Telegram upload omitted message_id."),
+    );
+  }
+  const messageId = Reflect.get(result, "message_id");
+  if (
+    typeof messageId !== "number" ||
+    !Number.isSafeInteger(messageId) ||
+    messageId <= 0
+  ) {
+    throw new TelegramRichAttachmentCommitUnknownError(
+      new Error("Successful Telegram upload returned an invalid message_id."),
+    );
+  }
+  return messageId;
+}
+
+/** Sends exactly one verified-byte multipart reply mutation. */
+export async function sendTelegramOutboundBinaryReplyUnit(
+  options: TelegramOutboundBinaryReplyUnitOptions,
+  deps: TelegramOutboundBinaryReplyUnitDeps,
+): Promise<TelegramOutboundBinaryReplyUnitReceipt> {
+  const replyParameters = options.replyToMessageId !== undefined &&
+      options.replyToMessageId > 0
+    ? JSON.stringify({
+        message_id: options.replyToMessageId,
+        allow_sending_without_reply: true,
+      })
+    : undefined;
+  const fields: Record<string, string> = {
+    chat_id: String(options.chatId),
+    ...getTelegramMultipartTargetFields(options.target),
+    ...(replyParameters ? { reply_parameters: replyParameters } : {}),
+    ...(options.replyMarkup
+      ? { reply_markup: JSON.stringify(options.replyMarkup) }
+      : {}),
+  };
+  let fileField: string;
+  if (options.method === "sendRichMessage") {
+    const mediaId = "artifact";
+    fields.rich_message = JSON.stringify({
+      markdown: `${options.caption ?? ""}\n\n![](tg://${options.mediaKind}?id=${mediaId})`,
+      media: [{
+        id: mediaId,
+        media: {
+          type: options.mediaKind,
+          media: "attach://rich_media_upload",
+        },
+      }],
+      skip_entity_detection: true,
+    });
+    fileField = "rich_media_upload";
+  } else {
+    fileField = options.method === "sendPhoto"
+      ? "photo"
+      : options.method === "sendVoice"
+        ? "voice"
+        : "document";
+    if (options.caption !== undefined) fields.caption = options.caption;
+  }
+  const result = await deps.sendMultipartBytes(
+    options.method,
+    fields,
+    fileField,
+    options.bytes,
+    options.fileName,
+  );
+  return {
+    method: options.method,
+    messageId: readTelegramMutationMessageId(result),
+  };
 }
 
 export interface TelegramQueuedOutboundAttachmentDeliveryDeps {
