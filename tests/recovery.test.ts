@@ -30,7 +30,10 @@ import {
   RECOVERY_BUS_STATES,
   RECOVERY_DELIVERED_PAYLOAD_RETENTION_MS,
   RECOVERY_INBOUND_STATES,
+  RECOVERY_OUTBOUND_MAX_AUTOMATIC_STARTS,
+  RECOVERY_OUTBOUND_RETRY_DELAYS_MS,
   RECOVERY_OUTBOUND_STATES,
+  RECOVERY_OUTBOUND_UNCERTAINTY_REASONS,
   RECOVERY_PROFILE_QUOTA_BYTES,
   RECOVERY_REASSIGNMENT_STATES,
   RECOVERY_SCHEMA_VERSION,
@@ -137,7 +140,7 @@ function makeSnapshot(
   reassignmentState: RecoverySnapshotV1["reassignments"][number]["state"] =
     "requested",
 ): RecoverySnapshotV1 {
-  const inbound = RECOVERY_INBOUND_STATES.map((state, index) => ({
+  const inbound: RecoverySnapshotV1["inbound"] = RECOVERY_INBOUND_STATES.map((state, index) => ({
     family: "inbound" as const,
     recordId: `inbound-${index}`,
     updateId: 2000 + index,
@@ -160,28 +163,87 @@ function makeSnapshot(
       sha256: TEST_SHA256,
     }],
   }));
-  const outbound = RECOVERY_OUTBOUND_STATES.map((state, index) => ({
-    family: "outbound" as const,
-    recordId: `outbound-${index}`,
-    intentId: `intent-${index}`,
-    turnId: `turn-out-${index}`,
-    state,
-    identity: OLD_IDENTITY,
-    createdRevision: 10 + index,
-    stateRevision: 10 + index,
-    createdAtMs: 300 + index,
-    updatedAtMs: 400 + index,
-    payloadRef: {
-      payloadId: `answer-${index}`,
-      byteLength: 30 + index,
-      sha256: TEST_SHA256,
-    },
-    spoolRefs: [{
-      spoolId: `out-spool-${index}`,
-      byteLength: 40 + index,
-      sha256: TEST_SHA256,
-    }],
-  }));
+  const outboundSources = RECOVERY_OUTBOUND_STATES.map((state, index) => {
+    const terminal =
+      state === "delivered" ||
+      state === "delivery-uncertain" ||
+      state === "explicitly-discarded";
+    return {
+      family: "inbound" as const,
+      recordId: `outbound-source-${index}`,
+      updateId: 3000 + index,
+      turnId: `turn-out-${index}`,
+      state: terminal ? "completed" as const : "dispatching" as const,
+      identity: OLD_IDENTITY,
+      createdRevision: 30 + index,
+      stateRevision: 30 + index,
+      admissionRevision: 30 + index,
+      createdAtMs: 250 + index,
+      updatedAtMs: 275 + index,
+      spoolRefs: [],
+    };
+  });
+  inbound.push(...outboundSources);
+  const outbound = RECOVERY_OUTBOUND_STATES.map((state, index) => {
+    const delivered = state === "delivered";
+    const discarded = state === "explicitly-discarded";
+    const sending = state === "sending";
+    const uncertain = state === "delivery-uncertain";
+    const retryable = state === "retryable-pending";
+    return {
+      family: "outbound" as const,
+      recordId: `outbound-${index}`,
+      intentId: `intent-${index}`,
+      turnId: `turn-out-${index}`,
+      sourceInboundRecordIds: [`outbound-source-${index}`],
+      state,
+      nextUnitIndex: delivered ? 1 : 0,
+      ...(sending
+        ? { activeUnit: { unitIndex: 0, attemptId: `attempt-${index}`, startedAtMs: 350 + index } }
+        : {}),
+      automaticAttemptCount: sending || uncertain || retryable ? 1 : 0,
+      ...(retryable ? { retryNotBeforeMs: 900 } : {}),
+      receipts: delivered
+        ? [{
+            unitIndex: 0,
+            operationId: `operation-${index}`,
+            method: "sendMessage",
+            messageId: 500 + index,
+            committedAtMs: 390 + index,
+          }]
+        : [],
+      ...(uncertain
+        ? {
+            uncertainty: {
+              unitIndex: 0,
+              reason: "commit-unknown" as const,
+              observedAtMs: 390 + index,
+            },
+          }
+        : {}),
+      identity: OLD_IDENTITY,
+      createdRevision: 10 + index,
+      stateRevision: 10 + index,
+      createdAtMs: 300 + index,
+      updatedAtMs: 400 + index,
+      ...(!discarded
+        ? {
+            payloadRef: {
+              payloadId: `answer-${index}`,
+              byteLength: 30 + index,
+              sha256: TEST_SHA256,
+            },
+          }
+        : {}),
+      spoolRefs: delivered || discarded
+        ? []
+        : [{
+            spoolId: `out-spool-${index}`,
+            byteLength: 40 + index,
+            sha256: TEST_SHA256,
+          }],
+    };
+  });
   const bus = RECOVERY_BUS_STATES.map((state, index) => ({
     family: "bus" as const,
     recordId: `bus-${index}`,
@@ -211,6 +273,16 @@ function makeSnapshot(
       return (RECOVERY_UNRESOLVED_BUS_STATES as readonly string[]).includes(record.state);
     })
     .map((record) => record.recordId);
+  const allRecords = [...inbound, ...outbound, ...bus];
+  const payloadBytes = allRecords.reduce(
+    (sum, record) => sum + (record.payloadRef?.byteLength ?? 0),
+    0,
+  );
+  const spoolBytes = allRecords.reduce(
+    (sum, record) =>
+      sum + record.spoolRefs.reduce((nested, ref) => nested + ref.byteLength, 0),
+    0,
+  );
   return {
     version: RECOVERY_SCHEMA_VERSION,
     profile: "default",
@@ -219,10 +291,10 @@ function makeSnapshot(
     writtenAtMs: 1000,
     quota: {
       recordBytes: 1000,
-      payloadBytes: 528,
-      spoolBytes: 462,
+      payloadBytes,
+      spoolBytes,
       reservedBytes: 10,
-      totalBytes: 2000,
+      totalBytes: 1000 + payloadBytes + spoolBytes + 10,
     },
     committedUpdateId: 1999,
     inbound,
@@ -352,6 +424,53 @@ function sha256(value: Uint8Array | string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function prepareOutbound(
+  harness: ReturnType<typeof createStoreHarness>,
+  options: {
+    updateId?: number;
+    intentId?: string;
+    units?: Parameters<RecoveryStore["planOutbound"]>[0]["units"];
+    spool?: readonly Uint8Array[];
+  } = {},
+) {
+  const inbound = harness.store.observeInbound(options.updateId ?? 800, OLD_IDENTITY);
+  harness.store.admitInbound({
+    recordId: inbound.recordId,
+    payload: Buffer.from("durable inbound source"),
+  });
+  harness.store.markPreDispatch(inbound.recordId, { identity: OLD_IDENTITY });
+  harness.store.markDispatching(inbound.recordId, { identity: OLD_IDENTITY });
+  const units = options.units ?? [
+    {
+      kind: "final-text" as const,
+      operationId: "operation-0",
+      method: "sendRichMessage",
+      content: "first",
+      contentMode: "rich-markdown" as const,
+    },
+    {
+      kind: "final-text" as const,
+      operationId: "operation-1",
+      method: "sendRichMessage",
+      content: "second",
+      contentMode: "rich-markdown" as const,
+    },
+  ];
+  const outbound = harness.store.planOutbound({
+    intentId: options.intentId ?? "intent-800",
+    turnId: inbound.turnId,
+    sourceInboundRecordIds: [inbound.recordId],
+    claim: { identity: OLD_IDENTITY },
+    replyToMessageId: 77,
+    renderingMode: "rich",
+    finalMarkdown: "first\n\nsecond",
+    renderedChunks: [],
+    units,
+    spool: options.spool,
+  });
+  return { inbound, outbound, units };
+}
+
 function writeAccountedSnapshot(rootPath: string, snapshot: RecoverySnapshotV1): void {
   const allRecords = [...snapshot.inbound, ...snapshot.outbound, ...snapshot.bus];
   snapshot.quota.payloadBytes = allRecords.reduce(
@@ -405,6 +524,87 @@ test("recovery constants preserve frozen quota, retention, paths, and unresolved
     "planned", "pending", "sending", "delivery-uncertain", "retryable-pending",
   ]);
   assert.deepEqual(RECOVERY_UNRESOLVED_BUS_STATES, ["pending", "bus-uncertain"]);
+});
+
+test("outbound policy constants freeze automatic starts, delays, and uncertainty reasons", () => {
+  assert.equal(RECOVERY_OUTBOUND_MAX_AUTOMATIC_STARTS, 3);
+  assert.deepEqual(RECOVERY_OUTBOUND_RETRY_DELAYS_MS, [250, 1_000]);
+  assert.deepEqual(RECOVERY_OUTBOUND_UNCERTAINTY_REASONS, [
+    "commit-unknown",
+    "timeout-after-write",
+    "connection-lost-after-write",
+    "malformed-success",
+    "response-lost",
+    "authority-lost-after-start",
+    "process-reopened-sending",
+    "confirmed-before-receipt",
+  ]);
+});
+
+test("strict outbound record parsing rejects state-specific metadata, skipped receipts, and mismatched sources", () => {
+  expectInvalid((value) => {
+    records(value, "outbound")[0]!.unknown = true;
+  }, /unknown field/);
+  expectInvalid((value) => {
+    records(value, "outbound")[0]!.activeUnit = {
+      unitIndex: 0,
+      attemptId: "invalid-planned-attempt",
+      startedAtMs: 1,
+    };
+  }, /only while sending/);
+  expectInvalid((value) => {
+    delete records(value, "outbound")[2]!.activeUnit;
+  }, /required for the exact next sending unit/);
+  expectInvalid((value) => {
+    delete records(value, "outbound")[4]!.uncertainty;
+  }, /must identify the exact ambiguous unit/);
+  expectInvalid((value) => {
+    delete records(value, "outbound")[5]!.retryNotBeforeMs;
+  }, /required before automatic retry/);
+  expectInvalid((value) => {
+    const delivered = records(value, "outbound")[3]!;
+    (delivered.receipts as Array<Record<string, unknown>>)[0]!.unitIndex = 1;
+  }, /contiguous and ordered/);
+  expectInvalid((value) => {
+    const delivered = records(value, "outbound")[3]!;
+    const receipts = delivered.receipts as Array<Record<string, unknown>>;
+    receipts.push({ ...receipts[0], unitIndex: 1 });
+    delivered.nextUnitIndex = 2;
+  }, /duplicate id/);
+  expectInvalid((value) => {
+    records(value, "outbound")[0]!.turnId = "wrong-turn";
+  }, /mismatched source turn/);
+  expectInvalid((value) => {
+    records(value, "outbound")[0]!.sourceInboundRecordIds = ["missing"];
+  }, /unknown inbound record/);
+});
+
+test("existing version-1 snapshots with an empty outbound array remain readable", () => {
+  const snapshot = makeSnapshot("active");
+  snapshot.outbound = [];
+  snapshot.inbound = snapshot.inbound.filter(
+    (record) => !record.recordId.startsWith("outbound-source-"),
+  );
+  snapshot.reassignments[0]!.unresolvedRecordIds =
+    snapshot.reassignments[0]!.unresolvedRecordIds.filter(
+      (recordId) => !recordId.startsWith("outbound-") && !recordId.startsWith("outbound-source-"),
+    );
+  const allRecords = [...snapshot.inbound, ...snapshot.bus];
+  snapshot.quota.payloadBytes = allRecords.reduce(
+    (sum, record) => sum + (record.payloadRef?.byteLength ?? 0),
+    0,
+  );
+  snapshot.quota.spoolBytes = allRecords.reduce(
+    (sum, record) =>
+      sum + record.spoolRefs.reduce((nested, reference) => nested + reference.byteLength, 0),
+    0,
+  );
+  snapshot.quota.totalBytes =
+    snapshot.quota.recordBytes +
+    snapshot.quota.payloadBytes +
+    snapshot.quota.spoolBytes +
+    snapshot.quota.reservedBytes;
+  assert.deepEqual(parseRecoverySnapshot(JSON.stringify(snapshot)), snapshot);
 });
 
 test("parser rejects invalid version, state, identity, revision, numbers, arrays, and unknown fields", () => {
@@ -546,6 +746,7 @@ test("request idempotency keys use collision-free structural tuples", () => {
     const outbound = records(value, "outbound");
     outbound[1]!.intentId = outbound[0]!.intentId;
     outbound[1]!.turnId = outbound[0]!.turnId;
+    outbound[1]!.sourceInboundRecordIds = outbound[0]!.sourceInboundRecordIds;
   }, /duplicate id/);
   expectInvalid((value) => {
     const bus = records(value, "bus");
@@ -591,7 +792,11 @@ test("quota accounting and global payload/spool references fail closed", () => {
   expectInvalid((value) => {
     const quota = value.quota as Record<string, unknown>;
     quota.recordBytes = RECOVERY_PROFILE_QUOTA_BYTES;
-    quota.totalBytes = RECOVERY_PROFILE_QUOTA_BYTES + 1000;
+    quota.totalBytes =
+      RECOVERY_PROFILE_QUOTA_BYTES +
+      Number(quota.payloadBytes) +
+      Number(quota.spoolBytes) +
+      Number(quota.reservedBytes);
   }, /per-profile quota/);
   expectInvalid((value) => {
     const inbound = records(value, "inbound");
@@ -607,8 +812,8 @@ test("quota accounting and global payload/spool references fail closed", () => {
   }, /duplicate id/);
   expectInvalid((value) => {
     const quota = value.quota as Record<string, unknown>;
-    quota.payloadBytes = 527;
-    quota.totalBytes = 1999;
+    quota.payloadBytes = Number(quota.payloadBytes) - 1;
+    quota.totalBytes = Number(quota.totalBytes) - 1;
   }, /referenced payload bytes/);
   expectInvalid((value) => {
     const payloadRef = records(value, "inbound")[0]!.payloadRef as Record<string, unknown>;
@@ -793,6 +998,581 @@ test("lightweight terminal dispositions are idempotent, payload-free, and prefix
   }
 });
 
+test("outbound transitions preserve ordered receipts and atomically complete inbound on delivery", () => {
+  const harness = createStoreHarness();
+  try {
+    const { inbound, outbound } = prepareOutbound(harness);
+    assert.equal(outbound.state, "planned");
+    assert.deepEqual(
+      harness.store.listClaimableOutboundRecords({ identity: OLD_IDENTITY })
+        .map((item) => item.record.recordId),
+      [outbound.recordId],
+    );
+    assert.equal(
+      harness.store.activateOutbound(outbound.recordId, { identity: OLD_IDENTITY }).state,
+      "pending",
+    );
+    const first = harness.store.claimOutboundUnit({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+    });
+    assert.equal(first.record.state, "sending");
+    assert.equal(first.record.activeUnit?.unitIndex, 0);
+    assert.equal(first.record.automaticAttemptCount, 1);
+    assert.throws(
+      () => harness.store.activateOutbound(outbound.recordId, { identity: OLD_IDENTITY }),
+      /sending -> pending/,
+    );
+    assert.throws(
+      () => harness.store.recordOutboundReceipt({
+        recordId: outbound.recordId,
+        claim: { identity: OLD_IDENTITY },
+        attemptId: first.record.activeUnit!.attemptId,
+        operationId: "wrong-operation",
+        method: "sendRichMessage",
+      }),
+      /does not match/,
+    );
+    const afterFirst = harness.store.recordOutboundReceipt({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+      attemptId: first.record.activeUnit!.attemptId,
+      operationId: "operation-0",
+      method: "sendRichMessage",
+      messageId: 900,
+    });
+    assert.equal(afterFirst.state, "pending");
+    assert.equal(afterFirst.nextUnitIndex, 1);
+    assert.equal(afterFirst.automaticAttemptCount, 0);
+    assert.deepEqual(afterFirst.receipts.map((receipt) => receipt.operationId), ["operation-0"]);
+    assert.throws(
+      () => harness.store.recordOutboundSafeFailure({
+        recordId: outbound.recordId,
+        claim: { identity: OLD_IDENTITY },
+        attemptId: first.record.activeUnit!.attemptId,
+      }),
+      /active attempt claim denied/,
+    );
+    const second = harness.store.claimOutboundUnit({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+    });
+    const delivered = harness.store.recordOutboundReceipt({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+      attemptId: second.record.activeUnit!.attemptId,
+      operationId: "operation-1",
+      method: "sendRichMessage",
+      messageId: 901,
+    });
+    assert.equal(delivered.state, "delivered");
+    assert.equal(delivered.nextUnitIndex, 2);
+    assert.equal(delivered.receipts.length, 2);
+    const snapshot = readStoreSnapshot(harness.rootPath);
+    const completed = snapshot.inbound.find((record) => record.recordId === inbound.recordId)!;
+    const durable = snapshot.outbound.find((record) => record.recordId === outbound.recordId)!;
+    assert.equal(completed.state, "completed");
+    assert.equal(completed.stateRevision, durable.stateRevision);
+    assert.throws(
+      () => harness.store.discardOutbound(outbound.recordId, { identity: OLD_IDENTITY }),
+      /Cannot discard.*delivered/,
+    );
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("outbound known-safe failures use exactly three starts with 250/1000 ms delays and operator drain reset", () => {
+  const harness = createStoreHarness();
+  try {
+    const { outbound } = prepareOutbound(harness);
+    harness.store.activateOutbound(outbound.recordId, { identity: OLD_IDENTITY });
+    const first = harness.store.claimOutboundUnit({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+    });
+    let retryable = harness.store.recordOutboundSafeFailure({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+      attemptId: first.record.activeUnit!.attemptId,
+    });
+    assert.equal(retryable.automaticAttemptCount, 1);
+    assert.equal(retryable.retryNotBeforeMs, harness.now.value + 250);
+    assert.throws(
+      () => harness.store.claimOutboundUnit({
+        recordId: outbound.recordId,
+        claim: { identity: OLD_IDENTITY },
+      }),
+      /not eligible yet/,
+    );
+    harness.now.value += 250;
+    const second = harness.store.claimOutboundUnit({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+    });
+    retryable = harness.store.recordOutboundSafeFailure({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+      attemptId: second.record.activeUnit!.attemptId,
+    });
+    assert.equal(retryable.automaticAttemptCount, 2);
+    assert.equal(retryable.retryNotBeforeMs, harness.now.value + 1_000);
+    harness.now.value += 1_000;
+    const third = harness.store.claimOutboundUnit({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+    });
+    retryable = harness.store.recordOutboundSafeFailure({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+      attemptId: third.record.activeUnit!.attemptId,
+    });
+    assert.equal(retryable.automaticAttemptCount, 3);
+    assert.equal(retryable.retryNotBeforeMs, undefined);
+    assert.deepEqual(
+      harness.store.listClaimableOutboundRecords({ identity: OLD_IDENTITY }),
+      [],
+    );
+    assert.throws(
+      () => harness.store.claimOutboundUnit({
+        recordId: outbound.recordId,
+        claim: { identity: OLD_IDENTITY },
+      }),
+      /attempts are exhausted/,
+    );
+    const drained = harness.store.drainSafeOutbound({ identity: OLD_IDENTITY });
+    assert.equal(drained.length, 1);
+    assert.equal(drained[0]!.record.state, "pending");
+    assert.equal(drained[0]!.record.automaticAttemptCount, 0);
+    assert.equal(
+      harness.store.claimOutboundUnit({
+        recordId: outbound.recordId,
+        claim: { identity: OLD_IDENTITY },
+      }).record.automaticAttemptCount,
+      1,
+    );
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("outbound uncertainty never auto-retries and explicit linked retry transfers exact binary references", () => {
+  const harness = createStoreHarness();
+  try {
+    const spool = Buffer.from("uncertain attachment");
+    const { inbound, outbound } = prepareOutbound(harness, {
+      units: [{
+        kind: "attachment",
+        operationId: "attachment-operation",
+        method: "sendDocument",
+        spoolRefIndex: 0,
+        fileName: "artifact.txt",
+        mediaKind: "document",
+      }],
+      spool: [spool],
+    });
+    const beforeRefs = {
+      payloadId: outbound.payloadRef!.payloadId,
+      spoolIds: outbound.spoolRefs.map((reference) => reference.spoolId),
+    };
+    harness.store.activateOutbound(outbound.recordId, { identity: OLD_IDENTITY });
+    const claimed = harness.store.claimOutboundUnit({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+    });
+    const uncertain = harness.store.markOutboundUncertain({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+      attemptId: claimed.record.activeUnit!.attemptId,
+      reason: "commit-unknown",
+    });
+    assert.equal(uncertain.state, "delivery-uncertain");
+    assert.deepEqual(
+      harness.store.listClaimableOutboundRecords({ identity: OLD_IDENTITY }),
+      [],
+    );
+    assert.deepEqual(harness.store.drainSafeOutbound({ identity: OLD_IDENTITY }), []);
+    assert.throws(
+      () => harness.store.claimOutboundUnit({
+        recordId: outbound.recordId,
+        claim: { identity: OLD_IDENTITY },
+      }),
+      /delivery-uncertain -> sending/,
+    );
+    assert.equal(
+      readStoreSnapshot(harness.rootPath).inbound.find(
+        (record) => record.recordId === inbound.recordId,
+      )!.state,
+      "completed",
+    );
+
+    const retry = harness.store.retryUncertainOutbound(
+      outbound.recordId,
+      "intent-linked-retry",
+      { identity: OLD_IDENTITY },
+    );
+    assert.equal(retry.duplicationWarning, true);
+    assert.equal(retry.record.state, "pending");
+    assert.equal(retry.record.linkedAttemptOf, outbound.recordId);
+    assert.equal(retry.record.payloadRef!.payloadId, beforeRefs.payloadId);
+    assert.deepEqual(
+      retry.record.spoolRefs.map((reference) => reference.spoolId),
+      beforeRefs.spoolIds,
+    );
+    assert.equal(Buffer.from(retry.spool[0]!).toString(), spool.toString());
+    const snapshot = readStoreSnapshot(harness.rootPath);
+    const source = snapshot.outbound.find((record) => record.recordId === outbound.recordId)!;
+    const attempt = snapshot.outbound.find((record) => record.recordId === retry.record.recordId)!;
+    assert.equal(source.payloadRef, undefined);
+    assert.deepEqual(source.spoolRefs, []);
+    assert.equal(attempt.payloadRef!.payloadId, beforeRefs.payloadId);
+    assert.equal(
+      new Set(snapshot.outbound.flatMap((record) => record.spoolRefs.map((ref) => ref.spoolId))).size,
+      1,
+    );
+    assert.equal(
+      harness.store.retryUncertainOutbound(
+        outbound.recordId,
+        "intent-linked-retry",
+        { identity: OLD_IDENTITY },
+      ).record.recordId,
+      retry.record.recordId,
+    );
+    assert.throws(
+      () => harness.store.retryUncertainOutbound(
+        outbound.recordId,
+        "different-linked-intent",
+        { identity: OLD_IDENTITY },
+      ),
+      /intent mismatch/,
+    );
+    const retryClaim = harness.store.claimOutboundUnit({
+      recordId: retry.record.recordId,
+      claim: { identity: OLD_IDENTITY },
+    });
+    harness.store.markOutboundUncertain({
+      recordId: retry.record.recordId,
+      claim: { identity: OLD_IDENTITY },
+      attemptId: retryClaim.record.activeUnit!.attemptId,
+      reason: "response-lost",
+    });
+    const secondRetry = harness.store.retryUncertainOutbound(
+      retry.record.recordId,
+      "intent-linked-retry-2",
+      { identity: OLD_IDENTITY },
+    );
+    assert.equal(secondRetry.record.linkedAttemptOf, retry.record.recordId);
+    assert.equal(secondRetry.record.payloadRef!.payloadId, beforeRefs.payloadId);
+    assert.throws(
+      () => harness.store.discardOutbound(outbound.recordId, { identity: OLD_IDENTITY }),
+      /linked retry exists/,
+    );
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("outbound planning strictly validates semantic payloads, filenames, operation ids, and idempotency", () => {
+  const duplicateHarness = createStoreHarness();
+  try {
+    assert.throws(
+      () => prepareOutbound(duplicateHarness, {
+        units: [
+          {
+            kind: "final-text",
+            operationId: "duplicate-operation",
+            method: "sendRichMessage",
+            content: "one",
+            contentMode: "rich-markdown",
+          },
+          {
+            kind: "final-text",
+            operationId: "duplicate-operation",
+            method: "sendRichMessage",
+            content: "two",
+            contentMode: "rich-markdown",
+          },
+        ],
+      }),
+      /duplicate id/,
+    );
+    assert.equal(readStoreSnapshot(duplicateHarness.rootPath).outbound.length, 0);
+  } finally {
+    removeHarness(duplicateHarness);
+  }
+
+  const filenameHarness = createStoreHarness();
+  try {
+    assert.throws(
+      () => prepareOutbound(filenameHarness, {
+        units: [{
+          kind: "attachment",
+          operationId: "unsafe-file",
+          method: "sendDocument",
+          spoolRefIndex: 0,
+          fileName: "../secret.txt",
+          mediaKind: "document",
+        }],
+        spool: [Buffer.from("secret")],
+      }),
+      /safe filename/,
+    );
+    assert.equal(readStoreSnapshot(filenameHarness.rootPath).outbound.length, 0);
+  } finally {
+    removeHarness(filenameHarness);
+  }
+
+  const harness = createStoreHarness();
+  try {
+    const prepared = prepareOutbound(harness);
+    const repeated = harness.store.planOutbound({
+      intentId: prepared.outbound.intentId,
+      turnId: prepared.inbound.turnId,
+      sourceInboundRecordIds: [prepared.inbound.recordId],
+      claim: { identity: OLD_IDENTITY },
+      replyToMessageId: 77,
+      renderingMode: "rich",
+      finalMarkdown: "first\n\nsecond",
+      renderedChunks: [],
+      units: prepared.units,
+    });
+    assert.equal(repeated.recordId, prepared.outbound.recordId);
+    assert.throws(
+      () => harness.store.planOutbound({
+        intentId: prepared.outbound.intentId,
+        turnId: prepared.inbound.turnId,
+        sourceInboundRecordIds: [prepared.inbound.recordId],
+        claim: { identity: OLD_IDENTITY },
+        replyToMessageId: 77,
+        renderingMode: "rich",
+        finalMarkdown: "changed semantic answer",
+        renderedChunks: [],
+        units: prepared.units,
+      }),
+      /idempotency payload mismatch/,
+    );
+    const wrongIdentity: RecoveryIdentity = {
+      ...OLD_IDENTITY,
+      owner: { kind: "leader", ownerId: "wrong", leaderEpoch: "wrong" },
+    };
+    assert.throws(
+      () => harness.store.listClaimableOutboundRecords({ identity: wrongIdentity }),
+      /not currently authenticated/,
+    );
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("outbound publication is quota-fenced and digest verification fails closed", () => {
+  const quotaHarness = createStoreHarness({ quotaBytes: 32_000 });
+  try {
+    const inbound = quotaHarness.store.observeInbound(810, OLD_IDENTITY);
+    quotaHarness.store.admitInbound({
+      recordId: inbound.recordId,
+      payload: Buffer.from("quota source"),
+    });
+    quotaHarness.store.markPreDispatch(inbound.recordId, { identity: OLD_IDENTITY });
+    quotaHarness.store.markDispatching(inbound.recordId, { identity: OLD_IDENTITY });
+    const payloadNames = readdirSync(quotaHarness.store.payloadDirectory).sort();
+    const spoolNames = readdirSync(quotaHarness.store.spoolDirectory).sort();
+    assert.throws(
+      () => quotaHarness.store.planOutbound({
+        intentId: "quota-intent",
+        turnId: inbound.turnId,
+        sourceInboundRecordIds: [inbound.recordId],
+        claim: { identity: OLD_IDENTITY },
+        replyToMessageId: 1,
+        renderingMode: "rich",
+        finalMarkdown: "x".repeat(40_000),
+        renderedChunks: [],
+        units: [{
+          kind: "final-text",
+          operationId: "quota-operation",
+          method: "sendRichMessage",
+          content: "x".repeat(40_000),
+          contentMode: "rich-markdown",
+        }],
+      }),
+      RecoveryQuotaExceededError,
+    );
+    assert.equal(readStoreSnapshot(quotaHarness.rootPath).outbound.length, 0);
+    assert.deepEqual(readdirSync(quotaHarness.store.payloadDirectory).sort(), payloadNames);
+    assert.deepEqual(readdirSync(quotaHarness.store.spoolDirectory).sort(), spoolNames);
+  } finally {
+    removeHarness(quotaHarness);
+  }
+
+  const digestHarness = createStoreHarness();
+  try {
+    const { outbound } = prepareOutbound(digestHarness);
+    const payloadPath = join(
+      digestHarness.store.payloadDirectory,
+      `${outbound.payloadRef!.payloadId}.bin`,
+    );
+    const bytes = readFileSync(payloadPath);
+    bytes[0] = bytes[0] === 0x7b ? 0x5b : 0x7b;
+    writeFileSync(payloadPath, bytes, { mode: 0o600 });
+    assert.throws(
+      () => digestHarness.store.listClaimableOutboundRecords({ identity: OLD_IDENTITY }),
+      /digest mismatch/,
+    );
+    assert.throws(() => reopenStore(digestHarness), /digest mismatch/);
+  } finally {
+    removeHarness(digestHarness);
+  }
+});
+
+test("outbound discard releases payload and spool only after durable disposition while uncertainty retains both indefinitely", () => {
+  const discardHarness = createStoreHarness();
+  try {
+    const { inbound, outbound } = prepareOutbound(discardHarness, {
+      units: [{
+        kind: "attachment",
+        operationId: "discard-operation",
+        method: "sendDocument",
+        spoolRefIndex: 0,
+        fileName: "discard.txt",
+        mediaKind: "document",
+      }],
+      spool: [Buffer.from("discard spool")],
+    });
+    const payloadPath = join(
+      discardHarness.store.payloadDirectory,
+      `${outbound.payloadRef!.payloadId}.bin`,
+    );
+    const spoolPath = join(
+      discardHarness.store.spoolDirectory,
+      `${outbound.spoolRefs[0]!.spoolId}.bin`,
+    );
+    assert.equal(existsSync(payloadPath), true);
+    assert.equal(existsSync(spoolPath), true);
+    const discarded = discardHarness.store.discardOutbound(
+      outbound.recordId,
+      { identity: OLD_IDENTITY },
+    );
+    assert.equal(discarded.state, "explicitly-discarded");
+    assert.equal(existsSync(payloadPath), false);
+    assert.equal(existsSync(spoolPath), false);
+    assert.equal(
+      readStoreSnapshot(discardHarness.rootPath).inbound.find(
+        (record) => record.recordId === inbound.recordId,
+      )!.state,
+      "completed",
+    );
+  } finally {
+    removeHarness(discardHarness);
+  }
+
+  const uncertainHarness = createStoreHarness();
+  try {
+    const { outbound } = prepareOutbound(uncertainHarness, {
+      units: [{
+        kind: "attachment",
+        operationId: "retain-operation",
+        method: "sendDocument",
+        spoolRefIndex: 0,
+        fileName: "retain.txt",
+        mediaKind: "document",
+      }],
+      spool: [Buffer.from("retain spool")],
+    });
+    uncertainHarness.store.activateOutbound(outbound.recordId, { identity: OLD_IDENTITY });
+    const claimed = uncertainHarness.store.claimOutboundUnit({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+    });
+    uncertainHarness.store.markOutboundUncertain({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+      attemptId: claimed.record.activeUnit!.attemptId,
+      reason: "response-lost",
+    });
+    uncertainHarness.now.value +=
+      RECOVERY_DELIVERED_PAYLOAD_RETENTION_MS +
+      RECOVERY_TERMINAL_METADATA_RETENTION_MS +
+      1;
+    uncertainHarness.store.compact();
+    const retained = readStoreSnapshot(uncertainHarness.rootPath).outbound[0]!;
+    assert.equal(retained.state, "delivery-uncertain");
+    assert.ok(retained.payloadRef);
+    assert.equal(retained.spoolRefs.length, 1);
+    assert.equal(readdirSync(uncertainHarness.store.payloadDirectory).length, 1);
+    assert.equal(readdirSync(uncertainHarness.store.spoolDirectory).length, 1);
+  } finally {
+    removeHarness(uncertainHarness);
+  }
+});
+
+test("outbound discard accepts pending, retryable, and uncertain states but rejects sending", () => {
+  for (const state of ["pending", "retryable-pending", "delivery-uncertain"] as const) {
+    const harness = createStoreHarness();
+    try {
+      const { inbound, outbound } = prepareOutbound(harness);
+      harness.store.activateOutbound(outbound.recordId, { identity: OLD_IDENTITY });
+      if (state !== "pending") {
+        const claimed = harness.store.claimOutboundUnit({
+          recordId: outbound.recordId,
+          claim: { identity: OLD_IDENTITY },
+        });
+        if (state === "retryable-pending") {
+          harness.store.recordOutboundSafeFailure({
+            recordId: outbound.recordId,
+            claim: { identity: OLD_IDENTITY },
+            attemptId: claimed.record.activeUnit!.attemptId,
+          });
+        } else {
+          harness.store.markOutboundUncertain({
+            recordId: outbound.recordId,
+            claim: { identity: OLD_IDENTITY },
+            attemptId: claimed.record.activeUnit!.attemptId,
+            reason: "commit-unknown",
+          });
+        }
+      }
+      const discarded = harness.store.discardOutbound(
+        outbound.recordId,
+        { identity: OLD_IDENTITY },
+      );
+      assert.equal(discarded.state, "explicitly-discarded");
+      assert.equal(
+        readStoreSnapshot(harness.rootPath).inbound.find(
+          (record) => record.recordId === inbound.recordId,
+        )!.state,
+        "completed",
+      );
+    } finally {
+      removeHarness(harness);
+    }
+  }
+
+  const sendingHarness = createStoreHarness();
+  try {
+    const { outbound } = prepareOutbound(sendingHarness);
+    const direct = sendingHarness.store.claimOutboundUnit({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+    });
+    assert.equal(direct.record.state, "sending");
+    assert.throws(
+      () => sendingHarness.store.claimOutboundUnit({
+        recordId: outbound.recordId,
+        claim: { identity: OLD_IDENTITY },
+      }),
+      /sending -> sending/,
+    );
+    assert.throws(
+      () => sendingHarness.store.discardOutbound(
+        outbound.recordId,
+        { identity: OLD_IDENTITY },
+      ),
+      /Cannot discard.*sending/,
+    );
+  } finally {
+    removeHarness(sendingHarness);
+  }
+});
+
 test("reopen marks dispatching uncertain, never drains it, and explicit retry is linked and idempotent", () => {
   const harness = createStoreHarness();
   try {
@@ -906,24 +1686,33 @@ test("same-process handoff is exact, expiring, single-use, and reassigns only ma
 test("same-process handoff updates matching unresolved inbound, outbound, and bus records", () => {
   const nextIdentity: RecoveryIdentity = { ...OLD_IDENTITY, sessionGeneration: 4 };
   const harness = createStoreHarness({
-    authenticated: (identity) => identitiesMatch(identity, nextIdentity),
+    authenticated: (identity) =>
+      identitiesMatch(identity, OLD_IDENTITY) || identitiesMatch(identity, nextIdentity),
   });
   try {
     const inbound = harness.store.observeInbound(120, OLD_IDENTITY);
-    const snapshot = readStoreSnapshot(harness.rootPath);
-    snapshot.outbound.push({
-      family: "outbound",
-      recordId: "outbound-handoff",
+    harness.store.admitInbound({ recordId: inbound.recordId, payload: Buffer.from("handoff") });
+    harness.store.markPreDispatch(inbound.recordId, { identity: OLD_IDENTITY });
+    harness.store.markDispatching(inbound.recordId, { identity: OLD_IDENTITY });
+    const outbound = harness.store.planOutbound({
       intentId: "intent-handoff",
-      turnId: "turn-outbound-handoff",
-      state: "pending",
-      identity: structuredClone(OLD_IDENTITY),
-      createdRevision: snapshot.revision,
-      stateRevision: snapshot.revision,
-      createdAtMs: harness.now.value,
-      updatedAtMs: harness.now.value,
-      spoolRefs: [],
+      turnId: inbound.turnId,
+      sourceInboundRecordIds: [inbound.recordId],
+      claim: { identity: OLD_IDENTITY },
+      replyToMessageId: 1,
+      renderingMode: "rich",
+      finalMarkdown: "handoff reply",
+      renderedChunks: [],
+      units: [{
+        kind: "final-text",
+        operationId: "handoff-operation",
+        method: "sendRichMessage",
+        content: "handoff reply",
+        contentMode: "rich-markdown",
+      }],
     });
+    harness.store.activateOutbound(outbound.recordId, { identity: OLD_IDENTITY });
+    const snapshot = readStoreSnapshot(harness.rootPath);
     snapshot.bus.push({
       family: "bus",
       recordId: "bus-handoff",
@@ -951,13 +1740,60 @@ test("same-process handoff updates matching unresolved inbound, outbound, and bu
     const result = harness.store.consumeSameProcessHandoff(handoff, nextIdentity);
     assert.deepEqual(
       [...result.claimedRecordIds].sort(),
-      [inbound.recordId, "outbound-handoff", "bus-handoff"].sort(),
+      [inbound.recordId, outbound.recordId, "bus-handoff"].sort(),
     );
     const moved = readStoreSnapshot(harness.rootPath);
     assert.ok(
       [...moved.inbound, ...moved.outbound, ...moved.bus].every(
         (record) => record.identity.sessionGeneration === 4,
       ),
+    );
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("same-process handoff moves uncertain outbound authority with its completed inbound source metadata", () => {
+  const nextIdentity: RecoveryIdentity = { ...OLD_IDENTITY, sessionGeneration: 4 };
+  const harness = createStoreHarness({
+    authenticated: (identity) =>
+      identitiesMatch(identity, OLD_IDENTITY) || identitiesMatch(identity, nextIdentity),
+  });
+  try {
+    const { inbound, outbound } = prepareOutbound(harness, { updateId: 121 });
+    harness.store.activateOutbound(outbound.recordId, { identity: OLD_IDENTITY });
+    const claimed = harness.store.claimOutboundUnit({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+    });
+    harness.store.markOutboundUncertain({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+      attemptId: claimed.record.activeUnit!.attemptId,
+      reason: "commit-unknown",
+    });
+    const handoff: RecoverySameProcessHandoff = {
+      handoffId: "uncertain-outbound-handoff",
+      profile: "default",
+      target: OLD_IDENTITY.target,
+      owner: OLD_IDENTITY.owner,
+      fromSessionGeneration: 3,
+      toSessionGeneration: 4,
+      createdAtMs: harness.now.value,
+      expiresAtMs: harness.now.value + 500,
+    };
+    const result = harness.store.consumeSameProcessHandoff(handoff, nextIdentity);
+    assert.deepEqual(result.claimedRecordIds, [outbound.recordId]);
+    const snapshot = readStoreSnapshot(harness.rootPath);
+    assert.equal(
+      snapshot.outbound.find((record) => record.recordId === outbound.recordId)!
+        .identity.sessionGeneration,
+      4,
+    );
+    assert.equal(
+      snapshot.inbound.find((record) => record.recordId === inbound.recordId)!
+        .identity.sessionGeneration,
+      4,
     );
   } finally {
     removeHarness(harness);
@@ -1282,45 +2118,51 @@ test("retention removes terminal payload after 24 hours and metadata after seven
 test("retention covers terminal outbound and bus payloads, spool cleanup, and dedup metadata horizon", () => {
   const harness = createStoreHarness();
   try {
-    const snapshot = readStoreSnapshot(harness.rootPath);
-    snapshot.revision = 1;
-    snapshot.writtenAtMs = harness.now.value;
-    const payloads = [
-      { id: "outbound-terminal-payload", body: Buffer.from("outbound-body") },
-      { id: "bus-terminal-payload", body: Buffer.from("bus-body") },
-    ];
-    const spools = [
-      { id: "outbound-terminal-spool", body: Buffer.from("outbound-spool") },
-      { id: "bus-terminal-spool", body: Buffer.from("bus-spool") },
-    ];
-    for (const entry of payloads) {
-      writeFileSync(join(harness.rootPath, "payloads", `${entry.id}.bin`), entry.body, { mode: 0o600 });
-    }
-    for (const entry of spools) {
-      writeFileSync(join(harness.rootPath, "spool", `${entry.id}.bin`), entry.body, { mode: 0o600 });
-    }
-    snapshot.outbound.push({
-      family: "outbound",
-      recordId: "outbound-terminal",
-      intentId: "outbound-terminal-intent",
-      turnId: "outbound-terminal-turn",
-      state: "delivered",
-      identity: structuredClone(OLD_IDENTITY),
-      createdRevision: 1,
-      stateRevision: 1,
-      createdAtMs: harness.now.value,
-      updatedAtMs: harness.now.value,
-      payloadRef: {
-        payloadId: payloads[0]!.id,
-        byteLength: payloads[0]!.body.byteLength,
-        sha256: sha256(payloads[0]!.body),
-      },
-      spoolRefs: [{
-        spoolId: spools[0]!.id,
-        byteLength: spools[0]!.body.byteLength,
-        sha256: sha256(spools[0]!.body),
-      }],
+    const inbound = harness.store.observeInbound(1090, OLD_IDENTITY);
+    harness.store.admitInbound({
+      recordId: inbound.recordId,
+      payload: Buffer.from("outbound source"),
     });
+    harness.store.markPreDispatch(inbound.recordId, { identity: OLD_IDENTITY });
+    harness.store.markDispatching(inbound.recordId, { identity: OLD_IDENTITY });
+    const planned = harness.store.planOutbound({
+      intentId: "outbound-terminal-intent",
+      turnId: inbound.turnId,
+      sourceInboundRecordIds: [inbound.recordId],
+      claim: { identity: OLD_IDENTITY },
+      replyToMessageId: 1,
+      renderingMode: "rich",
+      finalMarkdown: "outbound body",
+      renderedChunks: [],
+      units: [{
+        kind: "attachment",
+        operationId: "outbound-terminal-operation",
+        method: "sendDocument",
+        spoolRefIndex: 0,
+        fileName: "artifact.txt",
+        mediaKind: "document",
+      }],
+      spool: [Buffer.from("outbound spool")],
+    });
+    harness.store.activateOutbound(planned.recordId, { identity: OLD_IDENTITY });
+    const claimed = harness.store.claimOutboundUnit({
+      recordId: planned.recordId,
+      claim: { identity: OLD_IDENTITY },
+    });
+    harness.store.recordOutboundReceipt({
+      recordId: planned.recordId,
+      claim: { identity: OLD_IDENTITY },
+      attemptId: claimed.record.activeUnit!.attemptId,
+      operationId: "outbound-terminal-operation",
+      method: "sendDocument",
+      messageId: 55,
+    });
+
+    const busPayload = Buffer.from("bus body");
+    const busSpool = Buffer.from("bus spool");
+    writeFileSync(join(harness.rootPath, "payloads", "bus-terminal-payload.bin"), busPayload, { mode: 0o600 });
+    writeFileSync(join(harness.rootPath, "spool", "bus-terminal-spool.bin"), busSpool, { mode: 0o600 });
+    const snapshot = readStoreSnapshot(harness.rootPath);
     snapshot.bus.push({
       family: "bus",
       recordId: "bus-terminal",
@@ -1328,28 +2170,30 @@ test("retention covers terminal outbound and bus payloads, spool cleanup, and de
       payloadFingerprint: "bus-terminal-fingerprint",
       state: "completed",
       identity: structuredClone(OLD_IDENTITY),
-      createdRevision: 1,
-      stateRevision: 1,
+      createdRevision: snapshot.revision,
+      stateRevision: snapshot.revision,
       createdAtMs: harness.now.value,
       updatedAtMs: harness.now.value,
       payloadRef: {
-        payloadId: payloads[1]!.id,
-        byteLength: payloads[1]!.body.byteLength,
-        sha256: sha256(payloads[1]!.body),
+        payloadId: "bus-terminal-payload",
+        byteLength: busPayload.byteLength,
+        sha256: sha256(busPayload),
       },
       spoolRefs: [{
-        spoolId: spools[1]!.id,
-        byteLength: spools[1]!.body.byteLength,
-        sha256: sha256(spools[1]!.body),
+        spoolId: "bus-terminal-spool",
+        byteLength: busSpool.byteLength,
+        sha256: sha256(busSpool),
       }],
     });
     writeAccountedSnapshot(harness.rootPath, snapshot);
     harness.store.compact();
     assert.deepEqual(readdirSync(join(harness.rootPath, "spool")), []);
-    assert.equal(readdirSync(join(harness.rootPath, "payloads")).length, 2);
+    let retained = readStoreSnapshot(harness.rootPath);
+    assert.ok(retained.outbound[0]!.payloadRef);
+    assert.ok(retained.bus[0]!.payloadRef);
     harness.now.value += RECOVERY_DELIVERED_PAYLOAD_RETENTION_MS;
     harness.store.compact();
-    let retained = readStoreSnapshot(harness.rootPath);
+    retained = readStoreSnapshot(harness.rootPath);
     assert.equal(retained.outbound[0]!.payloadRef, undefined);
     assert.equal(retained.bus[0]!.payloadRef, undefined);
     assert.equal(retained.outbound.length, 1);
@@ -1631,6 +2475,185 @@ test("quarantine restore validates every referenced binary before activation", (
     assert.equal(statSync(quarantinePath).isDirectory(), true);
   } finally {
     removeHarness(harness);
+  }
+});
+
+test("final outbound uncertainty atomically completes every exact grouped inbound source", () => {
+  const harness = createStoreHarness();
+  try {
+    const observed = [820, 821].map((updateId) => {
+      const record = harness.store.observeInbound(updateId, OLD_IDENTITY);
+      harness.store.admitInbound({
+        recordId: record.recordId,
+        payload: Buffer.from(`raw-${updateId}`),
+      });
+      return record;
+    });
+    const materialized = harness.store.materializeInboundGroup(
+      observed.map((record, index) => ({
+        recordId: record.recordId,
+        claim: { identity: OLD_IDENTITY },
+        turnId: "grouped-outbound-turn",
+        payload: Buffer.from(`grouped-${index}`),
+      })),
+    );
+    harness.store.markDispatchingGroup(
+      materialized.map((record) => ({
+        recordId: record.recordId,
+        claim: { identity: OLD_IDENTITY },
+      })),
+    );
+    const outbound = harness.store.planOutbound({
+      intentId: "grouped-outbound-intent",
+      turnId: "grouped-outbound-turn",
+      sourceInboundRecordIds: materialized.map((record) => record.recordId),
+      claim: { identity: OLD_IDENTITY },
+      replyToMessageId: 99,
+      renderingMode: "rich",
+      finalMarkdown: "grouped result",
+      renderedChunks: [],
+      units: [{
+        kind: "final-text",
+        operationId: "grouped-operation",
+        method: "sendRichMessage",
+        content: "grouped result",
+        contentMode: "rich-markdown",
+      }],
+    });
+    harness.store.activateOutbound(outbound.recordId, { identity: OLD_IDENTITY });
+    const claimed = harness.store.claimOutboundUnit({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+    });
+    harness.store.markOutboundUncertain({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+      attemptId: claimed.record.activeUnit!.attemptId,
+      reason: "confirmed-before-receipt",
+    });
+    const snapshot = readStoreSnapshot(harness.rootPath);
+    const durableOutbound = snapshot.outbound.find(
+      (record) => record.recordId === outbound.recordId,
+    )!;
+    const sources = snapshot.inbound.filter((record) =>
+      materialized.some((source) => source.recordId === record.recordId),
+    );
+    assert.equal(durableOutbound.state, "delivery-uncertain");
+    assert.equal(sources.length, 2);
+    assert.ok(sources.every((record) => record.state === "completed"));
+    assert.ok(
+      sources.every((record) => record.stateRevision === durableOutbound.stateRevision),
+    );
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("OUT-02 through OUT-06 fault seams preserve their exact durable storage boundary", () => {
+  for (const faultId of ["OUT-02", "OUT-03", "OUT-04", "OUT-05", "OUT-06"] as const) {
+    const controller = new ReliabilityFaultController(faultId, {
+      seed: `outbound-${faultId}`,
+    });
+    const harness = createStoreHarness({ fault: (id) => controller.hit(id) });
+    try {
+      const { inbound, outbound } = prepareOutbound(harness, {
+        units: [{
+          kind: "final-text",
+          operationId: "fault-operation",
+          method: "sendRichMessage",
+          content: "fault result",
+          contentMode: "rich-markdown",
+        }],
+      });
+      if (faultId === "OUT-02") {
+        assert.throws(
+          () => harness.store.activateOutbound(outbound.recordId, { identity: OLD_IDENTITY }),
+          InjectedReliabilityFaultError,
+        );
+      } else {
+        harness.store.activateOutbound(outbound.recordId, { identity: OLD_IDENTITY });
+        const claimed = harness.store.claimOutboundUnit({
+          recordId: outbound.recordId,
+          claim: { identity: OLD_IDENTITY },
+        });
+        if (faultId === "OUT-03") {
+          assert.throws(
+            () => harness.store.recordOutboundSafeFailure({
+              recordId: outbound.recordId,
+              claim: { identity: OLD_IDENTITY },
+              attemptId: claimed.record.activeUnit!.attemptId,
+            }),
+            InjectedReliabilityFaultError,
+          );
+        } else if (faultId === "OUT-04") {
+          assert.throws(
+            () => harness.store.markOutboundUncertain({
+              recordId: outbound.recordId,
+              claim: { identity: OLD_IDENTITY },
+              attemptId: claimed.record.activeUnit!.attemptId,
+              reason: "commit-unknown",
+            }),
+            InjectedReliabilityFaultError,
+          );
+        } else {
+          assert.throws(
+            () => harness.store.recordOutboundReceipt({
+              recordId: outbound.recordId,
+              claim: { identity: OLD_IDENTITY },
+              attemptId: claimed.record.activeUnit!.attemptId,
+              operationId: "fault-operation",
+              method: "sendRichMessage",
+              messageId: 123,
+            }),
+            InjectedReliabilityFaultError,
+          );
+        }
+      }
+      controller.assertInjected();
+      const snapshot = readStoreSnapshot(harness.rootPath);
+      const stored = snapshot.outbound.find((record) => record.recordId === outbound.recordId)!;
+      const storedInbound = snapshot.inbound.find((record) => record.recordId === inbound.recordId)!;
+      const expectedState = {
+        "OUT-02": "pending",
+        "OUT-03": "retryable-pending",
+        "OUT-04": "delivery-uncertain",
+        "OUT-05": "sending",
+        "OUT-06": "delivered",
+      } as const;
+      assert.equal(stored.state, expectedState[faultId]);
+      assert.equal(
+        storedInbound.state,
+        faultId === "OUT-04" || faultId === "OUT-06" ? "completed" : "dispatching",
+      );
+      const reopened = reopenStore(harness);
+      const reopenedSnapshot = readStoreSnapshot(harness.rootPath);
+      const reopenedOutbound = reopenedSnapshot.outbound.find(
+        (record) => record.recordId === outbound.recordId,
+      )!;
+      assert.equal(
+        reopenedOutbound.state,
+        faultId === "OUT-05" ? "delivery-uncertain" : expectedState[faultId],
+      );
+      if (faultId === "OUT-05") {
+        assert.deepEqual(reopenedOutbound.uncertainty, {
+          unitIndex: 0,
+          reason: "process-reopened-sending",
+          observedAtMs: reopenedOutbound.updatedAtMs,
+        });
+        assert.equal(
+          reopenedSnapshot.inbound.find(
+            (record) => record.recordId === inbound.recordId,
+          )!.state,
+          "completed",
+        );
+      }
+      assert.equal(
+        reopened.getStatus().items.some((item) => item.family === "outbound"),
+        faultId !== "OUT-06",
+      );
+    } finally {
+      removeHarness(harness);
+    }
   }
 });
 

@@ -1,9 +1,10 @@
 /**
  * Durable recovery contracts and profile-scoped filesystem store
  * Zones: recovery, queue lifecycle, delivery, multi-instance bus, filesystem
- * Owns the strict v1 schema, inbound recovery state machine, byte reservations,
- * identity claims, retention, and downgrade quarantine primitives. Runtime wiring
- * to polling, queue dispatch, and the multi-instance bus remains outside this domain.
+ * Owns the strict v1 schema, inbound/outbound recovery state machines, byte
+ * reservations, identity claims, retention, and downgrade quarantine primitives.
+ * Runtime wiring to polling, queue dispatch, and the multi-instance bus remains
+ * outside this domain.
  */
 
 import { createHash, randomUUID } from "node:crypto";
@@ -42,6 +43,8 @@ export const RECOVERY_STORE_DIRECTORY_MODE = 0o700;
 export const RECOVERY_STORE_FILE_MODE = 0o600;
 export const RECOVERY_STORE_DIRECTORY_NAME = "recovery-v1";
 export const RECOVERY_STORE_QUARANTINE_PREFIX = "recovery-v1-quarantine-";
+export const RECOVERY_OUTBOUND_MAX_AUTOMATIC_STARTS = 3;
+export const RECOVERY_OUTBOUND_RETRY_DELAYS_MS = [250, 1_000] as const;
 
 export const RECOVERY_INBOUND_STATES = [
   "observed",
@@ -86,6 +89,19 @@ export const RECOVERY_UNRESOLVED_OUTBOUND_STATES = [
   "delivery-uncertain",
   "retryable-pending",
 ] as const satisfies readonly RecoveryOutboundState[];
+
+export const RECOVERY_OUTBOUND_UNCERTAINTY_REASONS = [
+  "commit-unknown",
+  "timeout-after-write",
+  "connection-lost-after-write",
+  "malformed-success",
+  "response-lost",
+  "authority-lost-after-start",
+  "process-reopened-sending",
+  "confirmed-before-receipt",
+] as const;
+export type RecoveryOutboundUncertaintyReason =
+  (typeof RECOVERY_OUTBOUND_UNCERTAINTY_REASONS)[number];
 
 export const RECOVERY_BUS_STATES = [
   "pending",
@@ -355,12 +371,115 @@ export interface RecoveryInboundRecord extends RecoveryRecordBase {
   terminalReason?: RecoveryInboundTerminalReason;
 }
 
+export interface RecoveryOutboundActiveUnit {
+  unitIndex: number;
+  attemptId: string;
+  startedAtMs: number;
+}
+
+export interface RecoveryOutboundReceipt {
+  unitIndex: number;
+  operationId: string;
+  method: string;
+  messageId?: number;
+  committedAtMs: number;
+}
+
+export interface RecoveryOutboundUncertainty {
+  unitIndex: number;
+  reason: RecoveryOutboundUncertaintyReason;
+  observedAtMs: number;
+}
+
 export interface RecoveryOutboundRecord extends RecoveryRecordBase {
   family: "outbound";
   intentId: string;
   turnId: string;
+  sourceInboundRecordIds: string[];
   state: RecoveryOutboundState;
+  nextUnitIndex: number;
+  activeUnit?: RecoveryOutboundActiveUnit;
+  automaticAttemptCount: number;
+  retryNotBeforeMs?: number;
+  receipts: RecoveryOutboundReceipt[];
+  uncertainty?: RecoveryOutboundUncertainty;
   linkedAttemptOf?: string;
+}
+
+export type RecoveryOutboundRenderingMode = "rich" | "html";
+export type RecoveryOutboundMediaKind =
+  | "photo"
+  | "video"
+  | "audio"
+  | "document"
+  | "voice";
+
+export interface RecoveryOutboundButton {
+  label: string;
+  prompt: string;
+}
+
+export interface RecoveryOutboundVoiceMetadata {
+  text: string;
+  automatic: boolean;
+}
+
+export type RecoveryOutboundUnit =
+  | {
+      kind: "final-text";
+      operationId: string;
+      method: string;
+      content: string;
+      contentMode: "rich-markdown" | "html" | "plain";
+    }
+  | {
+      kind: "rich-media" | "attachment" | "voice";
+      operationId: string;
+      method: string;
+      spoolRefIndex: number;
+      fileName: string;
+      mediaKind: RecoveryOutboundMediaKind;
+      caption?: string;
+    }
+  | {
+      kind: "guest";
+      operationId: string;
+      method: string;
+      markdown?: string;
+      spoolRefIndex?: number;
+      fileName?: string;
+      mediaKind?: RecoveryOutboundMediaKind;
+      caption?: string;
+    };
+
+export interface RecoveryOutboundPlanInput {
+  intentId: string;
+  turnId: string;
+  sourceInboundRecordIds: readonly string[];
+  claim: RecoveryIdentityClaim;
+  replyToMessageId: number;
+  renderingMode: RecoveryOutboundRenderingMode;
+  finalMarkdown: string;
+  renderedChunks: readonly string[];
+  units: readonly RecoveryOutboundUnit[];
+  buttons?: readonly RecoveryOutboundButton[];
+  voice?: RecoveryOutboundVoiceMetadata;
+  guestQueryId?: string;
+  spool?: readonly Uint8Array[];
+}
+
+interface RecoveryOutboundPayloadV1 {
+  version: 1;
+  intentId: string;
+  turnId: string;
+  replyToMessageId: number;
+  renderingMode: RecoveryOutboundRenderingMode;
+  finalMarkdown: string;
+  renderedChunks: string[];
+  units: RecoveryOutboundUnit[];
+  buttons: RecoveryOutboundButton[];
+  voice?: RecoveryOutboundVoiceMetadata;
+  guestQueryId?: string;
 }
 
 export interface RecoveryBusRecord extends RecoveryRecordBase {
@@ -471,6 +590,32 @@ function readStableString(value: unknown, path: string): string {
     fail(path, "expected a non-empty stable string without control characters");
   }
   return value;
+}
+
+function readText(value: unknown, path: string): string {
+  if (typeof value !== "string" || value.includes("\u0000")) {
+    fail(path, "expected text without NUL characters");
+  }
+  return value;
+}
+
+function readBoolean(value: unknown, path: string): boolean {
+  if (typeof value !== "boolean") fail(path, "expected a boolean");
+  return value;
+}
+
+function readSafeFileName(value: unknown, path: string): string {
+  const fileName = readStableString(value, path);
+  if (
+    fileName === "." ||
+    fileName === ".." ||
+    fileName.includes("/") ||
+    fileName.includes("\\") ||
+    basename(fileName) !== fileName
+  ) {
+    fail(path, "expected a safe filename without a path");
+  }
+  return fileName;
 }
 
 function readProfile(value: unknown, path: string): string {
@@ -734,22 +879,484 @@ function readOutboundRecord(
   assertKeys(
     object,
     path,
-    [...RECORD_BASE_REQUIRED_KEYS, "intentId", "turnId", "state"],
-    [...RECORD_BASE_OPTIONAL_KEYS, "linkedAttemptOf"],
+    [
+      ...RECORD_BASE_REQUIRED_KEYS,
+      "intentId",
+      "turnId",
+      "sourceInboundRecordIds",
+      "state",
+      "nextUnitIndex",
+      "automaticAttemptCount",
+      "receipts",
+    ],
+    [
+      ...RECORD_BASE_OPTIONAL_KEYS,
+      "activeUnit",
+      "retryNotBeforeMs",
+      "uncertainty",
+      "linkedAttemptOf",
+    ],
   );
   if (object.family !== "outbound") fail(`${path}.family`, "expected outbound");
   const base = readRecordBase(object, path);
+  const sourceInboundRecordIds = readArray(
+    object.sourceInboundRecordIds,
+    `${path}.sourceInboundRecordIds`,
+    readStableString,
+  );
+  if (sourceInboundRecordIds.length === 0) {
+    fail(`${path}.sourceInboundRecordIds`, "must not be empty");
+  }
+  assertUniqueStrings(sourceInboundRecordIds, `${path}.sourceInboundRecordIds`);
+  const state = readEnum(object.state, `${path}.state`, RECOVERY_OUTBOUND_STATES);
+  const receipts = readArray(
+    object.receipts,
+    `${path}.receipts`,
+    readOutboundReceipt,
+  );
+  assertUniqueStrings(
+    receipts.map((receipt) => receipt.operationId),
+    `${path}.receipts.operationId`,
+  );
+  for (let index = 0; index < receipts.length; index += 1) {
+    const receipt = receipts[index]!;
+    if (receipt.unitIndex !== index) {
+      fail(`${path}.receipts[${index}].unitIndex`, "must be contiguous and ordered");
+    }
+    if (
+      receipt.committedAtMs < base.createdAtMs ||
+      receipt.committedAtMs > base.updatedAtMs ||
+      (index > 0 && receipt.committedAtMs < receipts[index - 1]!.committedAtMs)
+    ) {
+      fail(
+        `${path}.receipts[${index}].committedAtMs`,
+        "must be ordered within the record lifetime",
+      );
+    }
+  }
+  const nextUnitIndex = readSafeInteger(
+    object.nextUnitIndex,
+    `${path}.nextUnitIndex`,
+    { minimum: 0 },
+  );
+  if (nextUnitIndex !== receipts.length) {
+    fail(`${path}.nextUnitIndex`, "must equal the confirmed receipt count");
+  }
+  const automaticAttemptCount = readSafeInteger(
+    object.automaticAttemptCount,
+    `${path}.automaticAttemptCount`,
+    { minimum: 0 },
+  );
+  if (automaticAttemptCount > RECOVERY_OUTBOUND_MAX_AUTOMATIC_STARTS) {
+    fail(`${path}.automaticAttemptCount`, "exceeds the automatic start limit");
+  }
+  const activeUnit = Object.hasOwn(object, "activeUnit")
+    ? readOutboundActiveUnit(object.activeUnit, `${path}.activeUnit`)
+    : undefined;
+  const retryNotBeforeMs = Object.hasOwn(object, "retryNotBeforeMs")
+    ? readTimestamp(object.retryNotBeforeMs, `${path}.retryNotBeforeMs`)
+    : undefined;
+  const uncertainty = Object.hasOwn(object, "uncertainty")
+    ? readOutboundUncertainty(object.uncertainty, `${path}.uncertainty`)
+    : undefined;
   const linkedAttemptOf = Object.hasOwn(object, "linkedAttemptOf")
     ? readStableString(object.linkedAttemptOf, `${path}.linkedAttemptOf`)
     : undefined;
+  if (state === "sending") {
+    if (!activeUnit || activeUnit.unitIndex !== nextUnitIndex) {
+      fail(`${path}.activeUnit`, "is required for the exact next sending unit");
+    }
+    if (
+      activeUnit.startedAtMs < base.createdAtMs ||
+      activeUnit.startedAtMs > base.updatedAtMs
+    ) {
+      fail(`${path}.activeUnit.startedAtMs`, "must fall within the record lifetime");
+    }
+    if (automaticAttemptCount < 1 || retryNotBeforeMs !== undefined || uncertainty) {
+      fail(path, "sending state has invalid retry or uncertainty metadata");
+    }
+  } else if (activeUnit) {
+    fail(`${path}.activeUnit`, "is valid only while sending");
+  }
+  if (state === "retryable-pending") {
+    if (automaticAttemptCount < 1 || uncertainty) {
+      fail(path, "retryable-pending requires prior safe attempts only");
+    }
+    if (
+      automaticAttemptCount < RECOVERY_OUTBOUND_MAX_AUTOMATIC_STARTS &&
+      retryNotBeforeMs === undefined
+    ) {
+      fail(`${path}.retryNotBeforeMs`, "is required before automatic retry");
+    }
+    if (
+      automaticAttemptCount === RECOVERY_OUTBOUND_MAX_AUTOMATIC_STARTS &&
+      retryNotBeforeMs !== undefined
+    ) {
+      fail(`${path}.retryNotBeforeMs`, "must be absent after retry exhaustion");
+    }
+  } else if (retryNotBeforeMs !== undefined) {
+    fail(`${path}.retryNotBeforeMs`, "is valid only while retryable-pending");
+  }
+  if (state === "delivery-uncertain") {
+    if (
+      !uncertainty ||
+      uncertainty.unitIndex !== nextUnitIndex ||
+      automaticAttemptCount < 1
+    ) {
+      fail(`${path}.uncertainty`, "must identify the exact ambiguous unit");
+    }
+    if (
+      uncertainty.observedAtMs < base.createdAtMs ||
+      uncertainty.observedAtMs > base.updatedAtMs
+    ) {
+      fail(`${path}.uncertainty.observedAtMs`, "must fall within the record lifetime");
+    }
+  } else if (uncertainty) {
+    fail(`${path}.uncertainty`, "is valid only for delivery-uncertain");
+  }
+  if (state === "planned" && nextUnitIndex !== 0) {
+    fail(`${path}.nextUnitIndex`, "planned work cannot have receipts");
+  }
+  if (
+    (state === "planned" || state === "pending") &&
+    automaticAttemptCount !== 0
+  ) {
+    fail(`${path}.automaticAttemptCount`, "must be zero for a fresh pending unit");
+  }
+  if (state === "delivered" && automaticAttemptCount !== 0) {
+    fail(`${path}.automaticAttemptCount`, "must reset after final receipt");
+  }
+  if (
+    (state === "delivered" || state === "explicitly-discarded") &&
+    base.spoolRefs.length > 0
+  ) {
+    fail(`${path}.spoolRefs`, "terminal resolution must release outbound spools");
+  }
+  if (state === "explicitly-discarded" && base.payloadRef) {
+    fail(`${path}.payloadRef`, "discarded outbound work must release its payload");
+  }
   return {
     ...base,
     family: "outbound",
     intentId: readStableString(object.intentId, `${path}.intentId`),
     turnId: readStableString(object.turnId, `${path}.turnId`),
-    state: readEnum(object.state, `${path}.state`, RECOVERY_OUTBOUND_STATES),
+    sourceInboundRecordIds,
+    state,
+    nextUnitIndex,
+    ...(activeUnit ? { activeUnit } : {}),
+    automaticAttemptCount,
+    ...(retryNotBeforeMs !== undefined ? { retryNotBeforeMs } : {}),
+    receipts,
+    ...(uncertainty ? { uncertainty } : {}),
     ...(linkedAttemptOf ? { linkedAttemptOf } : {}),
   };
+}
+
+function readOutboundActiveUnit(
+  value: unknown,
+  path: string,
+): RecoveryOutboundActiveUnit {
+  const object = readObject(value, path);
+  assertKeys(object, path, ["unitIndex", "attemptId", "startedAtMs"]);
+  return {
+    unitIndex: readSafeInteger(object.unitIndex, `${path}.unitIndex`, {
+      minimum: 0,
+    }),
+    attemptId: readStableString(object.attemptId, `${path}.attemptId`),
+    startedAtMs: readTimestamp(object.startedAtMs, `${path}.startedAtMs`),
+  };
+}
+
+function readOutboundReceipt(
+  value: unknown,
+  path: string,
+): RecoveryOutboundReceipt {
+  const object = readObject(value, path);
+  assertKeys(
+    object,
+    path,
+    ["unitIndex", "operationId", "method", "committedAtMs"],
+    ["messageId"],
+  );
+  const receipt: RecoveryOutboundReceipt = {
+    unitIndex: readSafeInteger(object.unitIndex, `${path}.unitIndex`, {
+      minimum: 0,
+    }),
+    operationId: readStableString(
+      object.operationId,
+      `${path}.operationId`,
+    ),
+    method: readStableString(object.method, `${path}.method`),
+    committedAtMs: readTimestamp(
+      object.committedAtMs,
+      `${path}.committedAtMs`,
+    ),
+  };
+  if (Object.hasOwn(object, "messageId")) {
+    receipt.messageId = readSafeInteger(
+      object.messageId,
+      `${path}.messageId`,
+      { minimum: 1 },
+    );
+  }
+  return receipt;
+}
+
+function readOutboundUncertainty(
+  value: unknown,
+  path: string,
+): RecoveryOutboundUncertainty {
+  const object = readObject(value, path);
+  assertKeys(object, path, ["unitIndex", "reason", "observedAtMs"]);
+  return {
+    unitIndex: readSafeInteger(object.unitIndex, `${path}.unitIndex`, {
+      minimum: 0,
+    }),
+    reason: readEnum(
+      object.reason,
+      `${path}.reason`,
+      RECOVERY_OUTBOUND_UNCERTAINTY_REASONS,
+    ),
+    observedAtMs: readTimestamp(object.observedAtMs, `${path}.observedAtMs`),
+  };
+}
+
+function readOutboundButton(
+  value: unknown,
+  path: string,
+): RecoveryOutboundButton {
+  const object = readObject(value, path);
+  assertKeys(object, path, ["label", "prompt"]);
+  return {
+    label: readStableString(object.label, `${path}.label`),
+    prompt: readText(object.prompt, `${path}.prompt`),
+  };
+}
+
+function readOutboundVoiceMetadata(
+  value: unknown,
+  path: string,
+): RecoveryOutboundVoiceMetadata {
+  const object = readObject(value, path);
+  assertKeys(object, path, ["text", "automatic"]);
+  return {
+    text: readText(object.text, `${path}.text`),
+    automatic: readBoolean(object.automatic, `${path}.automatic`),
+  };
+}
+
+function readOutboundUnit(value: unknown, path: string): RecoveryOutboundUnit {
+  const object = readObject(value, path);
+  const kind = readEnum(object.kind, `${path}.kind`, [
+    "final-text",
+    "rich-media",
+    "attachment",
+    "voice",
+    "guest",
+  ] as const);
+  if (kind === "final-text") {
+    assertKeys(object, path, [
+      "kind",
+      "operationId",
+      "method",
+      "content",
+      "contentMode",
+    ]);
+    return {
+      kind,
+      operationId: readStableString(
+        object.operationId,
+        `${path}.operationId`,
+      ),
+      method: readStableString(object.method, `${path}.method`),
+      content: readText(object.content, `${path}.content`),
+      contentMode: readEnum(object.contentMode, `${path}.contentMode`, [
+        "rich-markdown",
+        "html",
+        "plain",
+      ] as const),
+    };
+  }
+  if (kind === "guest") {
+    assertKeys(
+      object,
+      path,
+      ["kind", "operationId", "method"],
+      ["markdown", "spoolRefIndex", "fileName", "mediaKind", "caption"],
+    );
+    const unit: Extract<RecoveryOutboundUnit, { kind: "guest" }> = {
+      kind,
+      operationId: readStableString(
+        object.operationId,
+        `${path}.operationId`,
+      ),
+      method: readStableString(object.method, `${path}.method`),
+    };
+    if (Object.hasOwn(object, "markdown")) {
+      unit.markdown = readText(object.markdown, `${path}.markdown`);
+    }
+    const attachmentKeys = ["spoolRefIndex", "fileName", "mediaKind"];
+    const attachmentKeyCount = attachmentKeys.filter((key) =>
+      Object.hasOwn(object, key)
+    ).length;
+    if (attachmentKeyCount !== 0 && attachmentKeyCount !== attachmentKeys.length) {
+      fail(path, "guest attachment metadata must be complete");
+    }
+    if (attachmentKeyCount > 0) {
+      unit.spoolRefIndex = readSafeInteger(
+        object.spoolRefIndex,
+        `${path}.spoolRefIndex`,
+        { minimum: 0 },
+      );
+      unit.fileName = readSafeFileName(object.fileName, `${path}.fileName`);
+      unit.mediaKind = readEnum(object.mediaKind, `${path}.mediaKind`, [
+        "photo",
+        "video",
+        "audio",
+        "document",
+        "voice",
+      ] as const);
+    }
+    if (Object.hasOwn(object, "caption")) {
+      unit.caption = readText(object.caption, `${path}.caption`);
+    }
+    if (unit.markdown === undefined && unit.spoolRefIndex === undefined) {
+      fail(path, "guest unit requires markdown or an attachment");
+    }
+    return unit;
+  }
+  assertKeys(
+    object,
+    path,
+    [
+      "kind",
+      "operationId",
+      "method",
+      "spoolRefIndex",
+      "fileName",
+      "mediaKind",
+    ],
+    ["caption"],
+  );
+  const unit: Extract<
+    RecoveryOutboundUnit,
+    { kind: "rich-media" | "attachment" | "voice" }
+  > = {
+    kind,
+    operationId: readStableString(object.operationId, `${path}.operationId`),
+    method: readStableString(object.method, `${path}.method`),
+    spoolRefIndex: readSafeInteger(
+      object.spoolRefIndex,
+      `${path}.spoolRefIndex`,
+      { minimum: 0 },
+    ),
+    fileName: readSafeFileName(object.fileName, `${path}.fileName`),
+    mediaKind: readEnum(object.mediaKind, `${path}.mediaKind`, [
+      "photo",
+      "video",
+      "audio",
+      "document",
+      "voice",
+    ] as const),
+  };
+  if (Object.hasOwn(object, "caption")) {
+    unit.caption = readText(object.caption, `${path}.caption`);
+  }
+  if (kind === "voice" && unit.mediaKind !== "voice") {
+    fail(`${path}.mediaKind`, "voice units require voice media");
+  }
+  return unit;
+}
+
+function readOutboundPayload(
+  value: unknown,
+  path: string,
+  spoolCount: number,
+): RecoveryOutboundPayloadV1 {
+  const object = readObject(value, path);
+  assertKeys(
+    object,
+    path,
+    [
+      "version",
+      "intentId",
+      "turnId",
+      "replyToMessageId",
+      "renderingMode",
+      "finalMarkdown",
+      "renderedChunks",
+      "units",
+      "buttons",
+    ],
+    ["voice", "guestQueryId"],
+  );
+  if (object.version !== 1) fail(`${path}.version`, "expected 1");
+  const payload: RecoveryOutboundPayloadV1 = {
+    version: 1,
+    intentId: readStableString(object.intentId, `${path}.intentId`),
+    turnId: readStableString(object.turnId, `${path}.turnId`),
+    replyToMessageId: readSafeInteger(
+      object.replyToMessageId,
+      `${path}.replyToMessageId`,
+      { minimum: 1 },
+    ),
+    renderingMode: readEnum(object.renderingMode, `${path}.renderingMode`, [
+      "rich",
+      "html",
+    ] as const),
+    finalMarkdown: readText(object.finalMarkdown, `${path}.finalMarkdown`),
+    renderedChunks: readArray(
+      object.renderedChunks,
+      `${path}.renderedChunks`,
+      readText,
+    ),
+    units: readArray(object.units, `${path}.units`, readOutboundUnit),
+    buttons: readArray(object.buttons, `${path}.buttons`, readOutboundButton),
+  };
+  if (Object.hasOwn(object, "voice")) {
+    payload.voice = readOutboundVoiceMetadata(object.voice, `${path}.voice`);
+  }
+  if (Object.hasOwn(object, "guestQueryId")) {
+    payload.guestQueryId = readStableString(
+      object.guestQueryId,
+      `${path}.guestQueryId`,
+    );
+  }
+  if (payload.units.length === 0) fail(`${path}.units`, "must not be empty");
+  assertUniqueStrings(
+    payload.units.map((unit) => unit.operationId),
+    `${path}.units.operationId`,
+  );
+  for (let index = 0; index < payload.units.length; index += 1) {
+    const unit = payload.units[index]!;
+    if ("spoolRefIndex" in unit && unit.spoolRefIndex !== undefined) {
+      if (unit.spoolRefIndex >= spoolCount) {
+        fail(
+          `${path}.units[${index}].spoolRefIndex`,
+          "does not reference an outbound spool",
+        );
+      }
+    }
+    if (unit.kind === "guest" && payload.guestQueryId === undefined) {
+      fail(`${path}.guestQueryId`, "is required by guest units");
+    }
+  }
+  return payload;
+}
+
+function parseOutboundPayload(
+  bytes: Uint8Array,
+  path: string,
+  spoolCount: number,
+): RecoveryOutboundPayloadV1 {
+  let value: unknown;
+  try {
+    value = JSON.parse(Buffer.from(bytes).toString("utf8"));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    fail(path, `invalid JSON: ${message}`);
+  }
+  return readOutboundPayload(value, path, spoolCount);
 }
 
 function readBusRecord(value: unknown, path: string): RecoveryBusRecord {
@@ -1013,6 +1620,7 @@ function assertStructurallyUniqueRequests(snapshot: RecoverySnapshotV1): void {
   assertUniqueStrings(
     snapshot.outbound.map((record) =>
       JSON.stringify([
+        record.identity.profile,
         ...targetTuple(record.identity.target),
         record.intentId,
         record.turnId,
@@ -1070,6 +1678,88 @@ function assertSnapshotConsistency(snapshot: RecoverySnapshotV1): void {
         `$.inbound.${record.recordId}.updateId`,
         "must match the linked source update id",
       );
+    }
+  }
+  const outboundById = new Map(
+    snapshot.outbound.map((record) => [record.recordId, record] as const),
+  );
+  assertUniqueStrings(
+    snapshot.outbound.flatMap((record) =>
+      record.linkedAttemptOf ? [record.linkedAttemptOf] : [],
+    ),
+    "$.outbound.linkedAttemptOf",
+  );
+  for (const record of snapshot.outbound) {
+    const path = `$.outbound.${record.recordId}`;
+    const visitedAttempts = new Set<string>();
+    let attemptCursor: RecoveryOutboundRecord | undefined = record;
+    while (attemptCursor?.linkedAttemptOf) {
+      if (visitedAttempts.has(attemptCursor.recordId)) {
+        fail(`${path}.linkedAttemptOf`, "must not form a retry cycle");
+      }
+      visitedAttempts.add(attemptCursor.recordId);
+      attemptCursor = outboundById.get(attemptCursor.linkedAttemptOf);
+    }
+    for (const sourceId of record.sourceInboundRecordIds) {
+      const source = inboundById.get(sourceId);
+      if (!source) {
+        fail(`${path}.sourceInboundRecordIds`, "references an unknown inbound record");
+      }
+      const sourceIdentityAuthorized =
+        identitiesEqual(source.identity, record.identity) ||
+        hasSnapshotCommittedGrant(snapshot, source.recordId, record.identity) ||
+        (record.linkedAttemptOf !== undefined &&
+          hasSnapshotCommittedGrant(
+            snapshot,
+            record.linkedAttemptOf,
+            record.identity,
+          ));
+      if (source.turnId !== record.turnId || !sourceIdentityAuthorized) {
+        fail(`${path}.sourceInboundRecordIds`, "has a mismatched source turn or identity");
+      }
+      const outboundTerminalDisposition =
+        record.state === "delivered" ||
+        record.state === "delivery-uncertain" ||
+        record.state === "explicitly-discarded";
+      if (outboundTerminalDisposition && source.state !== "completed") {
+        fail(`${path}.sourceInboundRecordIds`, "terminal outbound work requires completed inbound sources");
+      }
+      if (
+        !outboundTerminalDisposition &&
+        source.state !== "dispatching" &&
+        !(record.linkedAttemptOf && source.state === "completed")
+      ) {
+        fail(`${path}.sourceInboundRecordIds`, "pending outbound work requires dispatching inbound sources");
+      }
+    }
+    if (record.linkedAttemptOf) {
+      const source = outboundById.get(record.linkedAttemptOf);
+      if (!source || source.state !== "delivery-uncertain") {
+        fail(`${path}.linkedAttemptOf`, "must reference delivery-uncertain outbound work");
+      }
+      if (
+        source.turnId !== record.turnId ||
+        (!identitiesEqual(source.identity, record.identity) &&
+          !hasSnapshotCommittedGrant(snapshot, source.recordId, record.identity)) ||
+        JSON.stringify(source.sourceInboundRecordIds) !==
+          JSON.stringify(record.sourceInboundRecordIds)
+      ) {
+        fail(`${path}.linkedAttemptOf`, "must preserve the exact source identity and turn");
+      }
+      if (source.payloadRef || source.spoolRefs.length > 0) {
+        fail(`${path}.linkedAttemptOf`, "must own transferred payload and spool references exclusively");
+      }
+    }
+    const linkedRetryExists = snapshot.outbound.some(
+      (candidate) => candidate.linkedAttemptOf === record.recordId,
+    );
+    if (
+      record.state !== "delivered" &&
+      record.state !== "explicitly-discarded" &&
+      !record.payloadRef &&
+      !(record.state === "delivery-uncertain" && linkedRetryExists)
+    ) {
+      fail(`${path}.payloadRef`, "is required for unresolved outbound work");
     }
   }
   assertStructurallyUniqueRequests(snapshot);
@@ -1296,6 +1986,17 @@ export type RecoveryInboundFaultId =
   | "DOWN-01"
   | "DOWN-02";
 
+export type RecoveryOutboundFaultId =
+  | "OUT-02"
+  | "OUT-03"
+  | "OUT-04"
+  | "OUT-05"
+  | "OUT-06";
+
+export type RecoveryStorageFaultId =
+  | RecoveryInboundFaultId
+  | RecoveryOutboundFaultId;
+
 export interface RecoveryFileSystem {
   chmod: typeof chmodSync;
   close: typeof closeSync;
@@ -1343,7 +2044,7 @@ export interface RecoveryStoreOpenOptions {
   now?: () => number;
   randomId?: () => string;
   fs?: Partial<RecoveryFileSystem>;
-  fault?: (faultId: RecoveryInboundFaultId) => void;
+  fault?: (faultId: RecoveryStorageFaultId) => void;
   /** Deterministic test seam; production remains capped by the frozen 512 MiB limit. */
   quotaBytes?: number;
   isIdentityAuthenticated?: (identity: RecoveryIdentity) => boolean;
@@ -1392,6 +2093,36 @@ export interface RecoveryDispatchClaim {
 
 export interface RecoveryIdentityClaim {
   identity: RecoveryIdentity;
+}
+
+export interface RecoveryOutboundClaimInput {
+  recordId: string;
+  claim: RecoveryIdentityClaim;
+}
+
+export interface RecoveryOutboundReceiptInput extends RecoveryOutboundClaimInput {
+  attemptId: string;
+  operationId: string;
+  method: string;
+  messageId?: number;
+}
+
+export interface RecoveryOutboundFailureInput extends RecoveryOutboundClaimInput {
+  attemptId: string;
+}
+
+export interface RecoveryOutboundUncertainInput extends RecoveryOutboundFailureInput {
+  reason: RecoveryOutboundUncertaintyReason;
+}
+
+export interface RecoveryOutboundDrainItem {
+  record: RecoveryOutboundRecord;
+  payload: Uint8Array;
+  spool: Uint8Array[];
+}
+
+export interface RecoveryOutboundRetryResult extends RecoveryOutboundDrainItem {
+  duplicationWarning: true;
 }
 
 export interface RecoveryInboundDrainItem {
@@ -1457,6 +2188,16 @@ export interface RecoveryReassignmentActionResult {
   actionId: string;
   state: RecoveryReassignmentState;
   unresolvedCount: number;
+}
+
+export class RecoverySnapshotCommitUnknownError extends Error {
+  readonly cause: unknown;
+
+  constructor(cause: unknown) {
+    super("Recovery snapshot publication may have committed");
+    this.name = "RecoverySnapshotCommitUnknownError";
+    this.cause = cause;
+  }
 }
 
 export class RecoveryQuotaExceededError extends Error {
@@ -1543,6 +2284,22 @@ function identitiesEqual(
     left.sessionGeneration === right.sessionGeneration &&
     areRecoveryTargetsEqual(left.target, right.target) &&
     areRecoveryOwnersEqual(left.owner, right.owner)
+  );
+}
+
+function hasSnapshotCommittedGrant(
+  snapshot: RecoverySnapshotV1,
+  recordId: string,
+  identity: RecoveryIdentity,
+): boolean {
+  return snapshot.reassignments.some(
+    (entry) =>
+      entry.state === "recovery-grant-committed" &&
+      entry.unresolvedRecordIds.includes(recordId) &&
+      entry.profile === identity.profile &&
+      areRecoveryTargetsEqual(entry.target, identity.target) &&
+      areRecoveryOwnersEqual(entry.newOwner, identity.owner) &&
+      entry.newSessionGeneration === identity.sessionGeneration,
   );
 }
 
@@ -1927,7 +2684,7 @@ export class RecoveryStore {
   readonly #fs: RecoveryFileSystem;
   readonly #now: () => number;
   readonly #randomId: () => string;
-  readonly #fault?: (faultId: RecoveryInboundFaultId) => void;
+  readonly #fault?: (faultId: RecoveryStorageFaultId) => void;
   readonly #isIdentityAuthenticated?: (identity: RecoveryIdentity) => boolean;
   readonly #validateReassignmentBinding?: (
     input: RecoveryReassignmentBindingValidation,
@@ -2033,23 +2790,86 @@ export class RecoveryStore {
       }
       this.#assertPrivateStoreShape();
       let snapshot = this.#readSnapshotLocked();
-      const dispatching = snapshot.inbound.filter(
-        (record) => record.state === "dispatching",
+      const outboundSourceIds = new Set(
+        snapshot.outbound.flatMap((record) => record.sourceInboundRecordIds),
       );
-      if (dispatching.length > 0) {
+      const dispatching = snapshot.inbound.filter(
+        (record) =>
+          record.state === "dispatching" &&
+          !outboundSourceIds.has(record.recordId),
+      );
+      const sendingOutbound = snapshot.outbound.filter(
+        (record) => record.state === "sending",
+      );
+      if (dispatching.length > 0 || sendingOutbound.length > 0) {
         snapshot = cloneSnapshot(snapshot);
         const revision = snapshot.revision + 1;
         const nowMs = this.#now();
+        const deleteAfterCommit: string[] = [];
         for (const record of snapshot.inbound) {
-          if (record.state !== "dispatching") continue;
+          if (
+            record.state !== "dispatching" ||
+            outboundSourceIds.has(record.recordId)
+          ) continue;
           record.state = "execution-uncertain";
           record.stateRevision = revision;
           record.updatedAtMs = nowMs;
         }
+        for (const outbound of snapshot.outbound) {
+          if (outbound.state !== "sending" || !outbound.activeUnit) continue;
+          const unitIndex = outbound.activeUnit.unitIndex;
+          outbound.state = "delivery-uncertain";
+          outbound.uncertainty = {
+            unitIndex,
+            reason: "process-reopened-sending",
+            observedAtMs: nowMs,
+          };
+          delete outbound.activeUnit;
+          delete outbound.retryNotBeforeMs;
+          outbound.stateRevision = revision;
+          outbound.updatedAtMs = nowMs;
+          for (const recordId of outbound.sourceInboundRecordIds) {
+            const inbound = this.#getInbound(snapshot, recordId);
+            if (inbound.state === "completed") continue;
+            if (
+              inbound.state !== "dispatching" ||
+              !identitiesEqual(inbound.identity, outbound.identity)
+            ) {
+              throw new Error(
+                "Reopened outbound source identity/state mismatch",
+              );
+            }
+            for (const spool of inbound.spoolRefs) {
+              deleteAfterCommit.push(
+                makeBinaryPath(this.spoolDirectory, spool.spoolId),
+              );
+            }
+            deleteAfterCommit.push(
+              join(this.materializedDirectory, inbound.recordId),
+            );
+            inbound.spoolRefs = [];
+            inbound.state = "completed";
+            inbound.stateRevision = revision;
+            inbound.updatedAtMs = nowMs;
+          }
+        }
         snapshot.revision = revision;
         snapshot.writtenAtMs = nowMs;
         this.#writeSnapshotLocked(snapshot);
-        this.#incidents.push("orphaned-dispatch-marked-uncertain");
+        for (const path of deleteAfterCommit) {
+          try {
+            this.#fs.remove(path, { force: true, recursive: true });
+            fsyncPath(this.#fs, dirname(path));
+          } catch {
+            this.#incidents.push("post-reopen-cleanup-failed");
+          }
+        }
+        if (dispatching.length > 0) {
+          this.#incidents.push("orphaned-dispatch-marked-uncertain");
+        }
+        if (sendingOutbound.length > 0) {
+          this.#incidents.push("outbound-sending-marked-uncertain");
+        }
       }
       this.#admissionDisabled = snapshot.mode !== "active";
       this.#reconcileFilesLocked(snapshot);
@@ -2129,11 +2949,16 @@ export class RecoveryStore {
       );
     }
     const tempPath = `${this.snapshotPath}${RECOVERY_TEMP_FILE_MARKER}${process.pid}-${this.#randomId()}`;
+    let published = false;
     try {
       writePrivateFile(this.#fs, tempPath, serialized);
       this.#fs.rename(tempPath, this.snapshotPath);
+      published = true;
       this.#fs.chmod(this.snapshotPath, RECOVERY_STORE_FILE_MODE);
       fsyncPath(this.#fs, this.rootPath);
+    } catch (error) {
+      if (published) throw new RecoverySnapshotCommitUnknownError(error);
+      throw error;
     } finally {
       if (this.#fs.exists(tempPath)) this.#fs.unlink(tempPath);
     }
@@ -2214,6 +3039,9 @@ export class RecoveryStore {
       }
       for (const spool of record.spoolRefs) {
         this.#readVerifiedBinary(this.spoolDirectory, spool, record.recordId);
+      }
+      if (record.family === "outbound" && record.payloadRef) {
+        this.#readOutboundPayload(snapshot, record);
       }
     }
     const reservedBytes = this.#reconcileMaterializedFilesLocked(snapshot);
@@ -2358,6 +3186,84 @@ export class RecoveryStore {
     }
   }
 
+  #readOutboundPayload(
+    snapshot: RecoverySnapshotV1,
+    record: RecoveryOutboundRecord,
+  ): { payload: RecoveryOutboundPayloadV1; bytes: Buffer } {
+    if (!record.payloadRef) {
+      throw new Error(`Recovery outbound record ${record.recordId} has no payload`);
+    }
+    const bytes = this.#readVerifiedBinary(
+      this.payloadDirectory,
+      record.payloadRef,
+      record.recordId,
+    );
+    const payload = parseOutboundPayload(
+      bytes,
+      `$outbound.${record.recordId}.payload`,
+      record.state === "delivered"
+        ? Number.MAX_SAFE_INTEGER
+        : record.spoolRefs.length,
+    );
+    let payloadOwner = record;
+    const visited = new Set<string>();
+    while (payloadOwner.linkedAttemptOf) {
+      if (visited.has(payloadOwner.recordId)) {
+        throw new Error("Recovery linked outbound retry cycle detected");
+      }
+      visited.add(payloadOwner.recordId);
+      const source = snapshot.outbound.find(
+        (entry) => entry.recordId === payloadOwner.linkedAttemptOf,
+      );
+      if (!source) throw new Error("Recovery linked outbound source is missing");
+      payloadOwner = source;
+    }
+    const expectedIntentId = payloadOwner.intentId;
+    if (payload.intentId !== expectedIntentId || payload.turnId !== record.turnId) {
+      throw new Error("Recovery outbound payload identity mismatch");
+    }
+    if (record.nextUnitIndex > payload.units.length) {
+      throw new Error("Recovery outbound next unit exceeds the delivery plan");
+    }
+    if (record.state === "delivered" && record.nextUnitIndex !== payload.units.length) {
+      throw new Error("Recovery delivered outbound record has incomplete units");
+    }
+    if (
+      record.state !== "delivered" &&
+      record.state !== "explicitly-discarded" &&
+      record.nextUnitIndex >= payload.units.length
+    ) {
+      throw new Error("Recovery unresolved outbound record has no next unit");
+    }
+    for (const receipt of record.receipts) {
+      const unit = payload.units[receipt.unitIndex];
+      if (
+        !unit ||
+        unit.operationId !== receipt.operationId ||
+        unit.method !== receipt.method
+      ) {
+        throw new Error("Recovery outbound receipt does not match its delivery unit");
+      }
+    }
+    const usedSpoolIndices = payload.units.flatMap((unit) =>
+      "spoolRefIndex" in unit && unit.spoolRefIndex !== undefined
+        ? [unit.spoolRefIndex]
+        : [],
+    );
+    const sortedSpoolIndices = [...usedSpoolIndices].sort(
+      (left, right) => left - right,
+    );
+    if (
+      new Set(usedSpoolIndices).size !== usedSpoolIndices.length ||
+      sortedSpoolIndices.some((value, index) => value !== index) ||
+      (record.state !== "delivered" &&
+        usedSpoolIndices.length !== record.spoolRefs.length)
+    ) {
+      throw new Error("Recovery outbound spool references must be used exactly once");
+    }
+    return { payload, bytes };
+  }
+
   #readVerifiedBinary(
     directory: string,
     reference: RecoveryPayloadReference | RecoverySpoolReference,
@@ -2414,18 +3320,10 @@ export class RecoveryStore {
 
   #hasCommittedGrant(
     snapshot: RecoverySnapshotV1,
-    record: RecoveryInboundRecord,
+    record: RecoveryRecord,
     identity: RecoveryIdentity,
   ): boolean {
-    return snapshot.reassignments.some(
-      (entry) =>
-        entry.state === "recovery-grant-committed" &&
-        entry.unresolvedRecordIds.includes(record.recordId) &&
-        entry.profile === identity.profile &&
-        areRecoveryTargetsEqual(entry.target, identity.target) &&
-        areRecoveryOwnersEqual(entry.newOwner, identity.owner) &&
-        entry.newSessionGeneration === identity.sessionGeneration,
-    );
+    return hasSnapshotCommittedGrant(snapshot, record.recordId, identity);
   }
 
   #assertClaim(
@@ -2448,6 +3346,29 @@ export class RecoveryStore {
       !this.#hasCommittedGrant(snapshot, record, claim.identity)
     ) {
       throw new Error("Recovery record identity claim denied");
+    }
+  }
+
+  #assertOutboundClaim(
+    snapshot: RecoverySnapshotV1,
+    record: RecoveryOutboundRecord,
+    claim: RecoveryIdentityClaim,
+  ): void {
+    this.#authenticate(claim.identity);
+    const blockingReassignment = snapshot.reassignments.some(
+      (entry) =>
+        entry.unresolvedRecordIds.includes(record.recordId) &&
+        entry.state !== "recovery-grant-committed" &&
+        entry.state !== "cancelled-before-transfer",
+    );
+    if (blockingReassignment) {
+      throw new Error("Recovery outbound record is fenced by a pending reassignment");
+    }
+    if (
+      !identitiesEqual(record.identity, claim.identity) &&
+      !this.#hasCommittedGrant(snapshot, record, claim.identity)
+    ) {
+      throw new Error("Recovery outbound identity claim denied");
     }
   }
 
@@ -2717,7 +3638,11 @@ export class RecoveryStore {
       } catch (error) {
         const injectedCrash =
           (error as { faultId?: unknown })?.faultId === "IN-02";
-        if (!committed && !injectedCrash) {
+        if (
+          !committed &&
+          !injectedCrash &&
+          !(error instanceof RecoverySnapshotCommitUnknownError)
+        ) {
           const cleanedDirectories = new Set<string>();
           for (const path of [...staged, ...published]) {
             this.#fs.remove(path, { force: true, recursive: true });
@@ -3080,7 +4005,10 @@ export class RecoveryStore {
         this.#fault?.("IN-05");
         return records.map((record) => structuredClone(record));
       } catch (error) {
-        if (!committed) {
+        if (
+          !committed &&
+          !(error instanceof RecoverySnapshotCommitUnknownError)
+        ) {
           const cleanedDirectories = new Set<string>();
           for (const path of published) {
             this.#fs.remove(path, { force: true, recursive: true });
@@ -3563,6 +4491,577 @@ export class RecoveryStore {
     };
   }
 
+  planOutbound(input: RecoveryOutboundPlanInput): RecoveryOutboundRecord {
+    const identity = readIdentity(input.claim.identity, "$plan.claim.identity");
+    const sourceInboundRecordIds = input.sourceInboundRecordIds.map((recordId, index) =>
+      readStableString(recordId, `$plan.sourceInboundRecordIds[${index}]`),
+    );
+    if (sourceInboundRecordIds.length === 0) {
+      throw new Error("Recovery outbound plan requires inbound source records");
+    }
+    assertUniqueStrings(sourceInboundRecordIds, "$plan.sourceInboundRecordIds");
+    const spool = [...(input.spool ?? [])];
+    const payload = readOutboundPayload(
+      {
+        version: 1,
+        intentId: input.intentId,
+        turnId: input.turnId,
+        replyToMessageId: input.replyToMessageId,
+        renderingMode: input.renderingMode,
+        finalMarkdown: input.finalMarkdown,
+        renderedChunks: [...input.renderedChunks],
+        units: structuredClone(input.units),
+        buttons: structuredClone(input.buttons ?? []),
+        ...(input.voice ? { voice: structuredClone(input.voice) } : {}),
+        ...(input.guestQueryId ? { guestQueryId: input.guestQueryId } : {}),
+      },
+      "$plan.payload",
+      spool.length,
+    );
+    const payloadBytes = Buffer.from(JSON.stringify(payload), "utf8");
+    return withTelegramFileTransaction(`${this.rootPath}.transaction`, () => {
+      const current = this.#readSnapshotForMutationLocked();
+      this.#assertActive(current);
+      this.#authenticate(identity);
+      this.#assertNotFencedByReassignment(current, identity);
+      const existing = current.outbound.find(
+        (record) =>
+          record.identity.profile === identity.profile &&
+          areRecoveryTargetsEqual(record.identity.target, identity.target) &&
+          record.intentId === payload.intentId &&
+          record.turnId === payload.turnId,
+      );
+      if (existing) {
+        this.#assertOutboundClaim(current, existing, input.claim);
+        if (
+          !identitiesEqual(existing.identity, identity) ||
+          JSON.stringify(existing.sourceInboundRecordIds) !==
+            JSON.stringify(sourceInboundRecordIds)
+        ) {
+          throw new Error("Recovery outbound plan idempotency mismatch");
+        }
+        const stored = this.#readOutboundPayload(current, existing);
+        if (!stored.bytes.equals(payloadBytes) || existing.spoolRefs.length !== spool.length) {
+          throw new Error("Recovery outbound plan idempotency payload mismatch");
+        }
+        for (let index = 0; index < spool.length; index += 1) {
+          const bytes = this.#readVerifiedBinary(
+            this.spoolDirectory,
+            existing.spoolRefs[index]!,
+            existing.recordId,
+          );
+          if (!bytes.equals(Buffer.from(spool[index]!))) {
+            throw new Error("Recovery outbound plan idempotency spool mismatch");
+          }
+        }
+        return structuredClone(existing);
+      }
+      for (const recordId of sourceInboundRecordIds) {
+        const record = this.#getInbound(current, recordId);
+        this.#assertClaim(current, record, input.claim);
+        if (record.state !== "dispatching") {
+          throw new Error("Recovery outbound sources must be dispatching");
+        }
+        if (record.turnId !== payload.turnId) {
+          throw new Error("Recovery outbound source turn mismatch");
+        }
+      }
+      const nowMs = this.#now();
+      const revision = current.revision + 1;
+      const snapshot = cloneSnapshot(current);
+      const payloadId = this.#randomId();
+      assertSafeFileId(payloadId, "$plan.payloadId");
+      const spoolIds = spool.map(() => {
+        const spoolId = this.#randomId();
+        assertSafeFileId(spoolId, "$plan.spoolId");
+        return spoolId;
+      });
+      const record: RecoveryOutboundRecord = {
+        family: "outbound",
+        recordId: this.#randomId(),
+        intentId: payload.intentId,
+        turnId: payload.turnId,
+        sourceInboundRecordIds,
+        state: "planned",
+        nextUnitIndex: 0,
+        automaticAttemptCount: 0,
+        receipts: [],
+        identity,
+        createdRevision: revision,
+        stateRevision: revision,
+        createdAtMs: nowMs,
+        updatedAtMs: nowMs,
+        payloadRef: {
+          payloadId,
+          byteLength: payloadBytes.byteLength,
+          sha256: sha256Bytes(payloadBytes),
+        },
+        spoolRefs: spoolIds.map((spoolId, index) => ({
+          spoolId,
+          byteLength: spool[index]!.byteLength,
+          sha256: sha256Bytes(spool[index]!),
+        })),
+      };
+      snapshot.outbound.push(record);
+      snapshot.revision = revision;
+      snapshot.writtenAtMs = nowMs;
+      serializeAccountedSnapshot(snapshot);
+      if (snapshot.quota.totalBytes > this.quotaBytes) {
+        throw new RecoveryQuotaExceededError(snapshot.quota.totalBytes, this.quotaBytes);
+      }
+      const publications = [
+        { directory: this.payloadDirectory, id: payloadId, bytes: payloadBytes },
+        ...spool.map((bytes, index) => ({
+          directory: this.spoolDirectory,
+          id: spoolIds[index]!,
+          bytes,
+        })),
+      ];
+      const published: string[] = [];
+      let committed = false;
+      let commitUnknown = false;
+      try {
+        const directories = new Set<string>();
+        for (const publication of publications) {
+          const path = makeBinaryPath(publication.directory, publication.id);
+          if (this.#fs.exists(path)) {
+            throw new Error(`Recovery binary id collision: ${publication.id}`);
+          }
+          writePrivateFile(this.#fs, path, publication.bytes);
+          published.push(path);
+          directories.add(publication.directory);
+        }
+        for (const directory of directories) fsyncPath(this.#fs, directory);
+        this.#writeSnapshotLocked(snapshot);
+        committed = true;
+        return structuredClone(record);
+      } catch (error) {
+        commitUnknown = error instanceof RecoverySnapshotCommitUnknownError;
+        throw error;
+      } finally {
+        if (!committed && !commitUnknown) {
+          const directories = new Set<string>();
+          for (const path of published) {
+            this.#fs.remove(path, { force: true, recursive: true });
+            directories.add(dirname(path));
+          }
+          for (const directory of directories) fsyncPath(this.#fs, directory);
+        }
+      }
+    });
+  }
+
+  activateOutbound(
+    recordId: string,
+    claim: RecoveryIdentityClaim,
+  ): RecoveryOutboundRecord {
+    const record = this.#commit((snapshot, revision, nowMs) => {
+      this.#assertActive(snapshot);
+      const current = this.#getOutbound(snapshot, recordId);
+      this.#assertOutboundClaim(snapshot, current, claim);
+      if (current.state === "pending") return structuredClone(current);
+      if (current.state !== "planned") {
+        throw new Error(`Invalid outbound transition ${current.state} -> pending`);
+      }
+      current.state = "pending";
+      current.stateRevision = revision;
+      current.updatedAtMs = nowMs;
+      return structuredClone(current);
+    });
+    this.#fault?.("OUT-02");
+    return record;
+  }
+
+  claimOutboundUnit(input: RecoveryOutboundClaimInput): RecoveryOutboundDrainItem {
+    return this.#commit((snapshot, revision, nowMs) => {
+      this.#assertActive(snapshot);
+      const record = this.#getOutbound(snapshot, input.recordId);
+      this.#assertOutboundClaim(snapshot, record, input.claim);
+      if (
+        record.state !== "planned" &&
+        record.state !== "pending" &&
+        record.state !== "retryable-pending"
+      ) {
+        throw new Error(`Invalid outbound transition ${record.state} -> sending`);
+      }
+      if (record.state === "retryable-pending") {
+        if (record.automaticAttemptCount >= RECOVERY_OUTBOUND_MAX_AUTOMATIC_STARTS) {
+          throw new Error("Recovery outbound automatic attempts are exhausted");
+        }
+        if (record.retryNotBeforeMs === undefined || nowMs < record.retryNotBeforeMs) {
+          throw new Error("Recovery outbound retry is not eligible yet");
+        }
+      }
+      const { payload } = this.#readOutboundPayload(snapshot, record);
+      if (!payload.units[record.nextUnitIndex]) {
+        throw new Error("Recovery outbound record has no claimable unit");
+      }
+      record.state = "sending";
+      record.automaticAttemptCount += 1;
+      delete record.retryNotBeforeMs;
+      record.activeUnit = {
+        unitIndex: record.nextUnitIndex,
+        attemptId: this.#randomId(),
+        startedAtMs: nowMs,
+      };
+      record.stateRevision = revision;
+      record.updatedAtMs = nowMs;
+      return this.#readOutboundDrainItem(snapshot, record);
+    });
+  }
+
+  recordOutboundReceipt(input: RecoveryOutboundReceiptInput): RecoveryOutboundRecord {
+    let finalReceipt = false;
+    const result = this.#commit((snapshot, revision, nowMs, deleteAfterCommit) => {
+      this.#assertActive(snapshot);
+      const record = this.#getOutbound(snapshot, input.recordId);
+      this.#assertOutboundClaim(snapshot, record, input.claim);
+      const { payload } = this.#readOutboundPayload(snapshot, record);
+      const unit = payload.units[record.nextUnitIndex];
+      this.#assertOutboundAttempt(record, input.attemptId);
+      const operationId = readStableString(input.operationId, "$receipt.operationId");
+      const method = readStableString(input.method, "$receipt.method");
+      if (!unit || unit.operationId !== operationId || unit.method !== method) {
+        throw new Error("Recovery outbound receipt does not match the active unit");
+      }
+      const messageId = input.messageId === undefined
+        ? undefined
+        : readSafeInteger(input.messageId, "$receipt.messageId", { minimum: 1 });
+      finalReceipt = record.nextUnitIndex + 1 === payload.units.length;
+      if (finalReceipt) this.#fault?.("OUT-05");
+      record.receipts.push({
+        unitIndex: record.nextUnitIndex,
+        operationId,
+        method,
+        ...(messageId !== undefined ? { messageId } : {}),
+        committedAtMs: nowMs,
+      });
+      record.nextUnitIndex += 1;
+      delete record.activeUnit;
+      record.automaticAttemptCount = 0;
+      if (finalReceipt) {
+        record.state = "delivered";
+        for (const spool of record.spoolRefs) {
+          deleteAfterCommit.push(makeBinaryPath(this.spoolDirectory, spool.spoolId));
+        }
+        record.spoolRefs = [];
+        this.#completeOutboundInboundSources(
+          snapshot,
+          record,
+          input.claim,
+          revision,
+          nowMs,
+          deleteAfterCommit,
+        );
+      } else {
+        record.state = "pending";
+      }
+      record.stateRevision = revision;
+      record.updatedAtMs = nowMs;
+      return structuredClone(record);
+    });
+    if (finalReceipt) this.#fault?.("OUT-06");
+    return result;
+  }
+
+  recordOutboundSafeFailure(
+    input: RecoveryOutboundFailureInput,
+  ): RecoveryOutboundRecord {
+    const result = this.#commit((snapshot, revision, nowMs) => {
+      this.#assertActive(snapshot);
+      const record = this.#getOutbound(snapshot, input.recordId);
+      this.#assertOutboundClaim(snapshot, record, input.claim);
+      this.#assertOutboundAttempt(record, input.attemptId);
+      record.state = "retryable-pending";
+      delete record.activeUnit;
+      if (record.automaticAttemptCount < RECOVERY_OUTBOUND_MAX_AUTOMATIC_STARTS) {
+        record.retryNotBeforeMs =
+          nowMs + RECOVERY_OUTBOUND_RETRY_DELAYS_MS[record.automaticAttemptCount - 1]!;
+      } else {
+        delete record.retryNotBeforeMs;
+      }
+      record.stateRevision = revision;
+      record.updatedAtMs = nowMs;
+      return structuredClone(record);
+    });
+    this.#fault?.("OUT-03");
+    return result;
+  }
+
+  markOutboundUncertain(
+    input: RecoveryOutboundUncertainInput,
+  ): RecoveryOutboundRecord {
+    const reason = readEnum(
+      input.reason,
+      "$uncertain.reason",
+      RECOVERY_OUTBOUND_UNCERTAINTY_REASONS,
+    );
+    const result = this.#commit((snapshot, revision, nowMs, deleteAfterCommit) => {
+      this.#assertActive(snapshot);
+      const record = this.#getOutbound(snapshot, input.recordId);
+      this.#assertOutboundClaim(snapshot, record, input.claim);
+      this.#assertOutboundAttempt(record, input.attemptId);
+      record.state = "delivery-uncertain";
+      record.uncertainty = {
+        unitIndex: record.nextUnitIndex,
+        reason,
+        observedAtMs: nowMs,
+      };
+      delete record.activeUnit;
+      delete record.retryNotBeforeMs;
+      record.stateRevision = revision;
+      record.updatedAtMs = nowMs;
+      this.#completeOutboundInboundSources(
+        snapshot,
+        record,
+        input.claim,
+        revision,
+        nowMs,
+        deleteAfterCommit,
+      );
+      return structuredClone(record);
+    });
+    this.#fault?.("OUT-04");
+    return result;
+  }
+
+  discardOutbound(
+    recordId: string,
+    claim: RecoveryIdentityClaim,
+  ): RecoveryOutboundRecord {
+    return this.#commit((snapshot, revision, nowMs, deleteAfterCommit) => {
+      this.#assertActive(snapshot);
+      const record = this.#getOutbound(snapshot, recordId);
+      this.#assertOutboundClaim(snapshot, record, claim);
+      if (record.state === "explicitly-discarded") return structuredClone(record);
+      if (snapshot.outbound.some((entry) => entry.linkedAttemptOf === record.recordId)) {
+        throw new Error("Cannot discard outbound work after a linked retry exists");
+      }
+      if (
+        record.state !== "planned" &&
+        record.state !== "pending" &&
+        record.state !== "retryable-pending" &&
+        record.state !== "delivery-uncertain"
+      ) {
+        throw new Error(`Cannot discard outbound record in ${record.state}`);
+      }
+      if (record.payloadRef) {
+        deleteAfterCommit.push(
+          makeBinaryPath(this.payloadDirectory, record.payloadRef.payloadId),
+        );
+        delete record.payloadRef;
+      }
+      for (const spool of record.spoolRefs) {
+        deleteAfterCommit.push(makeBinaryPath(this.spoolDirectory, spool.spoolId));
+      }
+      record.spoolRefs = [];
+      record.state = "explicitly-discarded";
+      delete record.activeUnit;
+      delete record.retryNotBeforeMs;
+      delete record.uncertainty;
+      record.stateRevision = revision;
+      record.updatedAtMs = nowMs;
+      this.#completeOutboundInboundSources(
+        snapshot,
+        record,
+        claim,
+        revision,
+        nowMs,
+        deleteAfterCommit,
+      );
+      return structuredClone(record);
+    });
+  }
+
+  retryUncertainOutbound(
+    recordId: string,
+    newIntentId: string,
+    claim: RecoveryIdentityClaim,
+  ): RecoveryOutboundRetryResult {
+    const parsedIntentId = readStableString(newIntentId, "$retry.intentId");
+    return this.#commit((snapshot, revision, nowMs) => {
+      this.#assertActive(snapshot);
+      const source = this.#getOutbound(snapshot, recordId);
+      this.#assertOutboundClaim(snapshot, source, claim);
+      const existing = snapshot.outbound.find(
+        (record) => record.linkedAttemptOf === source.recordId,
+      );
+      if (existing) {
+        this.#assertOutboundClaim(snapshot, existing, claim);
+        if (existing.intentId !== parsedIntentId) {
+          throw new Error("Recovery linked outbound retry intent mismatch");
+        }
+        return {
+          ...this.#readOutboundDrainItem(snapshot, existing),
+          duplicationWarning: true,
+        };
+      }
+      if (source.state !== "delivery-uncertain" || !source.payloadRef) {
+        throw new Error("Only delivery-uncertain outbound work with payload may be retried");
+      }
+      if (
+        snapshot.outbound.some(
+          (record) =>
+            record.identity.profile === claim.identity.profile &&
+            areRecoveryTargetsEqual(record.identity.target, claim.identity.target) &&
+            record.intentId === parsedIntentId &&
+            record.turnId === source.turnId,
+        )
+      ) {
+        throw new Error("Recovery linked outbound retry intent collision");
+      }
+      const attempt: RecoveryOutboundRecord = {
+        ...structuredClone(source),
+        recordId: this.#randomId(),
+        intentId: parsedIntentId,
+        identity: structuredClone(claim.identity),
+        state: "pending",
+        automaticAttemptCount: 0,
+        linkedAttemptOf: source.recordId,
+        createdRevision: revision,
+        stateRevision: revision,
+        createdAtMs: nowMs,
+        updatedAtMs: nowMs,
+      };
+      delete attempt.activeUnit;
+      delete attempt.retryNotBeforeMs;
+      delete attempt.uncertainty;
+      delete source.payloadRef;
+      source.spoolRefs = [];
+      source.stateRevision = revision;
+      source.updatedAtMs = nowMs;
+      snapshot.outbound.push(attempt);
+      return {
+        ...this.#readOutboundDrainItem(snapshot, attempt),
+        duplicationWarning: true,
+      };
+    });
+  }
+
+  listClaimableOutboundRecords(
+    claim: RecoveryIdentityClaim,
+  ): RecoveryOutboundDrainItem[] {
+    return withTelegramFileTransaction(`${this.rootPath}.transaction`, () => {
+      const snapshot = this.#readSnapshotForMutationLocked();
+      this.#assertActive(snapshot);
+      this.#authenticate(claim.identity);
+      const nowMs = this.#now();
+      const result: RecoveryOutboundDrainItem[] = [];
+      for (const record of snapshot.outbound) {
+        const claimable =
+          record.state === "planned" ||
+          record.state === "pending" ||
+          (record.state === "retryable-pending" &&
+            record.automaticAttemptCount < RECOVERY_OUTBOUND_MAX_AUTOMATIC_STARTS &&
+            record.retryNotBeforeMs !== undefined &&
+            nowMs >= record.retryNotBeforeMs);
+        if (!claimable) continue;
+        try {
+          this.#assertOutboundClaim(snapshot, record, claim);
+        } catch {
+          continue;
+        }
+        result.push(this.#readOutboundDrainItem(snapshot, record));
+      }
+      return result;
+    });
+  }
+
+  drainSafeOutbound(claim: RecoveryIdentityClaim): RecoveryOutboundDrainItem[] {
+    return this.#commit((snapshot, revision, nowMs) => {
+      this.#assertActive(snapshot);
+      this.#authenticate(claim.identity);
+      const result: RecoveryOutboundDrainItem[] = [];
+      for (const record of snapshot.outbound) {
+        if (
+          record.state !== "planned" &&
+          record.state !== "pending" &&
+          record.state !== "retryable-pending"
+        ) {
+          continue;
+        }
+        try {
+          this.#assertOutboundClaim(snapshot, record, claim);
+        } catch {
+          continue;
+        }
+        if (record.state !== "pending" || record.automaticAttemptCount !== 0) {
+          record.state = "pending";
+          record.automaticAttemptCount = 0;
+          delete record.retryNotBeforeMs;
+          record.stateRevision = revision;
+          record.updatedAtMs = nowMs;
+        }
+        result.push(this.#readOutboundDrainItem(snapshot, record));
+      }
+      return result;
+    });
+  }
+
+  #assertOutboundAttempt(
+    record: RecoveryOutboundRecord,
+    attemptId: string,
+  ): void {
+    const parsedAttemptId = readStableString(attemptId, "$attemptId");
+    if (
+      record.state !== "sending" ||
+      !record.activeUnit ||
+      record.activeUnit.attemptId !== parsedAttemptId ||
+      record.activeUnit.unitIndex !== record.nextUnitIndex
+    ) {
+      throw new Error("Recovery outbound active attempt claim denied");
+    }
+  }
+
+  #completeOutboundInboundSources(
+    snapshot: RecoverySnapshotV1,
+    outbound: RecoveryOutboundRecord,
+    claim: RecoveryIdentityClaim,
+    revision: number,
+    nowMs: number,
+    deleteAfterCommit: string[],
+  ): void {
+    for (const recordId of outbound.sourceInboundRecordIds) {
+      const inbound = this.#getInbound(snapshot, recordId);
+      if (inbound.state === "completed") continue;
+      this.#assertClaim(snapshot, inbound, claim);
+      if (inbound.state !== "dispatching") {
+        throw new Error("Recovery outbound disposition requires dispatching inbound sources");
+      }
+      for (const spool of inbound.spoolRefs) {
+        deleteAfterCommit.push(makeBinaryPath(this.spoolDirectory, spool.spoolId));
+      }
+      deleteAfterCommit.push(join(this.materializedDirectory, inbound.recordId));
+      inbound.spoolRefs = [];
+      inbound.state = "completed";
+      inbound.stateRevision = revision;
+      inbound.updatedAtMs = nowMs;
+    }
+  }
+
+  #readOutboundDrainItem(
+    snapshot: RecoverySnapshotV1,
+    record: RecoveryOutboundRecord,
+  ): RecoveryOutboundDrainItem {
+    const { bytes } = this.#readOutboundPayload(snapshot, record);
+    return {
+      record: structuredClone(record),
+      payload: bytes,
+      spool: record.spoolRefs.map((reference) =>
+        this.#readVerifiedBinary(this.spoolDirectory, reference, record.recordId),
+      ),
+    };
+  }
+
+  #getOutbound(
+    snapshot: RecoverySnapshotV1,
+    recordId: string,
+  ): RecoveryOutboundRecord {
+    const record = snapshot.outbound.find((entry) => entry.recordId === recordId);
+    if (!record) throw new Error("Unknown recovery outbound record");
+    return record;
+  }
+
   #opaqueActionId(stableInput: string): string {
     return readStableString(this.#actionId(stableInput), "$actionId");
   }
@@ -3645,6 +5144,25 @@ export class RecoveryStore {
         ) {
           record.identity = structuredClone(current);
           claimed.push(record.recordId);
+        }
+      }
+      const movedOutboundSourceIds = new Set(
+        snapshot.outbound
+          .filter((record) => claimed.includes(record.recordId))
+          .flatMap((record) => record.sourceInboundRecordIds),
+      );
+      for (const source of snapshot.inbound) {
+        if (
+          movedOutboundSourceIds.has(source.recordId) &&
+          ownerTargetEqual(
+            source.identity,
+            handoff.profile,
+            handoff.target,
+            handoff.owner,
+          ) &&
+          source.identity.sessionGeneration === handoff.fromSessionGeneration
+        ) {
+          source.identity = structuredClone(current);
         }
       }
       return claimed;
@@ -4013,6 +5531,9 @@ export class RecoveryStore {
       ...snapshot.outbound.flatMap((record) =>
         record.linkedAttemptOf ? [record.linkedAttemptOf] : [],
       ),
+      // Exact inbound completion links remain part of unresolved outbound
+      // evidence, especially while delivery is uncertain indefinitely.
+      ...snapshot.outbound.flatMap((record) => record.sourceInboundRecordIds),
     ]);
     const allRecords: RecoveryRecord[] = [
       ...snapshot.inbound,
