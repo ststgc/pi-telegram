@@ -7,6 +7,7 @@
 - `Terminal Status`: Pi's terminal `telegram` status key is always cleared while Telegram menus and `/telegram-status` retain bridge state and diagnostics. Impact: the optional transport no longer occupies Pi's shared footer.
 - `Queue Lifecycle`: Agent-end cleanup ignores only stale-context status failures after typing teardown, and control settlement is fenced to its originating deferred-dispatch generation. Impact: real status failures still reject, while callbacks from a replaced session cannot update status or dispatch queued work through an old context.
 - `Dependency Audit`: Added a fail-closed exception through 2026-08-21 UTC for only `brace-expansion@5.0.6` (`GHSA-3jxr-9vmj-r5cp`) and `protobufjs@7.6.4` (`GHSA-j3f2-48v5-ccww`) copies fixed inside Pi's published shrinkwrap. Impact: all unknown findings, graph/path/version drift, and any still-present exception at the deadline fail validation while an upstream Pi release is pending.
+- `Recovery Contract Harness`: Froze strict version-1 inbox, outbox, bus, target-reassignment, retention/quota, and downgrade-exclusive snapshot contracts plus the complete seeded crash-boundary fault inventory without activating recovery storage. Impact: later P0 durability work has a fail-closed schema and deterministic, package-excluded fault harness before runtime wiring begins.
 
 ## 0.24.2: Context Compression Hotfix
 
