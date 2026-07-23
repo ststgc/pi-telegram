@@ -4,7 +4,14 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as waitForTimeout } from "node:timers/promises";
@@ -12,11 +19,13 @@ import testRoot, { mock, type TestContext } from "node:test";
 
 import { registerTelegramActivityHandler } from "../api/activity.ts";
 import * as BusApi from "../lib/bus-api.ts";
+import * as BusFollower from "../lib/bus-follower.ts";
 import * as BusLeader from "../lib/bus-leader.ts";
 import * as Bus from "../lib/bus.ts";
 import * as Delivery from "../lib/delivery.ts";
 import * as Locks from "../lib/locks.ts";
 import * as Polling from "../lib/polling.ts";
+import * as Recovery from "../lib/recovery.ts";
 import type { TelegramBridgeApiRuntime } from "../lib/telegram-api.ts";
 
 type RuntimeTestHandler = (context: TestContext) => void | Promise<void>;
@@ -45,6 +54,90 @@ async function getRuntimeTelegramExtension(): Promise<RuntimeTelegramExtension> 
   runtimeTelegramExtension = (await import("../index.ts")).default;
   return runtimeTelegramExtension;
 }
+
+test("Profile-wide recovery downgrade fences follower and leader before quarantine", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-downgrade-integration-"));
+  const followerSocketPath = join(dir, "follower.sock");
+  const followerGate = new Recovery.RecoveryProfileOperationGate();
+  const leaderGate = new Recovery.RecoveryProfileOperationGate();
+  let followerSuspended = 0;
+  let leaderSuspended = 0;
+  let quarantined = 0;
+  const receiver = BusFollower.createTelegramBusForwardedUpdateReceiverRuntime({
+    socketPath: followerSocketPath,
+    instanceId: "follower-a",
+    getAuthSecret: () => "secret",
+    getRegistrationGeneration: () => "registration-a",
+    getProfile: () => "default",
+    getContext: () => "follower-ctx",
+    recoveryFence: {
+      enter: (profile) => followerGate.enter(profile),
+      beginFencing: (profile, generation) =>
+        followerGate.beginFencing(profile, generation),
+      awaitDrained: (profile, generation) =>
+        followerGate.awaitDrained(profile, generation),
+      resumeAfter: (profile, generation, resumeRuntime) =>
+        followerGate.resumeAfter(profile, generation, resumeRuntime),
+      suspendRuntime() {
+        followerSuspended += 1;
+      },
+      resumeRuntime() {
+        assert.fail("successful quarantine must not resume follower runtime");
+      },
+    },
+    handleForwardedCallback() {},
+    handleForwardedReaction() {},
+  });
+  const follower = {
+    instanceId: "follower-a",
+    registrationGeneration: "registration-a",
+    busSocketPath: followerSocketPath,
+    connectedAtMs: 1,
+    lastHeartbeatMs: 1,
+  };
+  const downgrade = BusLeader.createTelegramRecoveryDowngradeCoordinator<string>({
+    canCoordinate: () => true,
+    getCoordinationGeneration: () => "leader-epoch-1",
+    getProfile: () => "default",
+    getFollowers: () => [follower],
+    getAuthSecret: () => "secret",
+    createRequestId: () => "leader:fence:1",
+    gate: leaderGate,
+    preflight: () => ({ safe: true, blockerCount: 0 }),
+    beginStoreExclusive() {},
+    quarantineStore() {
+      quarantined += 1;
+      return join(dir, "quarantine");
+    },
+    cancelStoreExclusive() {
+      assert.fail("successful quarantine must not cancel store exclusive");
+    },
+    stopPolling() {},
+    suspendRuntime() {
+      leaderSuspended += 1;
+    },
+    resumeRuntime() {
+      assert.fail("successful quarantine must not resume leader runtime");
+    },
+    createFenceGeneration: () => "fence-a",
+  });
+  try {
+    await receiver.start();
+    assert.deepEqual(await downgrade("leader-ctx"), {
+      status: "downgraded",
+    });
+    assert.equal(followerSuspended, 1);
+    assert.equal(leaderSuspended, 1);
+    assert.equal(quarantined, 1);
+    assert.equal(followerGate.getState("default").phase, "fencing");
+    assert.equal(leaderGate.getState("default").phase, "quarantined");
+    assert.equal(followerGate.enter("default"), undefined);
+    assert.equal(leaderGate.enter("default"), undefined);
+  } finally {
+    await receiver.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("Poll supervisor terminal failure stops bus transport and releases the exact lease", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-poll-terminal-"));
@@ -238,6 +331,12 @@ function setRuntimeTestFetch(fetchImpl: typeof fetch): () => void {
 
 async function createRuntimeTelegramConfigFixture() {
   const agentDir = await ensureRuntimeAgentDir();
+  const telegramRuntimeDir = join(agentDir, "tmp", "telegram");
+  for (const entry of await readdir(telegramRuntimeDir).catch(() => [])) {
+    if (entry === "recovery-v1" || entry.startsWith("recovery-v1.")) {
+      await rm(join(telegramRuntimeDir, entry), { force: true, recursive: true });
+    }
+  }
   const configPath = join(agentDir, "telegram.json");
   const previousConfig = await readFile(configPath, "utf8").catch(
     () => undefined,
@@ -740,7 +839,7 @@ test("Extension runtime coalesces a cross-batch forward comment into one Pi turn
   }
 });
 
-test("Extension runtime finalizes queued turn after polling ownership moves away", async () => {
+test("Extension runtime fences final delivery after polling ownership moves away", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const extension = await getRuntimeTelegramExtension();
   let resolveDispatch: (() => void) | undefined;
@@ -839,8 +938,10 @@ test("Extension runtime finalizes queued turn after polling ownership moves away
     await handlers.get("agent_start")?.({}, ctx);
     await writeRuntimeTelegramLocks({
       default: {
-        pid: process.pid + 1_000_000,
+        pid: process.pid,
         cwd: "/tmp/other-pi-instance",
+        instanceId: "other-live-instance",
+        leaderEpoch: "other-live-epoch",
       },
     });
     mock.timers.tick(1100);
@@ -871,12 +972,8 @@ test("Extension runtime finalizes queued turn after polling ownership moves away
     await flushMicrotasks(20);
     await waitForTimeout(20);
     assert.deepEqual(draftTexts, []);
-    assert.equal(sentTexts.length, 1);
-    assert.match(sentTexts[0] ?? "", /Final \*\*answer\*\*/);
-    assert.deepEqual(sentBodies[0]?.reply_parameters, {
-      message_id: 7,
-      allow_sending_without_reply: true,
-    });
+    assert.deepEqual(sentTexts, []);
+    assert.deepEqual(sentBodies, []);
     assert.deepEqual(editedTexts, []);
     releasePolling?.();
     await handlers.get("session_shutdown")?.({}, ctx);
@@ -887,7 +984,7 @@ test("Extension runtime finalizes queued turn after polling ownership moves away
   }
 });
 
-test("Extension runtime keeps local queue progress but fences delivery after ownership moves away", async () => {
+test("Extension runtime fences queued Pi dispatch and delivery after ownership moves away", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const sentMessages: RuntimeHarnessMessage[] = [];
   const sentBodies: Array<Record<string, unknown>> = [];
@@ -965,8 +1062,10 @@ test("Extension runtime keeps local queue progress but fences delivery after own
     await handlers.get("agent_start")?.({}, ctx);
     await writeRuntimeTelegramLocks({
       default: {
-        pid: process.pid + 1_000_000,
+        pid: process.pid,
         cwd: "/repo/queue-owner-b",
+        instanceId: "other-live-instance",
+        leaderEpoch: "other-live-epoch",
       },
     });
     await handlers.get("agent_end")?.(
@@ -980,14 +1079,11 @@ test("Extension runtime keeps local queue progress but fences delivery after own
       },
       ctx,
     );
-    // Follow-up dispatch is intentionally routed through the session-bound
-    // deferred queue timer; wait on real time instead of setImmediate turns.
-    await waitForCondition(() => sentMessages.length === 2);
+    // Durable dispatch requires the exact current owner; the accepted follow-up
+    // stays queued for recovery rather than invoking Pi through a stale owner.
+    await waitForTimeout(100);
     assert.deepEqual(sentBodies, []);
-    assert.match(
-      getRuntimeHarnessMessageText(sentMessages[1] as RuntimeHarnessMessage),
-      /^\[telegram\] second queued$/,
-    );
+    assert.equal(sentMessages.length, 1);
     await handlers.get("session_shutdown")?.({}, ctx);
   } finally {
     restoreFetch();

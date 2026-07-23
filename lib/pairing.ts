@@ -265,6 +265,20 @@ function cloneProfileWithoutPairing(
   return remaining;
 }
 
+export function isTelegramPairingProofShapedUpdate(update: unknown): boolean {
+  if (!update || typeof update !== "object" || Array.isArray(update)) {
+    return false;
+  }
+  const message = Reflect.get(update, "message");
+  return (
+    Boolean(message) &&
+    typeof message === "object" &&
+    !Array.isArray(message) &&
+    typeof Reflect.get(message, "text") === "string" &&
+    /^\/start [0-9a-f]{32}$/u.test(Reflect.get(message, "text"))
+  );
+}
+
 export function parseTelegramPairingCandidate(
   update: unknown,
 ): TelegramPairingCandidate | undefined {

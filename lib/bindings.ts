@@ -352,6 +352,7 @@ interface TelegramLifecycleBindingDeps {
   canSendAgentActivity: (ctx: Pi.ExtensionContext) => boolean;
   isSessionContextActive: (ctx: Pi.ExtensionContext) => boolean;
   isTurnTransportActive?: (turn: Queue.PendingTelegramTurn) => boolean;
+  onTurnSettled?: (turn: Queue.PendingTelegramTurn) => void;
   updateStatus: TelegramBridgeStatusUpdater;
   recordRuntimeEvent: TelegramRuntimeEventRecorder;
 }
@@ -390,6 +391,7 @@ export function registerTelegramLifecycleRuntimeHooks({
   canSendAgentActivity,
   isSessionContextActive = () => true,
   isTurnTransportActive,
+  onTurnSettled,
   updateStatus,
   recordRuntimeEvent,
 }: TelegramLifecycleBindingDeps): void {
@@ -550,6 +552,7 @@ export function registerTelegramLifecycleRuntimeHooks({
     resetRuntimeState: agentEndResetter,
     isSessionActive: isSessionContextActive,
     isTurnTransportActive,
+    onTurnSettled,
     waitForTypingIdle: typing.waitForIdle,
     dispatchNextQueuedTelegramTurn,
     requestDeferredDispatchNextQueuedTelegramTurn:

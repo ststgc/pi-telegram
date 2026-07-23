@@ -42,6 +42,11 @@ import {
   TELEGRAM_RESERVED_COMMAND_NAMES,
 } from "../lib/commands.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "../lib/pi.ts";
+import type { TelegramInboundHandlingOutcome } from "../lib/updates.ts";
+
+function promptMaterialized(): TelegramInboundHandlingOutcome {
+  return { kind: "prompt-materialized", turnId: "test-turn", recordIds: [] };
+}
 
 type RegisteredBridgeCommand = {
   handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> | void;
@@ -68,10 +73,8 @@ function getRequiredCommand(
 
 function createBridgeCommandContext(
   notify: (message: string) => void = () => {},
-  confirm: (
-    title: string,
-    prompt: string,
-  ) => Promise<boolean> | boolean = () => false,
+  confirm: (title: string, prompt: string) => Promise<boolean> | boolean = () =>
+    false,
   select?: (title: string, items: string[]) => Promise<string | undefined>,
 ): ExtensionCommandContext {
   return {
@@ -363,10 +366,7 @@ test("Command helpers confirm destructive Threaded Mode disconnects", async () =
       events.push("status");
     },
   });
-  const command = getRequiredCommand(
-    harness.commands,
-    "telegram-disconnect",
-  );
+  const command = getRequiredCommand(harness.commands, "telegram-disconnect");
   const cancelled = createBridgeCommandContext(
     () => undefined,
     (_title, prompt) => {
@@ -404,10 +404,7 @@ test("Command helpers keep failed disconnects actionable and retryable", async (
       statusUpdates += 1;
     },
   });
-  const command = getRequiredCommand(
-    harness.commands,
-    "telegram-disconnect",
-  );
+  const command = getRequiredCommand(harness.commands, "telegram-disconnect");
   const ctx = createBridgeCommandContext((message) => {
     notifications.push(message);
   });
@@ -916,7 +913,7 @@ test("Command helpers open compact confirmation and handle callbacks", async () 
     updateStatus: () => {},
     dispatchNextQueuedTelegramTurn: () => {},
     compact: () => {},
-    enqueueContinueTurn: async () => {},
+    enqueueContinueTurn: async () => promptMaterialized(),
     enqueueControlItem: () => {},
     showStatus: async () => {},
     openModelMenu: async () => {},
@@ -925,7 +922,13 @@ test("Command helpers open compact confirmation and handle callbacks", async () 
     getAllowedUserId: () => 1,
     registerBotCommands: async () => {},
     sendTextReply: async () => {},
-    sendInteractiveMessage: async (chatId, text, parseMode, replyMarkup, options) => {
+    sendInteractiveMessage: async (
+      chatId,
+      text,
+      parseMode,
+      replyMarkup,
+      options,
+    ) => {
       events.push(`${chatId}:${parseMode}:${text}`);
       events.push(JSON.stringify(replyMarkup.inline_keyboard));
       events.push(JSON.stringify(options));
@@ -1252,6 +1255,7 @@ test("Command handler target runtime binds command targets into command handling
     },
     enqueueContinueTurn: async (_message, ctx) => {
       calls.push(`continue:${ctx}`);
+      return promptMaterialized();
     },
     compact: () => {},
     allocateItemOrder: () => 0,
@@ -1363,6 +1367,7 @@ test("Command runtime routes commands through runtime ports", async () => {
     },
     enqueueContinueTurn: async (nextMessage: typeof message) => {
       events.push(`continue:${nextMessage.message_id}`);
+      return promptMaterialized();
     },
     showStatus: async (nextMessage: typeof message) => {
       events.push(`show:${nextMessage.chat.id}`);
@@ -1391,8 +1396,14 @@ test("Command runtime routes commands through runtime ports", async () => {
   assert.equal(await handleCommand("debug", message, { idle: true }), false);
   assert.equal(await handleCommand("start", message, { idle: true }), true);
   assert.equal(await handleCommand("help", message, { idle: true }), true);
-  assert.equal(await handleCommand("continue", message, { idle: true }), true);
-  assert.equal(await handleCommand("continue", message, { idle: false }), true);
+  assert.deepEqual(
+    await handleCommand("continue", message, { idle: true }),
+    promptMaterialized(),
+  );
+  assert.deepEqual(
+    await handleCommand("continue", message, { idle: false }),
+    promptMaterialized(),
+  );
   assert.equal(await handleCommand("compact", message, { idle: true }), true);
   compactComplete?.();
   assert.equal(await handleCommand("stop", message, { idle: true }), true);
@@ -1452,7 +1463,7 @@ test("Command runtime does not first-pair from group start", async () => {
       events.push("status");
     },
     dispatchNextQueuedTelegramTurn: () => {},
-    enqueueContinueTurn: async () => {},
+    enqueueContinueTurn: async () => promptMaterialized(),
     compact: () => {},
     enqueueControlItem: () => {},
     showStatus: async () => {
@@ -1491,13 +1502,16 @@ test("Command or prompt runtime routes commands before enqueue fallback", async 
       events.push(
         `extension:${command.name}:${command.args}:${message.text}:${ctx.id}`,
       );
-      return command.name === "review";
+      return command.name === "review"
+        ? { kind: "completed", reason: "command" }
+        : undefined;
     },
     expandPromptTemplateCommand: (commandName, args) =>
       commandName === "review" ? `expanded:${args}` : undefined,
     replaceMessageText: (message, text) => ({ ...message, text }),
     enqueueTurn: async (messages, ctx) => {
       events.push(`enqueue:${messages.length}:${messages[0]?.text}:${ctx.id}`);
+      return promptMaterialized();
     },
   });
   await runtime.dispatchMessages([{ text: "/status" }], { id: "ctx" });
@@ -1534,6 +1548,7 @@ test("Command or prompt runtime can ignore non-prompt message batches", async ()
     replaceMessageText: (message, text) => ({ ...message, text }),
     enqueueTurn: async (messages) => {
       events.push(`enqueue:${messages.length}`);
+      return promptMaterialized();
     },
   });
   await runtime.dispatchMessages([{ service: true }], { id: "ctx" });
@@ -1572,6 +1587,7 @@ test("Command helpers execute command actions through provided handlers", async 
     },
     handleContinue: async () => {
       events.push("continue");
+      return promptMaterialized();
     },
     handleQueue: async () => {
       events.push("queue");
@@ -1616,11 +1632,16 @@ test("Connect displays pairing instructions locally before polling", async () =>
     reloadConfig: async () => {},
     hasBotToken: () => true,
     getPairingInstructions: async () => "Pairing code: local-only",
-    startPolling: async () => { events.push("poll"); },
+    startPolling: async () => {
+      events.push("poll");
+    },
     stopPolling: async () => {},
     updateStatus: () => {},
   });
   const ctx = createBridgeCommandContext((message) => events.push(message));
-  await getRequiredCommand(harness.commands, "telegram-connect").handler("", ctx);
+  await getRequiredCommand(harness.commands, "telegram-connect").handler(
+    "",
+    ctx,
+  );
   assert.deepEqual(events, ["Pairing code: local-only", "poll"]);
 });

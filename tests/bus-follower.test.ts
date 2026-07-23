@@ -39,6 +39,7 @@ import {
   getTelegramLeaderSessionHandoff,
   setTelegramLeaderSessionHandoff,
 } from "../lib/threads.ts";
+import { RecoveryProfileOperationGate } from "../lib/recovery.ts";
 import { isTelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
 
 async function waitForCondition(
@@ -349,6 +350,127 @@ test("Bus follower receiver handles leader-forwarded updates and target replacem
     ]);
   } finally {
     await leader.stop();
+    await receiver.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus follower recovery fence authenticates exact authority, drains, and resumes exact generation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-recovery-fence-"));
+  const socketPath = join(dir, "follower.sock");
+  const gate = new RecoveryProfileOperationGate();
+  const activeLease = gate.enter("work");
+  assert.ok(activeLease);
+  let suspended = 0;
+  let resumed = 0;
+  let resumeFails = true;
+  const receiver = createTelegramBusForwardedUpdateReceiverRuntime({
+    socketPath,
+    instanceId: "inst-b",
+    getAuthSecret: () => "secret",
+    getRegistrationGeneration: () => "registration-b",
+    getProfile: () => "work",
+    getContext: () => "ctx",
+    recoveryFence: {
+      enter: (profile) => gate.enter(profile),
+      beginFencing: (profile, generation) =>
+        gate.beginFencing(profile, generation),
+      awaitDrained: (profile, generation) =>
+        gate.awaitDrained(profile, generation),
+      resumeAfter: (profile, generation, resumeRuntime) =>
+        gate.resumeAfter(profile, generation, resumeRuntime),
+      suspendRuntime() {
+        suspended += 1;
+      },
+      resumeRuntime() {
+        resumed += 1;
+        if (resumeFails) throw new Error("follower resume failed");
+      },
+    },
+    handleForwardedCallback() {},
+    handleForwardedReaction() {},
+  });
+  const send = (
+    overrides: Partial<{
+      auth: string;
+      profile: string;
+      recipientInstanceId: string;
+      recipientRegistrationGeneration: string;
+      fenceGeneration: string;
+    }> = {},
+    kind: "leader.fenceRecovery" | "leader.resumeRecovery" =
+      "leader.fenceRecovery",
+  ) =>
+    sendTelegramBusLocalEnvelope({
+      socketPath,
+      timeoutMs: 500,
+      envelope: {
+        kind,
+        requestId: `${kind}:${Math.random()}`,
+        auth: overrides.auth ?? "secret",
+        profile: overrides.profile ?? "work",
+        recipientInstanceId: overrides.recipientInstanceId ?? "inst-b",
+        recipientRegistrationGeneration:
+          overrides.recipientRegistrationGeneration ?? "registration-b",
+        fenceGeneration: overrides.fenceGeneration ?? "fence-b",
+        sentAtMs: 1000,
+      },
+    });
+  try {
+    await receiver.start();
+    for (const response of [
+      await send({ auth: "wrong" }),
+      await send({ profile: "other" }),
+      await send({ recipientRegistrationGeneration: "stale" }),
+      await send({ recipientInstanceId: "other" }),
+    ]) {
+      assert.equal(response?.kind === "bus.ack" && response.ok, false);
+    }
+
+    let fenceSettled = false;
+    const fenceResponse = send().then((response) => {
+      fenceSettled = true;
+      return response;
+    });
+    await waitForCondition(() => suspended === 1);
+    assert.equal(fenceSettled, false);
+    assert.equal(gate.getState("work").phase, "fencing");
+    activeLease.release();
+    const fenced = await fenceResponse;
+    assert.equal(fenced?.kind, "bus.ack");
+    assert.equal(fenced?.ok, true);
+    assert.deepEqual(
+      fenced?.kind === "bus.ack" ? fenced.recoveryFence : undefined,
+      {
+        version: 1,
+        state: "fenced",
+        profile: "work",
+        recipientInstanceId: "inst-b",
+        recipientRegistrationGeneration: "registration-b",
+        fenceGeneration: "fence-b",
+      },
+    );
+    assert.equal(gate.enter("work"), undefined);
+
+    const failedResume = await send({}, "leader.resumeRecovery");
+    assert.equal(failedResume?.kind, "bus.ack");
+    assert.equal(failedResume?.ok, false);
+    assert.equal(resumed, 1);
+    assert.equal(gate.getState("work").phase, "fencing");
+    assert.equal(gate.enter("work"), undefined);
+
+    resumeFails = false;
+    const resumeResponse = await send({}, "leader.resumeRecovery");
+    assert.equal(resumeResponse?.kind, "bus.ack");
+    assert.equal(resumeResponse?.ok, true);
+    assert.equal(resumed, 2);
+    assert.equal(gate.getState("work").phase, "active");
+    const staleResume = await send({}, "leader.resumeRecovery");
+    assert.equal(
+      staleResume?.kind === "bus.ack" && staleResume.ok,
+      false,
+    );
+  } finally {
     await receiver.stop();
     rmSync(dir, { recursive: true, force: true });
   }

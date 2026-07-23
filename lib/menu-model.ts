@@ -42,6 +42,7 @@ export interface TelegramModelMenuState<TModel extends MenuModel = MenuModel> {
     | "model-detail"
     | "thinking"
     | "queue"
+    | "recovery"
     | "settings";
 }
 

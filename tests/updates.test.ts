@@ -26,16 +26,41 @@ import {
   getTelegramUpdateHandlerRegistry,
   handleAuthorizedTelegramReactionUpdate,
   normalizeTelegramReactionEmoji,
+  planTelegramDurableInboundResponsibility,
   registerTelegramUpdateHandler,
+  TELEGRAM_UNTARGETED_RECOVERY_CHAT_ID,
   TELEGRAM_PRIORITY_REACTION_EMOJIS,
   TELEGRAM_PRIORITY_REACTIONS,
   TELEGRAM_REMOVAL_REACTION_EMOJIS,
   TELEGRAM_REMOVAL_REACTIONS,
+  type TelegramInboundHandlingOutcome,
   type TelegramUpdateHandler,
   type TelegramUpdateHandlerRegistry,
 } from "../lib/updates.ts";
 
 const TEST_CONTEXT = "ctx";
+
+type CompletedReason = Extract<
+  TelegramInboundHandlingOutcome,
+  { kind: "completed" }
+>["reason"];
+
+function completed(reason: CompletedReason): TelegramInboundHandlingOutcome {
+  return { kind: "completed", reason };
+}
+
+function promptMaterialized(): TelegramInboundHandlingOutcome {
+  return { kind: "prompt-materialized", turnId: "test-turn", recordIds: [] };
+}
+
+function operatorRerouteDeferred(): TelegramInboundHandlingOutcome {
+  return {
+    kind: "deferred",
+    reason: "operator-reroute",
+    key: "test-unbound-topic",
+  };
+}
+
 const REGISTRY_KEY = "__piTelegramUpdateHandlerRegistry__";
 
 function clearGlobalRegistry(): void {
@@ -150,6 +175,38 @@ test("Update helpers extract private and thread targets from messages", () => {
   );
 });
 
+test("Durable responsibility accepts human callbacks on bot-authored messages and terminals targetless updates", () => {
+  assert.deepEqual(
+    planTelegramDurableInboundResponsibility(
+      {
+        callback_query: {
+          id: "callback-1",
+          from: { id: 7, is_bot: false },
+          message: {
+            chat: { id: 7, type: "private" },
+            from: { id: 99, is_bot: true },
+            message_id: 10,
+          },
+        },
+      },
+      { allowedUserId: 7 },
+    ),
+    { kind: "local", target: { chatId: 7 } },
+  );
+  assert.deepEqual(
+    planTelegramDurableInboundResponsibility(
+      {},
+      {},
+    ),
+    {
+      kind: "terminal",
+      target: { chatId: TELEGRAM_UNTARGETED_RECOVERY_CHAT_ID },
+      pairingProof: false,
+      reason: "unsupported",
+    },
+  );
+});
+
 test("Update helpers extract deleted business-message ids only from Bot API shapes", () => {
   assert.deepEqual(
     extractDeletedTelegramMessageIds({
@@ -176,12 +233,13 @@ test("Paired update runtime preserves configured-owner routing", async () => {
     prioritizeQueuedTelegramTurnByMessageId: () => false,
     answerCallbackQuery: async () => {},
     answerGuestQuery: async () => {},
-    handleAuthorizedTelegramCallbackQuery: async () => {},
+    handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
     sendTextReply: async () => undefined,
     handleAuthorizedTelegramMessage: async (message, ctx: string) => {
       events.push(`message:${ctx}:${message.message_id ?? "none"}`);
+      return promptMaterialized();
     },
-    handleAuthorizedTelegramEditedMessage: () => {},
+    handleAuthorizedTelegramEditedMessage: () => completed("ignored"),
   });
   await runtime.handleUpdate(
     {
@@ -214,14 +272,25 @@ test("Paired update runtime preserves follower target ownership forwarding", asy
     prioritizeQueuedTelegramTurnByMessageId: () => false,
     answerCallbackQuery: async () => {},
     answerGuestQuery: async () => {},
-    handleAuthorizedTelegramCallbackQuery: async () => {},
+    handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
     sendTextReply: async () => undefined,
     handleAuthorizedTelegramMessage: async () => {
       events.push("message");
+      return promptMaterialized();
     },
-    handleAuthorizedTelegramEditedMessage: () => {},
+    handleAuthorizedTelegramEditedMessage: () => completed("ignored"),
   });
-  await runtime.handleUpdate({ message: { chat: { id: 100, type: "private" }, from: { id: 7, is_bot: false }, message_id: 11, message_thread_id: 42 } }, TEST_CONTEXT);
+  await runtime.handleUpdate(
+    {
+      message: {
+        chat: { id: 100, type: "private" },
+        from: { id: 7, is_bot: false },
+        message_id: 11,
+        message_thread_id: 42,
+      },
+    },
+    TEST_CONTEXT,
+  );
   assert.deepEqual(events, ["forward:follower"]);
 });
 
@@ -235,12 +304,13 @@ test("Paired update runtime preserves topic lifecycle handling", async () => {
     prioritizeQueuedTelegramTurnByMessageId: () => false,
     answerCallbackQuery: async () => {},
     answerGuestQuery: async () => {},
-    handleAuthorizedTelegramCallbackQuery: async () => {},
+    handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
     sendTextReply: async () => undefined,
-    handleAuthorizedTelegramMessage: async () => {},
-    handleAuthorizedTelegramEditedMessage: () => {},
+    handleAuthorizedTelegramMessage: async () => promptMaterialized(),
+    handleAuthorizedTelegramEditedMessage: () => completed("ignored"),
     handleTelegramTopicLifecycleUpdate: async (lifecycle) => {
       events.push(`lifecycle:${lifecycle.kind}:${lifecycle.target.threadId}`);
+      return completed("topic-lifecycle");
     },
   });
 
@@ -624,6 +694,7 @@ test("Update runtime controller binds update and reaction ports", async () => {
     },
     handleAuthorizedTelegramCallbackQuery: async () => {
       events.push("callback");
+      return completed("callback");
     },
     sendTextReply: async (chatId, replyToMessageId, text) => {
       events.push(`reply:${chatId}:${replyToMessageId}:${text}`);
@@ -631,9 +702,11 @@ test("Update runtime controller binds update and reaction ports", async () => {
     },
     handleAuthorizedTelegramMessage: async (message, ctx: string) => {
       events.push(`message:${ctx}:${message.message_id ?? "none"}`);
+      return promptMaterialized();
     },
     handleAuthorizedTelegramEditedMessage: async (message, ctx: string) => {
       events.push(`edit:${ctx}:${message.message_id ?? "none"}`);
+      return completed("ignored");
     },
   });
   await runtime.handleAuthorizedReactionUpdate(
@@ -669,15 +742,16 @@ test("Update runtime routes guest messages through guest handler", async () => {
     prioritizeQueuedTelegramTurnByMessageId: () => true,
     answerCallbackQuery: async () => {},
     answerGuestQuery: async () => {},
-    handleAuthorizedTelegramCallbackQuery: async () => {},
+    handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
     sendTextReply: async () => 1,
-    handleAuthorizedTelegramMessage: async () => {},
-    handleAuthorizedTelegramEditedMessage: async () => {},
+    handleAuthorizedTelegramMessage: async () => promptMaterialized(),
+    handleAuthorizedTelegramEditedMessage: async () => completed("ignored"),
     handleAuthorizedTelegramGuestMessage: async (
       guestMessage,
       _ctx: string,
     ) => {
       events.push(`guest:${guestMessage.guest_query_id}`);
+      return completed("guest");
     },
   });
   await runtime.handleUpdate(
@@ -705,12 +779,13 @@ test("Update runtime denies guest messages before pairing", async () => {
     answerGuestQuery: async (id, text) => {
       events.push(`guest-deny:${id}:${text ?? ""}`);
     },
-    handleAuthorizedTelegramCallbackQuery: async () => {},
+    handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
     sendTextReply: async () => 1,
-    handleAuthorizedTelegramMessage: async () => {},
-    handleAuthorizedTelegramEditedMessage: async () => {},
+    handleAuthorizedTelegramMessage: async () => promptMaterialized(),
+    handleAuthorizedTelegramEditedMessage: async () => completed("ignored"),
     handleAuthorizedTelegramGuestMessage: async () => {
       events.push("guest-handled");
+      return completed("guest");
     },
   });
   await runtime.handleUpdate(
@@ -738,12 +813,13 @@ test("Update runtime answers guest query with access denied for unauthorized use
     answerGuestQuery: async (id, text) => {
       events.push(`guest-deny:${id}:${text ?? ""}`);
     },
-    handleAuthorizedTelegramCallbackQuery: async () => {},
+    handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
     sendTextReply: async () => 1,
-    handleAuthorizedTelegramMessage: async () => {},
-    handleAuthorizedTelegramEditedMessage: async () => {},
+    handleAuthorizedTelegramMessage: async () => promptMaterialized(),
+    handleAuthorizedTelegramEditedMessage: async () => completed("ignored"),
     handleAuthorizedTelegramGuestMessage: async () => {
       events.push("guest-handled");
+      return completed("guest");
     },
   });
   await runtime.handleUpdate(
@@ -1075,10 +1151,10 @@ test("Update runtime records forwarded message ownership for later reactions", a
     prioritizeQueuedTelegramTurnByMessageId: () => false,
     answerCallbackQuery: async () => {},
     answerGuestQuery: async () => {},
-    handleAuthorizedTelegramCallbackQuery: async () => {},
+    handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
     sendTextReply: async () => undefined,
-    handleAuthorizedTelegramMessage: async () => {},
-    handleAuthorizedTelegramEditedMessage: async () => {},
+    handleAuthorizedTelegramMessage: async () => promptMaterialized(),
+    handleAuthorizedTelegramEditedMessage: async () => completed("ignored"),
   });
 
   await runtime.handleUpdate(
@@ -1127,13 +1203,14 @@ test("Update runtime executes delete and reaction plans through the right side e
       },
       handleAuthorizedTelegramReactionUpdate: async () => {
         events.push("reaction");
+        return completed("reaction");
       },
       answerCallbackQuery: async () => {},
       answerGuestQuery: async () => {},
-      handleAuthorizedTelegramCallbackQuery: async () => {},
+      handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
       sendTextReply: async () => undefined,
-      handleAuthorizedTelegramMessage: async () => {},
-      handleAuthorizedTelegramEditedMessage: async () => {},
+      handleAuthorizedTelegramMessage: async () => promptMaterialized(),
+      handleAuthorizedTelegramEditedMessage: async () => completed("ignored"),
     },
   );
   assert.deepEqual(events, ["media:1,2", "queue:1,2"]);
@@ -1155,10 +1232,10 @@ test("Update runtime can execute directly from raw updates", async () => {
       ctx: TEST_CONTEXT,
       removePendingMediaGroupMessages: () => {},
       removeQueuedTelegramTurnsByMessageIds: () => 0,
-      handleAuthorizedTelegramReactionUpdate: async () => {},
+      handleAuthorizedTelegramReactionUpdate: async () => completed("reaction"),
       answerCallbackQuery: async () => {},
       answerGuestQuery: async () => {},
-      handleAuthorizedTelegramCallbackQuery: async () => {},
+      handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
       sendTextReply: async (_chatId, _replyToMessageId, text, options) => {
         events.push(
           `reply:${text}:${options?.target?.chatId}:${options?.target?.threadId}`,
@@ -1167,9 +1244,11 @@ test("Update runtime can execute directly from raw updates", async () => {
       },
       handleAuthorizedTelegramMessage: async () => {
         events.push("message");
+        return promptMaterialized();
       },
       handleAuthorizedTelegramEditedMessage: async () => {
         events.push("edited-message");
+        return completed("ignored");
       },
     },
   );
@@ -1183,12 +1262,12 @@ test("Update runtime swallows only stale context execution errors", async () => 
     ctx: TEST_CONTEXT,
     removePendingMediaGroupMessages: () => {},
     removeQueuedTelegramTurnsByMessageIds: () => 0,
-    handleAuthorizedTelegramReactionUpdate: async () => {},
+    handleAuthorizedTelegramReactionUpdate: async () => completed("reaction"),
     answerCallbackQuery: async () => {},
     answerGuestQuery: async () => {},
-    handleAuthorizedTelegramCallbackQuery: async () => {},
+    handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
     sendTextReply: async () => undefined,
-    handleAuthorizedTelegramEditedMessage: async () => {},
+    handleAuthorizedTelegramEditedMessage: async () => completed("ignored"),
   };
   const plan = {
     kind: "message" as const,
@@ -1199,13 +1278,18 @@ test("Update runtime swallows only stale context execution errors", async () => 
     },
     shouldDeny: false,
   };
-  await assert.doesNotReject(() =>
-    executeTelegramUpdatePlan(plan, {
+  assert.deepEqual(
+    await executeTelegramUpdatePlan(plan, {
       ...baseDeps,
       handleAuthorizedTelegramMessage: async () => {
         throw new Error("ctx is stale after session reload");
       },
     }),
+    {
+      kind: "deferred",
+      reason: "session-replay",
+      key: "session-replay:message:10:0:20",
+    },
   );
   await assert.rejects(
     () =>
@@ -1234,16 +1318,18 @@ test("Update runtime routes edited messages without creating normal message turn
       ctx: TEST_CONTEXT,
       removePendingMediaGroupMessages: () => {},
       removeQueuedTelegramTurnsByMessageIds: () => 0,
-      handleAuthorizedTelegramReactionUpdate: async () => {},
+      handleAuthorizedTelegramReactionUpdate: async () => completed("reaction"),
       answerCallbackQuery: async () => {},
       answerGuestQuery: async () => {},
-      handleAuthorizedTelegramCallbackQuery: async () => {},
+      handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
       sendTextReply: async () => undefined,
       handleAuthorizedTelegramMessage: async () => {
         events.push("message");
+        return promptMaterialized();
       },
       handleAuthorizedTelegramEditedMessage: async () => {
         events.push("edited-message");
+        return completed("ignored");
       },
     },
   );
@@ -1268,17 +1354,18 @@ test("Update runtime answers callbacks owned by another instance without handlin
       getMessageOwnership: () => ({ instanceId: "instance-b" }),
       removePendingMediaGroupMessages: () => {},
       removeQueuedTelegramTurnsByMessageIds: () => 0,
-      handleAuthorizedTelegramReactionUpdate: async () => {},
+      handleAuthorizedTelegramReactionUpdate: async () => completed("reaction"),
       answerCallbackQuery: async (id, text) => {
         events.push(`answer:${id}:${text}`);
       },
       answerGuestQuery: async () => {},
       handleAuthorizedTelegramCallbackQuery: async () => {
         events.push("callback");
+        return completed("callback");
       },
       sendTextReply: async () => undefined,
-      handleAuthorizedTelegramMessage: async () => {},
-      handleAuthorizedTelegramEditedMessage: async () => {},
+      handleAuthorizedTelegramMessage: async () => promptMaterialized(),
+      handleAuthorizedTelegramEditedMessage: async () => completed("ignored"),
     },
   );
   assert.deepEqual(events, [
@@ -1310,17 +1397,18 @@ test("Update runtime forwards callbacks owned by another instance", async () => 
       },
       removePendingMediaGroupMessages: () => {},
       removeQueuedTelegramTurnsByMessageIds: () => 0,
-      handleAuthorizedTelegramReactionUpdate: async () => {},
+      handleAuthorizedTelegramReactionUpdate: async () => completed("reaction"),
       answerCallbackQuery: async (id, text) => {
         events.push(`answer:${id}:${text}`);
       },
       answerGuestQuery: async () => {},
       handleAuthorizedTelegramCallbackQuery: async () => {
         events.push("callback");
+        return completed("callback");
       },
       sendTextReply: async () => undefined,
-      handleAuthorizedTelegramMessage: async () => {},
-      handleAuthorizedTelegramEditedMessage: async () => {},
+      handleAuthorizedTelegramMessage: async () => promptMaterialized(),
+      handleAuthorizedTelegramEditedMessage: async () => completed("ignored"),
     },
   );
   assert.deepEqual(events, ["forward:instance-b:ctx"]);
@@ -1358,17 +1446,18 @@ test("Update runtime forwards callbacks from threads owned by another target ins
       },
       removePendingMediaGroupMessages: () => {},
       removeQueuedTelegramTurnsByMessageIds: () => 0,
-      handleAuthorizedTelegramReactionUpdate: async () => {},
+      handleAuthorizedTelegramReactionUpdate: async () => completed("reaction"),
       answerCallbackQuery: async (id, text) => {
         events.push(`answer:${id}:${text}`);
       },
       answerGuestQuery: async () => {},
       handleAuthorizedTelegramCallbackQuery: async () => {
         events.push("callback");
+        return completed("callback");
       },
       sendTextReply: async () => undefined,
-      handleAuthorizedTelegramMessage: async () => {},
-      handleAuthorizedTelegramEditedMessage: async () => {},
+      handleAuthorizedTelegramMessage: async () => promptMaterialized(),
+      handleAuthorizedTelegramEditedMessage: async () => completed("ignored"),
     },
   );
   assert.deepEqual(events, ["forward:follower:ctx"]);
@@ -1403,15 +1492,16 @@ test("Update runtime forwards messages owned by another target instance", async 
       },
       removePendingMediaGroupMessages: () => {},
       removeQueuedTelegramTurnsByMessageIds: () => 0,
-      handleAuthorizedTelegramReactionUpdate: async () => {},
+      handleAuthorizedTelegramReactionUpdate: async () => completed("reaction"),
       answerCallbackQuery: async () => {},
       answerGuestQuery: async () => {},
-      handleAuthorizedTelegramCallbackQuery: async () => {},
+      handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
       sendTextReply: async () => undefined,
       handleAuthorizedTelegramMessage: async () => {
         events.push("message");
+        return promptMaterialized();
       },
-      handleAuthorizedTelegramEditedMessage: async () => {},
+      handleAuthorizedTelegramEditedMessage: async () => completed("ignored"),
     },
   );
   assert.deepEqual(events, ["target:-10010:55", "forward:instance-b:ctx:20"]);
@@ -1442,14 +1532,15 @@ test("Update runtime forwards edited messages owned by another message instance"
       },
       removePendingMediaGroupMessages: () => {},
       removeQueuedTelegramTurnsByMessageIds: () => 0,
-      handleAuthorizedTelegramReactionUpdate: async () => {},
+      handleAuthorizedTelegramReactionUpdate: async () => completed("reaction"),
       answerCallbackQuery: async () => {},
       answerGuestQuery: async () => {},
-      handleAuthorizedTelegramCallbackQuery: async () => {},
+      handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
       sendTextReply: async () => undefined,
-      handleAuthorizedTelegramMessage: async () => {},
+      handleAuthorizedTelegramMessage: async () => promptMaterialized(),
       handleAuthorizedTelegramEditedMessage: async () => {
         events.push("edited-message");
+        return completed("ignored");
       },
     },
   );
@@ -1482,14 +1573,15 @@ test("Update runtime forwards edited messages owned by another target instance",
       },
       removePendingMediaGroupMessages: () => {},
       removeQueuedTelegramTurnsByMessageIds: () => 0,
-      handleAuthorizedTelegramReactionUpdate: async () => {},
+      handleAuthorizedTelegramReactionUpdate: async () => completed("reaction"),
       answerCallbackQuery: async () => {},
       answerGuestQuery: async () => {},
-      handleAuthorizedTelegramCallbackQuery: async () => {},
+      handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
       sendTextReply: async () => undefined,
-      handleAuthorizedTelegramMessage: async () => {},
+      handleAuthorizedTelegramMessage: async () => promptMaterialized(),
       handleAuthorizedTelegramEditedMessage: async () => {
         events.push("edited-message");
+        return completed("ignored");
       },
     },
   );
@@ -1513,10 +1605,10 @@ test("Update runtime keeps unauthorized message replies in the source thread", a
       ctx: TEST_CONTEXT,
       removePendingMediaGroupMessages: () => {},
       removeQueuedTelegramTurnsByMessageIds: () => 0,
-      handleAuthorizedTelegramReactionUpdate: async () => {},
+      handleAuthorizedTelegramReactionUpdate: async () => completed("reaction"),
       answerCallbackQuery: async () => {},
       answerGuestQuery: async () => {},
-      handleAuthorizedTelegramCallbackQuery: async () => {},
+      handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
       sendTextReply: async (chatId, replyToMessageId, text, options) => {
         events.push(
           `reply:${chatId}:${replyToMessageId}:${text}:${options?.target?.chatId}:${options?.target?.threadId}`,
@@ -1525,9 +1617,11 @@ test("Update runtime keeps unauthorized message replies in the source thread", a
       },
       handleAuthorizedTelegramMessage: async () => {
         events.push("message");
+        return promptMaterialized();
       },
       handleAuthorizedTelegramEditedMessage: async () => {
         events.push("edited-message");
+        return completed("ignored");
       },
     },
   );
@@ -1553,13 +1647,14 @@ test("Update runtime handles callback deny and message pair flows", async () => 
       ctx: TEST_CONTEXT,
       removePendingMediaGroupMessages: () => {},
       removeQueuedTelegramTurnsByMessageIds: () => 0,
-      handleAuthorizedTelegramReactionUpdate: async () => {},
+      handleAuthorizedTelegramReactionUpdate: async () => completed("reaction"),
       answerCallbackQuery: async (id, text) => {
         events.push(`answer:${id}:${text}`);
       },
       answerGuestQuery: async () => {},
       handleAuthorizedTelegramCallbackQuery: async () => {
         events.push("callback");
+        return completed("callback");
       },
       sendTextReply: async (chatId, replyToMessageId, text) => {
         events.push(`reply:${chatId}:${replyToMessageId}:${text}`);
@@ -1567,9 +1662,11 @@ test("Update runtime handles callback deny and message pair flows", async () => 
       },
       handleAuthorizedTelegramMessage: async () => {
         events.push("message");
+        return promptMaterialized();
       },
       handleAuthorizedTelegramEditedMessage: async () => {
         events.push("edited-message");
+        return completed("ignored");
       },
     },
   );
@@ -1588,10 +1685,10 @@ test("Update runtime handles callback deny and message pair flows", async () => 
       ctx: TEST_CONTEXT,
       removePendingMediaGroupMessages: () => {},
       removeQueuedTelegramTurnsByMessageIds: () => 0,
-      handleAuthorizedTelegramReactionUpdate: async () => {},
+      handleAuthorizedTelegramReactionUpdate: async () => completed("reaction"),
       answerCallbackQuery: async () => {},
       answerGuestQuery: async () => {},
-      handleAuthorizedTelegramCallbackQuery: async () => {},
+      handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
       sendTextReply: async (chatId, replyToMessageId, text, options) => {
         events.push(
           `reply:${chatId}:${replyToMessageId}:${text}:${options?.target?.chatId}:${options?.target?.threadId}`,
@@ -1600,9 +1697,11 @@ test("Update runtime handles callback deny and message pair flows", async () => 
       },
       handleAuthorizedTelegramMessage: async () => {
         events.push("message");
+        return promptMaterialized();
       },
       handleAuthorizedTelegramEditedMessage: async () => {
         events.push("edited-message");
+        return completed("ignored");
       },
     },
   );
@@ -1631,17 +1730,19 @@ test("executeTelegramUpdatePlan with handleUnboundTelegramTopicMessage calls unb
       ctx: TEST_CONTEXT,
       removePendingMediaGroupMessages: () => {},
       removeQueuedTelegramTurnsByMessageIds: () => 0,
-      handleAuthorizedTelegramReactionUpdate: async () => {},
+      handleAuthorizedTelegramReactionUpdate: async () => completed("reaction"),
       answerCallbackQuery: async () => {},
       answerGuestQuery: async () => {},
-      handleAuthorizedTelegramCallbackQuery: async () => {},
+      handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
       sendTextReply: async () => undefined,
       handleAuthorizedTelegramMessage: async () => {
         events.push("message");
+        return promptMaterialized();
       },
-      handleAuthorizedTelegramEditedMessage: async () => {},
+      handleAuthorizedTelegramEditedMessage: async () => completed("ignored"),
       handleUnboundTelegramTopicMessage: async () => {
         events.push("unbound-topic");
+        return operatorRerouteDeferred();
       },
     },
   );
@@ -1666,17 +1767,19 @@ test("executeTelegramUpdatePlan with handleUnboundTelegramTopicMessage falls thr
       ctx: TEST_CONTEXT,
       removePendingMediaGroupMessages: () => {},
       removeQueuedTelegramTurnsByMessageIds: () => 0,
-      handleAuthorizedTelegramReactionUpdate: async () => {},
+      handleAuthorizedTelegramReactionUpdate: async () => completed("reaction"),
       answerCallbackQuery: async () => {},
       answerGuestQuery: async () => {},
-      handleAuthorizedTelegramCallbackQuery: async () => {},
+      handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
       sendTextReply: async () => undefined,
       handleAuthorizedTelegramMessage: async () => {
         events.push("message");
+        return promptMaterialized();
       },
-      handleAuthorizedTelegramEditedMessage: async () => {},
+      handleAuthorizedTelegramEditedMessage: async () => completed("ignored"),
       handleUnboundTelegramTopicMessage: async () => {
         events.push("unbound-topic");
+        return operatorRerouteDeferred();
       },
     },
   );
@@ -1710,17 +1813,19 @@ test("executeTelegramUpdatePlan with foreign target ownership skips unbound hand
       },
       removePendingMediaGroupMessages: () => {},
       removeQueuedTelegramTurnsByMessageIds: () => 0,
-      handleAuthorizedTelegramReactionUpdate: async () => {},
+      handleAuthorizedTelegramReactionUpdate: async () => completed("reaction"),
       answerCallbackQuery: async () => {},
       answerGuestQuery: async () => {},
-      handleAuthorizedTelegramCallbackQuery: async () => {},
+      handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
       sendTextReply: async () => undefined,
       handleAuthorizedTelegramMessage: async () => {
         events.push("message");
+        return promptMaterialized();
       },
-      handleAuthorizedTelegramEditedMessage: async () => {},
+      handleAuthorizedTelegramEditedMessage: async () => completed("ignored"),
       handleUnboundTelegramTopicMessage: async () => {
         events.push("unbound-topic");
+        return operatorRerouteDeferred();
       },
     },
   );
@@ -1836,17 +1941,33 @@ test("Void/undefined return values are treated as 'pass'", async () => {
 test("createTelegramUpdateHandle skips defaultHandle on consume", async () => {
   clearGlobalRegistry();
   const defaultCalls: number[] = [];
-  const defaultHandle = async (update: { update_id: number }) => {
+  const defaultHandle = async (update: {
+    update_id: number;
+    message?: { from: { id: number; is_bot: boolean } };
+  }) => {
     defaultCalls.push(update.update_id);
+    return completed("ignored");
   };
   const off = registerTelegramUpdateHandler((update) => {
     const id = (update as { update_id?: number }).update_id;
     return id === 99 ? "consume" : "pass";
   });
-  const handler = createTelegramUpdateHandle({ defaultHandle, pairingGate: createPairedGate() });
-  await handler({ update_id: 1 }, undefined);
-  await handler({ update_id: 99 }, undefined);
-  await handler({ update_id: 2 }, undefined);
+  const handler = createTelegramUpdateHandle({
+    defaultHandle,
+    pairingGate: createPairedGate(),
+  });
+  await handler(
+    { update_id: 1, message: { from: { id: 7, is_bot: false } } },
+    undefined,
+  );
+  await handler(
+    { update_id: 99, message: { from: { id: 7, is_bot: false } } },
+    undefined,
+  );
+  await handler(
+    { update_id: 2, message: { from: { id: 7, is_bot: false } } },
+    undefined,
+  );
   assert.deepEqual(defaultCalls, [1, 2]);
   off();
   clearGlobalRegistry();
@@ -1857,8 +1978,12 @@ test("createTelegramUpdateHandle calls defaultHandle when no handlers registered
   const defaultCalls: unknown[] = [];
   const defaultHandle = async (update: { update_id: number }, ctx: string) => {
     defaultCalls.push({ update, ctx });
+    return completed("ignored");
   };
-  const handler = createTelegramUpdateHandle({ defaultHandle, pairingGate: createPairedGate() });
+  const handler = createTelegramUpdateHandle({
+    defaultHandle,
+    pairingGate: createPairedGate(),
+  });
   await handler({ update_id: 7 }, "ctx");
   assert.deepEqual(defaultCalls, [{ update: { update_id: 7 }, ctx: "ctx" }]);
   clearGlobalRegistry();
@@ -1978,11 +2103,16 @@ test("createTelegramUpdateHandle accepts an explicit registry override", async (
     pairingGate: createPairedGate(),
     defaultHandle: async (update) => {
       defaultCalls.push(update);
+      return completed("ignored");
     },
     registry: customRegistry,
   });
-  await handler({ update_id: 1 }, undefined);
-  assert.deepEqual(seen, [{ update_id: 1 }]);
+  const update = {
+    update_id: 1,
+    message: { from: { id: 7, is_bot: false } },
+  };
+  await handler(update, undefined);
+  assert.deepEqual(seen, [update]);
   assert.deepEqual(defaultCalls, []);
   assert.equal(getGlobalRegistry(), undefined);
   clearGlobalRegistry();
@@ -2003,19 +2133,30 @@ test("Unpaired gate hides proofs and rejects from public/default handlers before
   const registry: TelegramUpdateHandlerRegistry = {
     version: 1,
     add: () => () => {},
-    async dispatch(update) { publicSeen.push(update); return "consume"; },
+    async dispatch(update) {
+      publicSeen.push(update);
+      return "consume";
+    },
   };
   const handler = createTelegramUpdateHandle({
     registry,
-    defaultHandle: async (update) => { defaultSeen.push(update); },
+    defaultHandle: async (update) => {
+      defaultSeen.push(update);
+      return completed("ignored");
+    },
     pairingGate: {
       getAllowedUserId: () => allowedUserId,
       async claim(input) {
         claims.push(input);
-        if (input.code === code) { allowedUserId = input.senderId; return { kind: "claimed" }; }
+        if (input.code === code) {
+          allowedUserId = input.senderId;
+          return { kind: "claimed" };
+        }
         return { kind: "rejected" };
       },
-      async sendGenericResponse(target) { responses.push(target); },
+      async sendGenericResponse(target) {
+        responses.push(target);
+      },
       onPaired: () => {},
       recordSideEffectFailure: () => {},
     },
@@ -2023,8 +2164,24 @@ test("Unpaired gate hides proofs and rejects from public/default handlers before
   const rejected = [
     { update_id: 1, callback_query: {} },
     { update_id: 2, edited_message: {} },
-    { update_id: 3, message: { message_id: 1, chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: `/start  ${code}` } },
-    { update_id: 4, message: { message_id: 1, chat: { id: -7, type: "group" }, from: { id: 7, is_bot: false }, text: `/start ${code}` } },
+    {
+      update_id: 3,
+      message: {
+        message_id: 1,
+        chat: { id: 7, type: "private" },
+        from: { id: 7, is_bot: false },
+        text: `/start  ${code}`,
+      },
+    },
+    {
+      update_id: 4,
+      message: {
+        message_id: 1,
+        chat: { id: -7, type: "group" },
+        from: { id: 7, is_bot: false },
+        text: `/start ${code}`,
+      },
+    },
   ];
   for (const update of rejected) await handler(update, "ctx");
   assert.deepEqual(publicSeen, []);
@@ -2032,7 +2189,18 @@ test("Unpaired gate hides proofs and rejects from public/default handlers before
   assert.deepEqual(claims, []);
   assert.deepEqual(responses, []);
 
-  const proof = { update_id: 5, message: { message_id: 9, message_thread_id: 12, is_topic_message: true, date: 1, chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: `/start ${code}` } };
+  const proof = {
+    update_id: 5,
+    message: {
+      message_id: 9,
+      message_thread_id: 12,
+      is_topic_message: true,
+      date: 1,
+      chat: { id: 7, type: "private" },
+      from: { id: 7, is_bot: false },
+      text: `/start ${code}`,
+    },
+  };
   await handler(proof, "ctx");
   assert.deepEqual(claims, [{ senderId: 7, code }]);
   assert.deepEqual(publicSeen, []);
@@ -2052,9 +2220,181 @@ test("Unpaired gate hides proofs and rejects from public/default handlers before
   assert.deepEqual(publicSeen, []);
   assert.deepEqual(defaultSeen, []);
 
-  await handler({ update_id: 6 }, "ctx");
-  assert.deepEqual(publicSeen, [{ update_id: 6 }]);
+  const pairedOwnerUpdate = {
+    update_id: 6,
+    message: { from: { id: 7, is_bot: false } },
+  };
+  await handler(pairedOwnerUpdate, "ctx");
+  assert.deepEqual(publicSeen, [pairedOwnerUpdate]);
   assert.deepEqual(defaultSeen, []);
+});
+
+test("Paired unauthorized senders are denied before public handler dispatch", async () => {
+  const publicSeen: unknown[] = [];
+  const defaultSeen: unknown[] = [];
+  const handler = createTelegramUpdateHandle({
+    registry: {
+      version: 1,
+      add: () => () => {},
+      async dispatch(update) {
+        publicSeen.push(update);
+        return "pass";
+      },
+    },
+    defaultHandle: async (update) => {
+      defaultSeen.push(update);
+      return completed("ignored");
+    },
+    pairingGate: createPairedGate(),
+  });
+  const denied = await handler(
+    {
+      update_id: 70,
+      message: {
+        chat: { id: 70, type: "private" },
+        message_id: 1,
+        from: { id: 99, is_bot: false },
+      },
+    },
+    "ctx",
+  );
+  assert.deepEqual(denied, completed("unauthorized"));
+  assert.deepEqual(publicSeen, []);
+  assert.deepEqual(defaultSeen, []);
+
+  await handler(
+    {
+      update_id: 71,
+      message: {
+        chat: { id: 7, type: "private" },
+        message_id: 2,
+        from: { id: 7, is_bot: false },
+      },
+    },
+    "ctx",
+  );
+  assert.equal(publicSeen.length, 1);
+  assert.equal(defaultSeen.length, 1);
+});
+
+test("Public handlers require an exact owner sender while senderless terminal updates stay built-in", async () => {
+  const publicSeen: unknown[] = [];
+  const defaultSeen: unknown[] = [];
+  const handler = createTelegramUpdateHandle({
+    registry: {
+      version: 1,
+      add: () => () => {},
+      async dispatch(update) {
+        publicSeen.push(update);
+        return "pass";
+      },
+    },
+    defaultHandle: async (update) => {
+      defaultSeen.push(update);
+      return completed("ignored");
+    },
+    pairingGate: createPairedGate(),
+  });
+  const deleted = {
+    update_id: 72,
+    deleted_business_messages: { chat: { id: 7 }, message_ids: [3] },
+  };
+  const futureShape = {
+    update_id: 73,
+    future_update: { from: { id: 7, is_bot: false } },
+  };
+  await handler(deleted, "ctx");
+  await handler(futureShape, "ctx");
+  assert.deepEqual(publicSeen, []);
+  assert.deepEqual(defaultSeen, [deleted, futureShape]);
+});
+
+test("Proof-shaped start text with extra Bot fields is suppressed before strict claim and routing", async () => {
+  const code = "03".repeat(16);
+  for (const allowedUserId of [undefined, 7]) {
+    let claims = 0;
+    let publicCalls = 0;
+    let defaultCalls = 0;
+    const handler = createTelegramUpdateHandle({
+      registry: {
+        version: 1,
+        add: () => () => {},
+        async dispatch() {
+          publicCalls += 1;
+          return "pass";
+        },
+      },
+      defaultHandle: async () => {
+        defaultCalls += 1;
+        return completed("ignored");
+      },
+      pairingGate: {
+        getAllowedUserId: () => allowedUserId,
+        async claim() {
+          claims += 1;
+          return { kind: "rejected" };
+        },
+        sendGenericResponse: async () => {},
+        onPaired: () => {},
+        recordSideEffectFailure: () => {},
+      },
+    });
+    await handler(
+      {
+        update_id: 74,
+        message: {
+          message_id: 4,
+          chat: { id: 7, type: "private" },
+          from: { id: 7, is_bot: false },
+          text: `/start ${code}`,
+          future_bot_field: true,
+        },
+      },
+      "ctx",
+    );
+    assert.equal(claims, 0);
+    assert.equal(publicCalls, 0);
+    assert.equal(defaultCalls, 0);
+  }
+});
+
+test("Legacy or malformed follower forwarding stays retryable with a stable key", async () => {
+  for (const forwardingResult of [undefined, false, true, { version: 1 }]) {
+    const outcome = await executeTelegramUpdate(
+      {
+        update_id: 88,
+        message: {
+          chat: { id: 7, type: "private" },
+          message_id: 44,
+          message_thread_id: 9,
+          from: { id: 7, is_bot: false },
+        },
+      },
+      7,
+      {
+        ctx: TEST_CONTEXT,
+        getCurrentInstanceId: () => "leader",
+        getTargetOwnership: () => ({ instanceId: "follower" }),
+        foreignOwnedUpdateForwarder: {
+          forwardMessage: async () => forwardingResult as boolean,
+        },
+        removePendingMediaGroupMessages: () => {},
+        removeQueuedTelegramTurnsByMessageIds: () => 0,
+        handleAuthorizedTelegramReactionUpdate: async () => completed("reaction"),
+        answerCallbackQuery: async () => {},
+        answerGuestQuery: async () => {},
+        handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
+        sendTextReply: async () => undefined,
+        handleAuthorizedTelegramMessage: async () => promptMaterialized(),
+        handleAuthorizedTelegramEditedMessage: async () => completed("ignored"),
+      },
+    );
+    assert.deepEqual(outcome, {
+      kind: "deferred",
+      reason: "follower-admission-pending",
+      key: "follower:7:9:update:88",
+    });
+  }
 });
 
 test("Pairing response and status failures are redacted best-effort side effects", async () => {
@@ -2073,6 +2413,7 @@ test("Pairing response and status failures are redacted best-effort side effects
     },
     defaultHandle: async () => {
       defaultCalls += 1;
+      return completed("ignored");
     },
     pairingGate: {
       getAllowedUserId: () => undefined,

@@ -17,6 +17,7 @@ import {
 import {
   TELEGRAM_PAIRING_EXPIRY_MS,
   createTelegramPairingRuntime,
+  isTelegramPairingProofShapedUpdate,
   parseTelegramPairingCandidate,
 } from "../lib/pairing.ts";
 
@@ -73,6 +74,19 @@ test("Pairing parser admits only exact private-human text proof shapes", () => {
       },
     }),
     { senderId: 7, chatId: 7, messageId: 2, threadId: 12, code },
+  );
+  const futureShape = {
+    ...valid,
+    message: { ...valid.message, future_bot_field: true },
+  };
+  assert.equal(isTelegramPairingProofShapedUpdate(futureShape), true);
+  assert.equal(parseTelegramPairingCandidate(futureShape), undefined);
+  assert.equal(
+    isTelegramPairingProofShapedUpdate({
+      ...valid,
+      message: { ...valid.message, text: `/start ${code} extra` },
+    }),
+    false,
   );
   for (const update of [
     { ...valid, message: { ...valid.message, text: `/start  ${code}` } },

@@ -1,10 +1,35 @@
 /**
- * Durable recovery schema contracts and strict snapshot validation
- * Zones: recovery, queue lifecycle, delivery, multi-instance bus
- * Owns only the versioned serializable shapes and frozen policy constants used by
- * later recovery storage work; it performs no filesystem I/O or runtime activation.
+ * Durable recovery contracts and profile-scoped filesystem store
+ * Zones: recovery, queue lifecycle, delivery, multi-instance bus, filesystem
+ * Owns the strict v1 schema, inbound recovery state machine, byte reservations,
+ * identity claims, retention, and downgrade quarantine primitives. Runtime wiring
+ * to polling, queue dispatch, and the multi-instance bus remains outside this domain.
  */
 
+import { createHash, randomUUID } from "node:crypto";
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, join } from "node:path";
+
+import { withTelegramFileTransaction } from "./locks.ts";
+import {
+  getTelegramProfilePathSuffix,
+  resolveTelegramTempDir,
+} from "./paths.ts";
 import type { TelegramTarget } from "./target.ts";
 
 export const RECOVERY_SCHEMA_VERSION = 1 as const;
@@ -28,6 +53,14 @@ export const RECOVERY_INBOUND_STATES = [
   "explicitly-discarded",
 ] as const;
 export type RecoveryInboundState = (typeof RECOVERY_INBOUND_STATES)[number];
+export const RECOVERY_INBOUND_TERMINAL_REASONS = [
+  "ignored",
+  "unauthorized",
+  "unsupported",
+  "poison-skipped",
+] as const;
+export type RecoveryInboundTerminalReason =
+  (typeof RECOVERY_INBOUND_TERMINAL_REASONS)[number];
 export const RECOVERY_UNRESOLVED_INBOUND_STATES = [
   "observed",
   "admitted",
@@ -80,6 +113,193 @@ export type RecoveryReassignmentState =
 export const RECOVERY_STORE_MODES = ["active", "downgrade-exclusive"] as const;
 export type RecoveryStoreMode = (typeof RECOVERY_STORE_MODES)[number];
 
+export const RECOVERY_OPERATION_GATE_PHASES = [
+  "active",
+  "fencing",
+  "downgrade-exclusive",
+  "quarantined",
+] as const;
+export type RecoveryOperationGatePhase =
+  (typeof RECOVERY_OPERATION_GATE_PHASES)[number];
+
+export interface RecoveryOperationGateState {
+  profile: string;
+  phase: RecoveryOperationGatePhase;
+  fenceGeneration?: string;
+  inFlight: number;
+}
+
+export interface RecoveryOperationLease {
+  profile: string;
+  operationGeneration: number;
+  release(): void;
+}
+
+interface MutableRecoveryOperationGateState extends RecoveryOperationGateState {
+  operationGeneration: number;
+  drainWaiters: Set<() => void>;
+}
+
+/**
+ * Process-local half of the downgrade fence. The on-disk store mode remains the
+ * final cross-process authority, while this gate prevents already-running runtime
+ * work from racing the exclusive transition in this process.
+ */
+export class RecoveryProfileOperationGate {
+  readonly #states = new Map<string, MutableRecoveryOperationGateState>();
+
+  #state(profile: string): MutableRecoveryOperationGateState {
+    if (!profile) throw new Error("Recovery gate profile is required");
+    let state = this.#states.get(profile);
+    if (!state) {
+      state = {
+        profile,
+        phase: "active",
+        inFlight: 0,
+        operationGeneration: 1,
+        drainWaiters: new Set(),
+      };
+      this.#states.set(profile, state);
+    }
+    return state;
+  }
+
+  getState(profile: string): RecoveryOperationGateState {
+    const state = this.#state(profile);
+    return {
+      profile: state.profile,
+      phase: state.phase,
+      ...(state.fenceGeneration
+        ? { fenceGeneration: state.fenceGeneration }
+        : {}),
+      inFlight: state.inFlight,
+    };
+  }
+
+  enter(profile: string): RecoveryOperationLease | undefined {
+    const state = this.#state(profile);
+    if (state.phase !== "active") return undefined;
+    state.inFlight += 1;
+    const operationGeneration = state.operationGeneration;
+    let released = false;
+    return {
+      profile,
+      operationGeneration,
+      release: () => {
+        if (released) return;
+        released = true;
+        const current = this.#state(profile);
+        if (
+          current.operationGeneration !== operationGeneration ||
+          current.inFlight <= 0
+        ) {
+          throw new Error("Recovery operation lease generation mismatch");
+        }
+        current.inFlight -= 1;
+        if (current.inFlight === 0 && current.phase !== "active") {
+          const waiters = [...current.drainWaiters];
+          current.drainWaiters.clear();
+          for (const resolve of waiters) resolve();
+        }
+      },
+    };
+  }
+
+  beginFencing(profile: string, fenceGeneration: string = randomUUID()): string {
+    if (!fenceGeneration) {
+      throw new Error("Recovery fence generation is required");
+    }
+    const state = this.#state(profile);
+    if (state.phase === "active") {
+      state.phase = "fencing";
+      state.fenceGeneration = fenceGeneration;
+      return fenceGeneration;
+    }
+    if (
+      state.phase === "fencing" &&
+      state.fenceGeneration === fenceGeneration
+    ) {
+      return fenceGeneration;
+    }
+    throw new Error("Recovery gate is already fenced by another generation");
+  }
+
+  async awaitDrained(profile: string, fenceGeneration: string): Promise<void> {
+    const state = this.#requireFence(profile, fenceGeneration);
+    if (state.inFlight === 0) return;
+    await new Promise<void>((resolve) => state.drainWaiters.add(resolve));
+    this.#requireFence(profile, fenceGeneration);
+  }
+
+  beginDowngradeExclusive(profile: string, fenceGeneration: string): void {
+    const state = this.#requireFence(profile, fenceGeneration);
+    if (state.phase !== "fencing" || state.inFlight !== 0) {
+      throw new Error("Recovery gate cannot become exclusive before drain");
+    }
+    state.phase = "downgrade-exclusive";
+  }
+
+  markQuarantined(profile: string, fenceGeneration: string): void {
+    const state = this.#requireFence(profile, fenceGeneration);
+    if (state.phase !== "downgrade-exclusive" || state.inFlight !== 0) {
+      throw new Error("Recovery gate is not downgrade-exclusive");
+    }
+    state.phase = "quarantined";
+  }
+
+  resume(profile: string, fenceGeneration: string): void {
+    const state = this.#requireResumableFence(profile, fenceGeneration);
+    this.#activate(state);
+  }
+
+  async resumeAfter(
+    profile: string,
+    fenceGeneration: string,
+    resumeRuntime: () => Promise<void> | void,
+  ): Promise<void> {
+    this.#requireResumableFence(profile, fenceGeneration);
+    await resumeRuntime();
+    const state = this.#requireResumableFence(profile, fenceGeneration);
+    this.#activate(state);
+  }
+
+  #requireResumableFence(
+    profile: string,
+    fenceGeneration: string,
+  ): MutableRecoveryOperationGateState {
+    const state = this.#requireFence(profile, fenceGeneration);
+    if (state.phase === "quarantined") {
+      throw new Error("Quarantined recovery gate cannot resume");
+    }
+    if (state.inFlight !== 0) {
+      throw new Error("Recovery gate cannot resume with work in flight");
+    }
+    return state;
+  }
+
+  #activate(state: MutableRecoveryOperationGateState): void {
+    state.phase = "active";
+    delete state.fenceGeneration;
+    state.operationGeneration += 1;
+    state.drainWaiters.clear();
+  }
+
+  #requireFence(
+    profile: string,
+    fenceGeneration: string,
+  ): MutableRecoveryOperationGateState {
+    const state = this.#state(profile);
+    if (
+      state.phase === "active" ||
+      !fenceGeneration ||
+      state.fenceGeneration !== fenceGeneration
+    ) {
+      throw new Error("Recovery fence generation mismatch");
+    }
+    return state;
+  }
+}
+
 export type RecoveryOwnerIdentity =
   | {
       kind: "leader";
@@ -103,11 +323,13 @@ export interface RecoveryIdentity {
 export interface RecoveryPayloadReference {
   payloadId: string;
   byteLength: number;
+  sha256: string;
 }
 
 export interface RecoverySpoolReference {
   spoolId: string;
   byteLength: number;
+  sha256: string;
 }
 
 interface RecoveryRecordBase {
@@ -127,7 +349,10 @@ export interface RecoveryInboundRecord extends RecoveryRecordBase {
   updateId: number;
   turnId: string;
   state: RecoveryInboundState;
+  /** Immutable revision at which this update first became durably acknowledged. */
+  admissionRevision?: number;
   linkedAttemptOf?: string;
+  terminalReason?: RecoveryInboundTerminalReason;
 }
 
 export interface RecoveryOutboundRecord extends RecoveryRecordBase {
@@ -191,6 +416,8 @@ export interface RecoverySnapshotV1 {
   revision: number;
   writtenAtMs: number;
   quota: RecoveryQuotaAccounting;
+  /** Sole durable inbound offset authority; polling wiring is added in P0-C C2. */
+  committedUpdateId: number | null;
   inbound: RecoveryInboundRecord[];
   outbound: RecoveryOutboundRecord[];
   bus: RecoveryBusRecord[];
@@ -200,6 +427,7 @@ export interface RecoverySnapshotV1 {
 const PROFILE_PATTERN = /^[a-z0-9]{1,32}$/;
 const RESERVED_PROFILES = new Set(["active", "main"]);
 const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 
 type JsonObject = Record<string, unknown>;
 
@@ -334,11 +562,7 @@ function readOwner(value: unknown, path: string): RecoveryOwnerIdentity {
     };
   }
   if (object.kind === "manual-follower") {
-    assertKeys(object, path, [
-      "kind",
-      "ownerId",
-      "registrationGeneration",
-    ]);
+    assertKeys(object, path, ["kind", "ownerId", "registrationGeneration"]);
     return {
       kind: "manual-follower",
       ownerId: readStableString(object.ownerId, `${path}.ownerId`),
@@ -371,23 +595,31 @@ function readPayloadRef(
   path: string,
 ): RecoveryPayloadReference {
   const object = readObject(value, path);
-  assertKeys(object, path, ["payloadId", "byteLength"]);
+  assertKeys(object, path, ["payloadId", "byteLength", "sha256"]);
+  const sha256 = readStableString(object.sha256, `${path}.sha256`);
+  if (!SHA256_PATTERN.test(sha256))
+    fail(`${path}.sha256`, "expected SHA-256 hex");
   return {
     payloadId: readStableString(object.payloadId, `${path}.payloadId`),
     byteLength: readSafeInteger(object.byteLength, `${path}.byteLength`, {
       minimum: 0,
     }),
+    sha256,
   };
 }
 
 function readSpoolRef(value: unknown, path: string): RecoverySpoolReference {
   const object = readObject(value, path);
-  assertKeys(object, path, ["spoolId", "byteLength"]);
+  assertKeys(object, path, ["spoolId", "byteLength", "sha256"]);
+  const sha256 = readStableString(object.sha256, `${path}.sha256`);
+  if (!SHA256_PATTERN.test(sha256))
+    fail(`${path}.sha256`, "expected SHA-256 hex");
   return {
     spoolId: readStableString(object.spoolId, `${path}.spoolId`),
     byteLength: readSafeInteger(object.byteLength, `${path}.byteLength`, {
       minimum: 0,
     }),
+    sha256,
   };
 }
 
@@ -456,12 +688,29 @@ function readInboundRecord(
     object,
     path,
     [...RECORD_BASE_REQUIRED_KEYS, "updateId", "turnId", "state"],
-    [...RECORD_BASE_OPTIONAL_KEYS, "linkedAttemptOf"],
+    [
+      ...RECORD_BASE_OPTIONAL_KEYS,
+      "admissionRevision",
+      "linkedAttemptOf",
+      "terminalReason",
+    ],
   );
   if (object.family !== "inbound") fail(`${path}.family`, "expected inbound");
   const base = readRecordBase(object, path);
+  const admissionRevision = Object.hasOwn(object, "admissionRevision")
+    ? readSafeInteger(object.admissionRevision, `${path}.admissionRevision`, {
+        minimum: 0,
+      })
+    : undefined;
   const linkedAttemptOf = Object.hasOwn(object, "linkedAttemptOf")
     ? readStableString(object.linkedAttemptOf, `${path}.linkedAttemptOf`)
+    : undefined;
+  const terminalReason = Object.hasOwn(object, "terminalReason")
+    ? readEnum(
+        object.terminalReason,
+        `${path}.terminalReason`,
+        RECOVERY_INBOUND_TERMINAL_REASONS,
+      )
     : undefined;
   return {
     ...base,
@@ -471,7 +720,9 @@ function readInboundRecord(
     }),
     turnId: readStableString(object.turnId, `${path}.turnId`),
     state: readEnum(object.state, `${path}.state`, RECOVERY_INBOUND_STATES),
+    ...(admissionRevision !== undefined ? { admissionRevision } : {}),
     ...(linkedAttemptOf ? { linkedAttemptOf } : {}),
+    ...(terminalReason ? { terminalReason } : {}),
   };
 }
 
@@ -506,12 +757,7 @@ function readBusRecord(value: unknown, path: string): RecoveryBusRecord {
   assertKeys(
     object,
     path,
-    [
-      ...RECORD_BASE_REQUIRED_KEYS,
-      "requestId",
-      "payloadFingerprint",
-      "state",
-    ],
+    [...RECORD_BASE_REQUIRED_KEYS, "requestId", "payloadFingerprint", "state"],
     RECORD_BASE_OPTIONAL_KEYS,
   );
   if (object.family !== "bus") fail(`${path}.family`, "expected bus");
@@ -680,9 +926,13 @@ function readQuota(value: unknown, path: string): RecoveryQuotaAccounting {
     spoolBytes: readSafeInteger(object.spoolBytes, `${path}.spoolBytes`, {
       minimum: 0,
     }),
-    reservedBytes: readSafeInteger(object.reservedBytes, `${path}.reservedBytes`, {
-      minimum: 0,
-    }),
+    reservedBytes: readSafeInteger(
+      object.reservedBytes,
+      `${path}.reservedBytes`,
+      {
+        minimum: 0,
+      },
+    ),
     totalBytes: readSafeInteger(object.totalBytes, `${path}.totalBytes`, {
       minimum: 0,
     }),
@@ -737,9 +987,9 @@ function isUnresolvedRecord(
         record.state,
       );
     case "outbound":
-      return (RECOVERY_UNRESOLVED_OUTBOUND_STATES as readonly string[]).includes(
-        record.state,
-      );
+      return (
+        RECOVERY_UNRESOLVED_OUTBOUND_STATES as readonly string[]
+      ).includes(record.state);
     case "bus":
       return (RECOVERY_UNRESOLVED_BUS_STATES as readonly string[]).includes(
         record.state,
@@ -783,15 +1033,45 @@ function assertStructurallyUniqueRequests(snapshot: RecoverySnapshotV1): void {
 
 function assertSnapshotConsistency(snapshot: RecoverySnapshotV1): void {
   const records = [...snapshot.inbound, ...snapshot.outbound, ...snapshot.bus];
-  assertUniqueStrings(records.map((record) => record.recordId), "$.records");
+  assertUniqueStrings(
+    records.map((record) => record.recordId),
+    "$.records",
+  );
   assertUniqueStrings(
     snapshot.reassignments.map((record) => record.reassignmentId),
     "$.reassignments",
   );
   assertUniqueStrings(
-    snapshot.inbound.map((record) => String(record.updateId)),
+    snapshot.inbound
+      .filter((record) => record.linkedAttemptOf === undefined)
+      .map((record) => String(record.updateId)),
     "$.inbound.updateId",
   );
+  const inboundById = new Map(
+    snapshot.inbound.map((record) => [record.recordId, record] as const),
+  );
+  assertUniqueStrings(
+    snapshot.inbound.flatMap((record) =>
+      record.linkedAttemptOf ? [record.linkedAttemptOf] : [],
+    ),
+    "$.inbound.linkedAttemptOf",
+  );
+  for (const record of snapshot.inbound) {
+    if (!record.linkedAttemptOf) continue;
+    const source = inboundById.get(record.linkedAttemptOf);
+    if (!source) {
+      fail(
+        `$.inbound.${record.recordId}.linkedAttemptOf`,
+        "must reference an existing inbound record",
+      );
+    }
+    if (source.updateId !== record.updateId) {
+      fail(
+        `$.inbound.${record.recordId}.updateId`,
+        "must match the linked source update id",
+      );
+    }
+  }
   assertStructurallyUniqueRequests(snapshot);
 
   const payloadRefs = records.flatMap((record) =>
@@ -814,19 +1094,57 @@ function assertSnapshotConsistency(snapshot: RecoverySnapshotV1): void {
     (sum, reference) => sum + reference.byteLength,
     0,
   );
-  if (!Number.isSafeInteger(payloadBytes) || payloadBytes !== snapshot.quota.payloadBytes) {
+  if (
+    !Number.isSafeInteger(payloadBytes) ||
+    payloadBytes !== snapshot.quota.payloadBytes
+  ) {
     fail("$.quota.payloadBytes", "must equal referenced payload bytes");
   }
-  if (!Number.isSafeInteger(spoolBytes) || spoolBytes !== snapshot.quota.spoolBytes) {
+  if (
+    !Number.isSafeInteger(spoolBytes) ||
+    spoolBytes !== snapshot.quota.spoolBytes
+  ) {
     fail("$.quota.spoolBytes", "must equal referenced spool bytes");
   }
 
   for (const record of records) {
+    if (record.family === "inbound") {
+      if (record.state === "observed") {
+        if (record.admissionRevision !== undefined) {
+          fail(
+            `$.records.${record.recordId}.admissionRevision`,
+            "must be absent while the record is only observed",
+          );
+        }
+      } else if (
+        record.admissionRevision === undefined ||
+        record.admissionRevision < record.createdRevision ||
+        record.admissionRevision > record.stateRevision
+      ) {
+        fail(
+          `$.records.${record.recordId}.admissionRevision`,
+          "must identify the immutable durable admission revision",
+        );
+      }
+    }
+    if (
+      record.family === "inbound" &&
+      record.terminalReason !== undefined &&
+      record.state !== "explicitly-discarded"
+    ) {
+      fail(
+        `$.records.${record.recordId}.terminalReason`,
+        "is valid only for an explicitly-discarded terminal disposition",
+      );
+    }
     if (record.identity.profile !== snapshot.profile) {
       fail(`$.records.${record.recordId}.identity.profile`, "profile mismatch");
     }
     if (record.createdRevision > snapshot.revision) {
-      fail(`$.records.${record.recordId}.createdRevision`, "exceeds snapshot revision");
+      fail(
+        `$.records.${record.recordId}.createdRevision`,
+        "exceeds snapshot revision",
+      );
     }
     if (
       record.stateRevision < record.createdRevision ||
@@ -838,7 +1156,10 @@ function assertSnapshotConsistency(snapshot: RecoverySnapshotV1): void {
       );
     }
     if (record.updatedAtMs > snapshot.writtenAtMs) {
-      fail(`$.records.${record.recordId}.updatedAtMs`, "exceeds snapshot writtenAtMs");
+      fail(
+        `$.records.${record.recordId}.updatedAtMs`,
+        "exceeds snapshot writtenAtMs",
+      );
     }
   }
   const claimedRecordIds = new Map<string, string>();
@@ -873,7 +1194,10 @@ function assertSnapshotConsistency(snapshot: RecoverySnapshotV1): void {
             reassignment.captureThroughRevision,
           ) &&
           record.identity.profile === reassignment.profile &&
-          areRecoveryTargetsEqual(record.identity.target, reassignment.target) &&
+          areRecoveryTargetsEqual(
+            record.identity.target,
+            reassignment.target,
+          ) &&
           areRecoveryOwnersEqual(record.identity.owner, reassignment.oldOwner),
       )
       .map((record) => record.recordId)
@@ -900,6 +1224,7 @@ export function validateRecoverySnapshot(value: unknown): RecoverySnapshotV1 {
     "revision",
     "writtenAtMs",
     "quota",
+    "committedUpdateId",
     "inbound",
     "outbound",
     "bus",
@@ -915,6 +1240,12 @@ export function validateRecoverySnapshot(value: unknown): RecoverySnapshotV1 {
     revision: readSafeInteger(object.revision, "$.revision", { minimum: 0 }),
     writtenAtMs: readTimestamp(object.writtenAtMs, "$.writtenAtMs"),
     quota: readQuota(object.quota, "$.quota"),
+    committedUpdateId:
+      object.committedUpdateId === null
+        ? null
+        : readSafeInteger(object.committedUpdateId, "$.committedUpdateId", {
+            minimum: 0,
+          }),
     inbound: readArray(object.inbound, "$.inbound", readInboundRecord),
     outbound: readArray(object.outbound, "$.outbound", readOutboundRecord),
     bus: readArray(object.bus, "$.bus", readBusRecord),
@@ -937,4 +1268,3036 @@ export function parseRecoverySnapshot(serialized: string): RecoverySnapshotV1 {
     throw new Error(`Invalid recovery snapshot JSON: ${message}`);
   }
   return validateRecoverySnapshot(value);
+}
+
+const RECOVERY_SNAPSHOT_FILE_NAME = "snapshot.json";
+const RECOVERY_PAYLOAD_DIRECTORY_NAME = "payloads";
+const RECOVERY_SPOOL_DIRECTORY_NAME = "spool";
+const RECOVERY_MATERIALIZED_DIRECTORY_NAME = "materialized";
+const RECOVERY_BINARY_FILE_SUFFIX = ".bin";
+const RECOVERY_TEMP_FILE_MARKER = ".tmp-";
+const RECOVERY_SAFE_FILE_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
+const RECOVERY_HANDOFF_REGISTRY_KEY = Symbol.for(
+  "@ststgc/pi-telegram/recovery-consumed-handoffs-v1",
+);
+
+export type RecoveryInboundFaultId =
+  | "IN-01"
+  | "IN-02"
+  | "IN-03"
+  | "IN-04"
+  | "IN-05"
+  | "IN-06"
+  | "IN-07"
+  | "IN-08"
+  | "IN-GROUP-01"
+  | "IN-GROUP-02"
+  | "IN-GROUP-03"
+  | "DOWN-01"
+  | "DOWN-02";
+
+export interface RecoveryFileSystem {
+  chmod: typeof chmodSync;
+  close: typeof closeSync;
+  exists: typeof existsSync;
+  fsync: typeof fsyncSync;
+  lstat: typeof lstatSync;
+  mkdir: typeof mkdirSync;
+  open: typeof openSync;
+  readFile: typeof readFileSync;
+  readDir: typeof readdirSync;
+  rename: typeof renameSync;
+  remove: typeof rmSync;
+  stat: typeof statSync;
+  unlink: typeof unlinkSync;
+  writeFile: typeof writeFileSync;
+}
+
+const NODE_RECOVERY_FILE_SYSTEM: RecoveryFileSystem = {
+  chmod: chmodSync,
+  close: closeSync,
+  exists: existsSync,
+  fsync: fsyncSync,
+  lstat: lstatSync,
+  mkdir: mkdirSync,
+  open: openSync,
+  readFile: readFileSync,
+  readDir: readdirSync,
+  rename: renameSync,
+  remove: rmSync,
+  stat: statSync,
+  unlink: unlinkSync,
+  writeFile: writeFileSync,
+};
+
+export interface RecoveryReassignmentBindingValidation {
+  reassignment: RecoveryReassignmentRecord;
+  currentIdentity: RecoveryIdentity;
+  expectedBinding: "new-owner" | "old-owner-restored";
+}
+
+export interface RecoveryStoreOpenOptions {
+  profile: string;
+  agentDir?: string;
+  rootPath?: string;
+  now?: () => number;
+  randomId?: () => string;
+  fs?: Partial<RecoveryFileSystem>;
+  fault?: (faultId: RecoveryInboundFaultId) => void;
+  /** Deterministic test seam; production remains capped by the frozen 512 MiB limit. */
+  quotaBytes?: number;
+  isIdentityAuthenticated?: (identity: RecoveryIdentity) => boolean;
+  validateReassignmentBinding?: (
+    input: RecoveryReassignmentBindingValidation,
+  ) => boolean;
+  /** Opaque-handle derivation seam used only for deterministic collision tests. */
+  actionId?: (stableInput: string) => string;
+  /** Deterministic test seams; production remains capped by the frozen limits. */
+  terminalMetadataMaxRecords?: number;
+  terminalMetadataMaxBytes?: number;
+}
+
+export interface RecoveryInboundAdmissionInput {
+  recordId: string;
+  payload: Uint8Array;
+  spool?: readonly Uint8Array[];
+}
+
+export interface RecoveryInboundAdmissionProof {
+  version: 1;
+  updateId: number;
+  recordId: string;
+  turnId: string;
+  profile: string;
+  target: TelegramTarget;
+  ownerId: string;
+  registrationGeneration: string;
+  sessionGeneration: number;
+  admissionRevision: number;
+  disposition: "admitted" | "terminal";
+}
+
+export interface RecoveryInboundMaterializationInput extends RecoveryInboundAdmissionInput {
+  claim: RecoveryIdentityClaim;
+  /** Canonical queue turn shared by every member of one materialized group. */
+  turnId?: string;
+  /** Exact prior raw-update payload allowed to be replaced after replay drain. */
+  previousPayload?: Uint8Array;
+}
+
+export interface RecoveryDispatchClaim {
+  recordId: string;
+  claim: RecoveryIdentityClaim;
+}
+
+export interface RecoveryIdentityClaim {
+  identity: RecoveryIdentity;
+}
+
+export interface RecoveryInboundDrainItem {
+  record: RecoveryInboundRecord;
+  payload: Uint8Array;
+  spool: Uint8Array[];
+}
+
+export interface RecoveryInboundRetryResult extends RecoveryInboundDrainItem {
+  duplicationWarning: true;
+}
+
+export interface RecoveryInboundActionResult {
+  actionId: string;
+  turnId: string;
+  state: RecoveryInboundState;
+  payload?: Uint8Array;
+  spool: Uint8Array[];
+  duplicationWarning?: true;
+}
+
+export interface RecoveryStatusItem {
+  id: string;
+  actionId: string;
+  family: "inbound" | "outbound" | "bus";
+  state: RecoveryInboundState | RecoveryOutboundState | RecoveryBusState;
+  ageMs: number;
+  requiredAction: "drain" | "retry-or-discard" | "none";
+}
+
+export interface RecoveryMetadataStatus {
+  profile: string;
+  mode: RecoveryStoreMode;
+  admissionEnabled: boolean;
+  committedUpdateId: number | null;
+  counts: Record<RecoveryInboundState, number>;
+  quota: RecoveryQuotaAccounting & { limitBytes: number };
+  oldestUnresolvedAgeMs: number | null;
+  items: RecoveryStatusItem[];
+  incidents: readonly string[];
+}
+
+export interface RecoveryDowngradePreflight {
+  safe: boolean;
+  blockerCount: number;
+  blockers: RecoveryStatusItem[];
+}
+
+export interface RecoveryReassignmentRequest {
+  target: TelegramTarget;
+  oldOwner: RecoveryOwnerIdentity;
+  newIdentity: RecoveryIdentity;
+}
+
+export interface RecoveryOrphanReassignmentCandidate {
+  actionId: string;
+  unresolvedCount: number;
+  oldestAgeMs: number;
+  states: string[];
+}
+
+export interface RecoveryReassignmentActionResult {
+  actionId: string;
+  state: RecoveryReassignmentState;
+  unresolvedCount: number;
+}
+
+export class RecoveryQuotaExceededError extends Error {
+  readonly requiredBytes: number;
+  readonly limitBytes: number;
+
+  constructor(requiredBytes: number, limitBytes: number) {
+    super(
+      `Recovery admission requires ${requiredBytes} bytes but the profile limit is ${limitBytes}`,
+    );
+    this.name = "RecoveryQuotaExceededError";
+    this.requiredBytes = requiredBytes;
+    this.limitBytes = limitBytes;
+  }
+}
+
+export class RecoveryQuarantineError extends Error {
+  readonly quarantinePaths: readonly string[];
+
+  constructor(quarantinePaths: readonly string[]) {
+    super(
+      "Recovery store is quarantined; explicit compatible restore is required",
+    );
+    this.name = "RecoveryQuarantineError";
+    this.quarantinePaths = quarantinePaths;
+  }
+}
+
+export function resolveRecoveryStorePath(
+  profile: string,
+  agentDir?: string,
+): string {
+  readProfile(profile, "$profile");
+  return join(
+    resolveTelegramTempDir(agentDir),
+    `${RECOVERY_STORE_DIRECTORY_NAME}${getTelegramProfilePathSuffix(profile)}`,
+  );
+}
+
+function cloneSnapshot(snapshot: RecoverySnapshotV1): RecoverySnapshotV1 {
+  return structuredClone(snapshot);
+}
+
+function assertSafeFileId(id: string, path: string): void {
+  if (!RECOVERY_SAFE_FILE_ID_PATTERN.test(id)) {
+    throw new Error(`Invalid recovery file id at ${path}`);
+  }
+}
+
+function assertSnapshotFileIds(snapshot: RecoverySnapshotV1): void {
+  for (const record of [
+    ...snapshot.inbound,
+    ...snapshot.outbound,
+    ...snapshot.bus,
+  ]) {
+    if (record.payloadRef) {
+      assertSafeFileId(
+        record.payloadRef.payloadId,
+        `${record.recordId}.payloadId`,
+      );
+    }
+    for (const spool of record.spoolRefs) {
+      assertSafeFileId(spool.spoolId, `${record.recordId}.spoolId`);
+    }
+  }
+}
+
+function isInboundUnresolved(state: RecoveryInboundState): boolean {
+  return (RECOVERY_UNRESOLVED_INBOUND_STATES as readonly string[]).includes(
+    state,
+  );
+}
+
+function isInboundTerminal(state: RecoveryInboundState): boolean {
+  return state === "completed" || state === "explicitly-discarded";
+}
+
+function identitiesEqual(
+  left: RecoveryIdentity,
+  right: RecoveryIdentity,
+): boolean {
+  return (
+    left.profile === right.profile &&
+    left.sessionGeneration === right.sessionGeneration &&
+    areRecoveryTargetsEqual(left.target, right.target) &&
+    areRecoveryOwnersEqual(left.owner, right.owner)
+  );
+}
+
+function ownerTargetEqual(
+  identity: RecoveryIdentity,
+  profile: string,
+  target: TelegramTarget,
+  owner: RecoveryOwnerIdentity,
+): boolean {
+  return (
+    identity.profile === profile &&
+    areRecoveryTargetsEqual(identity.target, target) &&
+    areRecoveryOwnersEqual(identity.owner, owner)
+  );
+}
+
+function getConsumedHandoffRegistry(): Set<string> {
+  const globals = globalThis as Record<PropertyKey, unknown>;
+  const existing = globals[RECOVERY_HANDOFF_REGISTRY_KEY];
+  if (existing instanceof Set) return existing as Set<string>;
+  const created = new Set<string>();
+  globals[RECOVERY_HANDOFF_REGISTRY_KEY] = created;
+  return created;
+}
+
+function emptyCounts(): Record<RecoveryInboundState, number> {
+  return {
+    observed: 0,
+    admitted: 0,
+    "pre-dispatch": 0,
+    dispatching: 0,
+    completed: 0,
+    "execution-uncertain": 0,
+    "explicitly-discarded": 0,
+  };
+}
+
+function sha256Bytes(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function stableRedactedId(stableInput: string): string {
+  return createHash("sha256").update(stableInput).digest("hex").slice(0, 12);
+}
+
+function createInitialSnapshot(
+  profile: string,
+  nowMs: number,
+): RecoverySnapshotV1 {
+  return {
+    version: RECOVERY_SCHEMA_VERSION,
+    profile,
+    mode: "active",
+    revision: 0,
+    writtenAtMs: nowMs,
+    quota: {
+      recordBytes: 0,
+      payloadBytes: 0,
+      spoolBytes: 0,
+      reservedBytes: 0,
+      totalBytes: 0,
+    },
+    committedUpdateId: null,
+    inbound: [],
+    outbound: [],
+    bus: [],
+    reassignments: [],
+  };
+}
+
+function getQuarantineProfilePrefix(profile: string): string {
+  return `${RECOVERY_STORE_QUARANTINE_PREFIX}${profile.length}-${profile}-`;
+}
+
+function listQuarantines(
+  fs: RecoveryFileSystem,
+  rootPath: string,
+  profile: string,
+): string[] {
+  const parent = dirname(rootPath);
+  if (!fs.exists(parent)) return [];
+  const profilePrefix = getQuarantineProfilePrefix(profile);
+  return fs
+    .readDir(parent)
+    .filter((name) => {
+      if (!name.startsWith(profilePrefix)) return false;
+      const suffix = name.slice(profilePrefix.length);
+      if (!/^\d+-[a-zA-Z0-9_-]+$/u.test(suffix)) return false;
+      return fs.lstat(join(parent, name)).isDirectory();
+    })
+    .map((name) => join(parent, name))
+    .sort();
+}
+
+function fsyncPath(fs: RecoveryFileSystem, path: string): void {
+  const descriptor = fs.open(path, "r");
+  try {
+    fs.fsync(descriptor);
+  } finally {
+    fs.close(descriptor);
+  }
+}
+
+function physicalFileBytes(
+  fs: RecoveryFileSystem,
+  directory: string,
+): number {
+  let total = 0;
+  for (const name of fs.readDir(directory)) {
+    const path = join(directory, name);
+    const stat = fs.lstat(path);
+    if (stat.isDirectory()) {
+      total += physicalFileBytes(fs, path);
+    } else if (stat.isFile()) {
+      total += fs.stat(path).size;
+    } else {
+      throw new Error(`Unsupported recovery filesystem entry: ${path}`);
+    }
+    if (!Number.isSafeInteger(total)) {
+      throw new Error("Recovery physical byte accounting overflow");
+    }
+  }
+  return total;
+}
+
+function writePrivateFile(
+  fs: RecoveryFileSystem,
+  path: string,
+  content: Uint8Array | string,
+): void {
+  const descriptor = fs.open(path, "wx", RECOVERY_STORE_FILE_MODE);
+  try {
+    fs.writeFile(descriptor, content);
+    fs.fsync(descriptor);
+  } finally {
+    fs.close(descriptor);
+  }
+  fs.chmod(path, RECOVERY_STORE_FILE_MODE);
+}
+
+function referencedBytes(snapshot: RecoverySnapshotV1): {
+  payloadBytes: number;
+  spoolBytes: number;
+} {
+  const records = [...snapshot.inbound, ...snapshot.outbound, ...snapshot.bus];
+  return {
+    payloadBytes: records.reduce(
+      (total, record) => total + (record.payloadRef?.byteLength ?? 0),
+      0,
+    ),
+    spoolBytes: records.reduce(
+      (total, record) =>
+        total + record.spoolRefs.reduce((sum, ref) => sum + ref.byteLength, 0),
+      0,
+    ),
+  };
+}
+
+function serializeAccountedSnapshot(snapshot: RecoverySnapshotV1): string {
+  const bytes = referencedBytes(snapshot);
+  snapshot.quota.payloadBytes = bytes.payloadBytes;
+  snapshot.quota.spoolBytes = bytes.spoolBytes;
+  if (
+    !Number.isSafeInteger(snapshot.quota.reservedBytes) ||
+    snapshot.quota.reservedBytes < 0
+  ) {
+    throw new Error("Recovery reserved byte accounting is invalid");
+  }
+  let serialized = "";
+  let recordBytes = -1;
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    snapshot.quota.recordBytes = Math.max(0, recordBytes);
+    snapshot.quota.totalBytes =
+      snapshot.quota.recordBytes +
+      bytes.payloadBytes +
+      bytes.spoolBytes +
+      snapshot.quota.reservedBytes;
+    serialized = `${JSON.stringify(snapshot, null, 2)}\n`;
+    const next = Buffer.byteLength(serialized);
+    if (next === snapshot.quota.recordBytes) {
+      validateRecoverySnapshot(snapshot);
+      return serialized;
+    }
+    recordBytes = next;
+  }
+  throw new Error("Recovery snapshot byte accounting did not converge");
+}
+
+type RecoveryRecord =
+  RecoveryInboundRecord | RecoveryOutboundRecord | RecoveryBusRecord;
+
+function isTerminalRecord(record: RecoveryRecord): boolean {
+  switch (record.family) {
+    case "inbound":
+      return isInboundTerminal(record.state);
+    case "outbound":
+      return (
+        record.state === "delivered" || record.state === "explicitly-discarded"
+      );
+    case "bus":
+      return (
+        record.state === "completed" || record.state === "explicitly-discarded"
+      );
+  }
+}
+
+function isSuccessfulTerminalRecord(record: RecoveryRecord): boolean {
+  return (
+    (record.family === "inbound" && record.state === "completed") ||
+    (record.family === "outbound" && record.state === "delivered") ||
+    (record.family === "bus" && record.state === "completed")
+  );
+}
+
+function terminalMetadataBytes(record: RecoveryRecord): number {
+  const serialized = JSON.stringify(record, null, 2);
+  const lineCount = serialized.split("\n").length;
+  // Records are nested inside a pretty-printed snapshot array. Account for the
+  // additional four-space base indent on every line plus comma/newline framing.
+  return Buffer.byteLength(serialized) + lineCount * 4 + 2;
+}
+
+function makeBinaryPath(directory: string, id: string): string {
+  assertSafeFileId(id, "binary reference");
+  return join(directory, `${id}${RECOVERY_BINARY_FILE_SUFFIX}`);
+}
+
+function validateRecoveryStoreBackup(
+  fs: RecoveryFileSystem,
+  rootPath: string,
+  profile: string,
+): RecoverySnapshotV1 {
+  const payloadDirectory = join(rootPath, RECOVERY_PAYLOAD_DIRECTORY_NAME);
+  const spoolDirectory = join(rootPath, RECOVERY_SPOOL_DIRECTORY_NAME);
+  const materializedDirectory = join(
+    rootPath,
+    RECOVERY_MATERIALIZED_DIRECTORY_NAME,
+  );
+  const snapshotPath = join(rootPath, RECOVERY_SNAPSHOT_FILE_NAME);
+  for (const directory of [
+    rootPath,
+    payloadDirectory,
+    spoolDirectory,
+    materializedDirectory,
+  ]) {
+    if (!fs.exists(directory) || !fs.lstat(directory).isDirectory()) {
+      throw new Error(`Invalid recovery quarantine directory: ${directory}`);
+    }
+  }
+  if (!fs.exists(snapshotPath) || !fs.lstat(snapshotPath).isFile()) {
+    throw new Error("Recovery quarantine snapshot is missing");
+  }
+  const serialized = fs.readFile(snapshotPath, "utf8") as string;
+  const snapshot = parseRecoverySnapshot(serialized);
+  if (snapshot.profile !== profile || snapshot.mode !== "downgrade-exclusive") {
+    throw new Error("Recovery quarantine is incompatible with this profile");
+  }
+  if (
+    snapshot.quota.recordBytes !== Buffer.byteLength(serialized) ||
+    snapshot.quota.totalBytes > RECOVERY_PROFILE_QUOTA_BYTES
+  ) {
+    throw new Error("Recovery quarantine byte accounting mismatch");
+  }
+  assertSnapshotFileIds(snapshot);
+  const expectedRootEntries = new Set([
+    RECOVERY_SNAPSHOT_FILE_NAME,
+    RECOVERY_PAYLOAD_DIRECTORY_NAME,
+    RECOVERY_SPOOL_DIRECTORY_NAME,
+    RECOVERY_MATERIALIZED_DIRECTORY_NAME,
+  ]);
+  const rootEntries = fs.readDir(rootPath);
+  if (
+    rootEntries.length !== expectedRootEntries.size ||
+    rootEntries.some((name) => !expectedRootEntries.has(name))
+  ) {
+    throw new Error("Recovery quarantine contains unexpected root entries");
+  }
+  const expectedPayloadNames = new Set<string>();
+  const expectedSpoolNames = new Set<string>();
+  let physicalBinaryBytes = 0;
+  for (const record of [
+    ...snapshot.inbound,
+    ...snapshot.outbound,
+    ...snapshot.bus,
+  ]) {
+    if (record.payloadRef) {
+      expectedPayloadNames.add(
+        `${record.payloadRef.payloadId}${RECOVERY_BINARY_FILE_SUFFIX}`,
+      );
+      physicalBinaryBytes += record.payloadRef.byteLength;
+    }
+    for (const spool of record.spoolRefs) {
+      expectedSpoolNames.add(`${spool.spoolId}${RECOVERY_BINARY_FILE_SUFFIX}`);
+      physicalBinaryBytes += spool.byteLength;
+    }
+    const references: Array<{
+      path: string;
+      byteLength: number;
+      sha256: string;
+    }> = [
+      ...(record.payloadRef
+        ? [
+            {
+              path: makeBinaryPath(
+                payloadDirectory,
+                record.payloadRef.payloadId,
+              ),
+              byteLength: record.payloadRef.byteLength,
+              sha256: record.payloadRef.sha256,
+            },
+          ]
+        : []),
+      ...record.spoolRefs.map((reference) => ({
+        path: makeBinaryPath(spoolDirectory, reference.spoolId),
+        byteLength: reference.byteLength,
+        sha256: reference.sha256,
+      })),
+    ];
+    for (const reference of references) {
+      if (
+        !fs.exists(reference.path) ||
+        !fs.lstat(reference.path).isFile() ||
+        fs.stat(reference.path).size !== reference.byteLength
+      ) {
+        throw new Error("Recovery quarantine binary is missing or truncated");
+      }
+      const bytes = fs.readFile(reference.path) as Buffer;
+      if (sha256Bytes(bytes) !== reference.sha256) {
+        throw new Error("Recovery quarantine binary digest mismatch");
+      }
+    }
+  }
+  for (const [directory, expectedNames] of [
+    [payloadDirectory, expectedPayloadNames],
+    [spoolDirectory, expectedSpoolNames],
+  ] as const) {
+    const names = fs.readDir(directory);
+    if (
+      names.length !== expectedNames.size ||
+      names.some((name) => !expectedNames.has(name))
+    ) {
+      throw new Error("Recovery quarantine contains unexpected binary files");
+    }
+  }
+  if (fs.readDir(materializedDirectory).length !== 0) {
+    throw new Error("Recovery quarantine contains materialized cache files");
+  }
+  const actualPhysicalBytes = Buffer.byteLength(serialized) + physicalBinaryBytes;
+  if (
+    snapshot.quota.reservedBytes !== 0 ||
+    snapshot.quota.totalBytes !== actualPhysicalBytes
+  ) {
+    throw new Error("Recovery quarantine physical byte accounting mismatch");
+  }
+  for (const directory of [
+    rootPath,
+    payloadDirectory,
+    spoolDirectory,
+    materializedDirectory,
+  ]) {
+    fs.chmod(directory, RECOVERY_STORE_DIRECTORY_MODE);
+  }
+  fs.chmod(snapshotPath, RECOVERY_STORE_FILE_MODE);
+  for (const directory of [payloadDirectory, spoolDirectory]) {
+    for (const name of fs.readDir(directory)) {
+      const path = join(directory, name);
+      if (fs.lstat(path).isFile()) fs.chmod(path, RECOVERY_STORE_FILE_MODE);
+    }
+  }
+  return snapshot;
+}
+
+export class RecoveryStore {
+  readonly profile: string;
+  readonly rootPath: string;
+  readonly snapshotPath: string;
+  readonly payloadDirectory: string;
+  readonly spoolDirectory: string;
+  readonly materializedDirectory: string;
+  readonly quotaBytes: number;
+
+  readonly #fs: RecoveryFileSystem;
+  readonly #now: () => number;
+  readonly #randomId: () => string;
+  readonly #fault?: (faultId: RecoveryInboundFaultId) => void;
+  readonly #isIdentityAuthenticated?: (identity: RecoveryIdentity) => boolean;
+  readonly #validateReassignmentBinding?: (
+    input: RecoveryReassignmentBindingValidation,
+  ) => boolean;
+  readonly #actionId: (stableInput: string) => string;
+  readonly #terminalMetadataMaxRecords: number;
+  readonly #terminalMetadataMaxBytes: number;
+  readonly #incidents: string[] = [];
+  #admissionDisabled = false;
+
+  constructor(options: RecoveryStoreOpenOptions) {
+    this.profile = readProfile(options.profile, "$profile");
+    this.rootPath =
+      options.rootPath ??
+      resolveRecoveryStorePath(this.profile, options.agentDir);
+    this.snapshotPath = join(this.rootPath, RECOVERY_SNAPSHOT_FILE_NAME);
+    this.payloadDirectory = join(
+      this.rootPath,
+      RECOVERY_PAYLOAD_DIRECTORY_NAME,
+    );
+    this.spoolDirectory = join(this.rootPath, RECOVERY_SPOOL_DIRECTORY_NAME);
+    this.materializedDirectory = join(
+      this.rootPath,
+      RECOVERY_MATERIALIZED_DIRECTORY_NAME,
+    );
+    this.quotaBytes = options.quotaBytes ?? RECOVERY_PROFILE_QUOTA_BYTES;
+    if (
+      !Number.isSafeInteger(this.quotaBytes) ||
+      this.quotaBytes <= 0 ||
+      this.quotaBytes > RECOVERY_PROFILE_QUOTA_BYTES
+    ) {
+      throw new Error("Invalid recovery quota limit");
+    }
+    this.#fs = { ...NODE_RECOVERY_FILE_SYSTEM, ...options.fs };
+    this.#now = options.now ?? Date.now;
+    this.#randomId = options.randomId ?? randomUUID;
+    this.#fault = options.fault;
+    this.#isIdentityAuthenticated = options.isIdentityAuthenticated;
+    this.#validateReassignmentBinding = options.validateReassignmentBinding;
+    this.#actionId = options.actionId ?? stableRedactedId;
+    this.#terminalMetadataMaxRecords =
+      options.terminalMetadataMaxRecords ??
+      RECOVERY_TERMINAL_METADATA_MAX_RECORDS;
+    this.#terminalMetadataMaxBytes =
+      options.terminalMetadataMaxBytes ?? RECOVERY_TERMINAL_METADATA_MAX_BYTES;
+    if (
+      !Number.isSafeInteger(this.#terminalMetadataMaxRecords) ||
+      this.#terminalMetadataMaxRecords <= 0 ||
+      this.#terminalMetadataMaxRecords >
+        RECOVERY_TERMINAL_METADATA_MAX_RECORDS ||
+      !Number.isSafeInteger(this.#terminalMetadataMaxBytes) ||
+      this.#terminalMetadataMaxBytes <= 0 ||
+      this.#terminalMetadataMaxBytes > RECOVERY_TERMINAL_METADATA_MAX_BYTES
+    ) {
+      throw new Error("Invalid recovery terminal metadata limit");
+    }
+  }
+
+  initialize(): this {
+    const parent = dirname(this.rootPath);
+    this.#fs.mkdir(parent, {
+      recursive: true,
+      mode: RECOVERY_STORE_DIRECTORY_MODE,
+    });
+    this.#fs.chmod(parent, RECOVERY_STORE_DIRECTORY_MODE);
+    withTelegramFileTransaction(`${this.rootPath}.transaction`, () => {
+      if (!this.#fs.exists(this.rootPath)) {
+        const quarantines = listQuarantines(
+          this.#fs,
+          this.rootPath,
+          this.profile,
+        );
+        if (quarantines.length > 0)
+          throw new RecoveryQuarantineError(quarantines);
+        this.#fs.mkdir(this.rootPath, {
+          mode: RECOVERY_STORE_DIRECTORY_MODE,
+        });
+        this.#fs.mkdir(this.payloadDirectory, {
+          mode: RECOVERY_STORE_DIRECTORY_MODE,
+        });
+        this.#fs.mkdir(this.spoolDirectory, {
+          mode: RECOVERY_STORE_DIRECTORY_MODE,
+        });
+        this.#fs.mkdir(this.materializedDirectory, {
+          mode: RECOVERY_STORE_DIRECTORY_MODE,
+        });
+        this.#fs.chmod(this.rootPath, RECOVERY_STORE_DIRECTORY_MODE);
+        this.#fs.chmod(this.payloadDirectory, RECOVERY_STORE_DIRECTORY_MODE);
+        this.#fs.chmod(this.spoolDirectory, RECOVERY_STORE_DIRECTORY_MODE);
+        this.#fs.chmod(
+          this.materializedDirectory,
+          RECOVERY_STORE_DIRECTORY_MODE,
+        );
+        const initial = createInitialSnapshot(this.profile, this.#now());
+        this.#writeSnapshotLocked(initial);
+        fsyncPath(this.#fs, parent);
+      }
+      if (!this.#fs.exists(this.materializedDirectory)) {
+        this.#fs.mkdir(this.materializedDirectory, {
+          mode: RECOVERY_STORE_DIRECTORY_MODE,
+        });
+        fsyncPath(this.#fs, this.rootPath);
+      }
+      this.#assertPrivateStoreShape();
+      let snapshot = this.#readSnapshotLocked();
+      const dispatching = snapshot.inbound.filter(
+        (record) => record.state === "dispatching",
+      );
+      if (dispatching.length > 0) {
+        snapshot = cloneSnapshot(snapshot);
+        const revision = snapshot.revision + 1;
+        const nowMs = this.#now();
+        for (const record of snapshot.inbound) {
+          if (record.state !== "dispatching") continue;
+          record.state = "execution-uncertain";
+          record.stateRevision = revision;
+          record.updatedAtMs = nowMs;
+        }
+        snapshot.revision = revision;
+        snapshot.writtenAtMs = nowMs;
+        this.#writeSnapshotLocked(snapshot);
+        this.#incidents.push("orphaned-dispatch-marked-uncertain");
+      }
+      this.#admissionDisabled = snapshot.mode !== "active";
+      this.#reconcileFilesLocked(snapshot);
+    });
+    return this;
+  }
+
+  #assertPrivateStoreShape(): void {
+    for (const directory of [
+      this.rootPath,
+      this.payloadDirectory,
+      this.spoolDirectory,
+      this.materializedDirectory,
+    ]) {
+      if (
+        !this.#fs.exists(directory) ||
+        !this.#fs.lstat(directory).isDirectory()
+      ) {
+        throw new Error(`Invalid recovery directory: ${directory}`);
+      }
+      this.#fs.chmod(directory, RECOVERY_STORE_DIRECTORY_MODE);
+    }
+    if (!this.#fs.exists(this.snapshotPath)) {
+      throw new Error(`Missing recovery snapshot: ${this.snapshotPath}`);
+    }
+    if (!this.#fs.lstat(this.snapshotPath).isFile()) {
+      throw new Error(`Invalid recovery snapshot file: ${this.snapshotPath}`);
+    }
+    this.#fs.chmod(this.snapshotPath, RECOVERY_STORE_FILE_MODE);
+  }
+
+  #readSnapshotLocked(): RecoverySnapshotV1 {
+    if (
+      !this.#fs.exists(this.rootPath) ||
+      !this.#fs.exists(this.snapshotPath)
+    ) {
+      this.#admissionDisabled = true;
+      throw new Error("Recovery store is closed or quarantined");
+    }
+    const serialized = this.#fs.readFile(this.snapshotPath, "utf8") as string;
+    const snapshot = parseRecoverySnapshot(serialized);
+    if (snapshot.profile !== this.profile) {
+      throw new Error("Recovery snapshot profile mismatch");
+    }
+    assertSnapshotFileIds(snapshot);
+    const actualBytes = Buffer.byteLength(serialized);
+    if (snapshot.quota.recordBytes !== actualBytes) {
+      throw new Error("Recovery snapshot byte accounting mismatch");
+    }
+    if (snapshot.quota.totalBytes > this.quotaBytes) {
+      throw new RecoveryQuotaExceededError(
+        snapshot.quota.totalBytes,
+        this.quotaBytes,
+      );
+    }
+    return snapshot;
+  }
+
+  #readSnapshotForMutationLocked(): RecoverySnapshotV1 {
+    const snapshot = this.#readSnapshotLocked();
+    this.#reconcileFilesLocked(snapshot);
+    return this.#readSnapshotLocked();
+  }
+
+  #writeSnapshotLocked(snapshot: RecoverySnapshotV1): void {
+    const serialized = serializeAccountedSnapshot(snapshot);
+    const publicationPeakBytes =
+      physicalFileBytes(this.#fs, this.rootPath) +
+      Buffer.byteLength(serialized);
+    if (
+      snapshot.quota.totalBytes > this.quotaBytes ||
+      publicationPeakBytes > this.quotaBytes
+    ) {
+      throw new RecoveryQuotaExceededError(
+        Math.max(snapshot.quota.totalBytes, publicationPeakBytes),
+        this.quotaBytes,
+      );
+    }
+    const tempPath = `${this.snapshotPath}${RECOVERY_TEMP_FILE_MARKER}${process.pid}-${this.#randomId()}`;
+    try {
+      writePrivateFile(this.#fs, tempPath, serialized);
+      this.#fs.rename(tempPath, this.snapshotPath);
+      this.#fs.chmod(this.snapshotPath, RECOVERY_STORE_FILE_MODE);
+      fsyncPath(this.#fs, this.rootPath);
+    } finally {
+      if (this.#fs.exists(tempPath)) this.#fs.unlink(tempPath);
+    }
+  }
+
+  #reconcileFilesLocked(snapshot: RecoverySnapshotV1): void {
+    let rootChanged = false;
+    for (const name of this.#fs.readDir(this.rootPath)) {
+      if (
+        name === RECOVERY_SNAPSHOT_FILE_NAME ||
+        name === RECOVERY_PAYLOAD_DIRECTORY_NAME ||
+        name === RECOVERY_SPOOL_DIRECTORY_NAME ||
+        name === RECOVERY_MATERIALIZED_DIRECTORY_NAME
+      ) {
+        continue;
+      }
+      const path = join(this.rootPath, name);
+      if (
+        name.startsWith(
+          `${RECOVERY_SNAPSHOT_FILE_NAME}${RECOVERY_TEMP_FILE_MARKER}`,
+        )
+      ) {
+        this.#fs.remove(path, { force: true, recursive: true });
+        rootChanged = true;
+        this.#incidents.push("orphan-snapshot-tail-removed");
+        continue;
+      }
+      throw new Error(`Unexpected recovery store entry: ${path}`);
+    }
+    if (rootChanged) fsyncPath(this.#fs, this.rootPath);
+    const expectedPayloads = new Set<string>();
+    const expectedSpools = new Set<string>();
+    for (const record of [
+      ...snapshot.inbound,
+      ...snapshot.outbound,
+      ...snapshot.bus,
+    ]) {
+      if (record.payloadRef) {
+        expectedPayloads.add(
+          `${record.payloadRef.payloadId}${RECOVERY_BINARY_FILE_SUFFIX}`,
+        );
+      }
+      for (const spool of record.spoolRefs) {
+        expectedSpools.add(`${spool.spoolId}${RECOVERY_BINARY_FILE_SUFFIX}`);
+      }
+    }
+    for (const [directory, expected] of [
+      [this.payloadDirectory, expectedPayloads],
+      [this.spoolDirectory, expectedSpools],
+    ] as const) {
+      let directoryChanged = false;
+      for (const name of this.#fs.readDir(directory)) {
+        const path = join(directory, name);
+        if (name.includes(RECOVERY_TEMP_FILE_MARKER) || !expected.has(name)) {
+          this.#fs.remove(path, { force: true, recursive: true });
+          directoryChanged = true;
+          this.#incidents.push("orphan-recovery-file-removed");
+          continue;
+        }
+        if (!this.#fs.lstat(path).isFile()) {
+          throw new Error(`Invalid recovery binary file: ${path}`);
+        }
+        this.#fs.chmod(path, RECOVERY_STORE_FILE_MODE);
+      }
+      if (directoryChanged) fsyncPath(this.#fs, directory);
+    }
+    for (const record of [
+      ...snapshot.inbound,
+      ...snapshot.outbound,
+      ...snapshot.bus,
+    ]) {
+      if (record.payloadRef) {
+        this.#readVerifiedBinary(
+          this.payloadDirectory,
+          record.payloadRef,
+          record.recordId,
+        );
+      }
+      for (const spool of record.spoolRefs) {
+        this.#readVerifiedBinary(this.spoolDirectory, spool, record.recordId);
+      }
+    }
+    const reservedBytes = this.#reconcileMaterializedFilesLocked(snapshot);
+    if (snapshot.quota.reservedBytes !== reservedBytes) {
+      snapshot.quota.reservedBytes = reservedBytes;
+      this.#writeSnapshotLocked(snapshot);
+    }
+  }
+
+  #reconcileMaterializedFilesLocked(snapshot: RecoverySnapshotV1): number {
+    const liveRecords = new Map(
+      snapshot.inbound
+        .filter(
+          (record) =>
+            (record.state === "pre-dispatch" ||
+              record.state === "dispatching") &&
+            record.spoolRefs.length > 0,
+        )
+        .map((record) => [record.recordId, record] as const),
+    );
+    let changed = false;
+    let reservedBytes = 0;
+    for (const name of this.#fs.readDir(this.materializedDirectory)) {
+      const path = join(this.materializedDirectory, name);
+      const record = liveRecords.get(name);
+      if (
+        name.includes(RECOVERY_TEMP_FILE_MARKER) ||
+        !RECOVERY_SAFE_FILE_ID_PATTERN.test(name) ||
+        !record
+      ) {
+        this.#fs.remove(path, { force: true, recursive: true });
+        changed = true;
+        this.#incidents.push("orphan-materialized-cache-removed");
+        continue;
+      }
+      try {
+        reservedBytes += this.#validateMaterializedDirectoryLocked(
+          path,
+          record,
+        ).byteLength;
+      } catch {
+        this.#fs.remove(path, { force: true, recursive: true });
+        changed = true;
+        this.#incidents.push("corrupt-materialized-cache-removed");
+      }
+    }
+    if (changed) fsyncPath(this.#fs, this.materializedDirectory);
+    return reservedBytes;
+  }
+
+  #countMaterializedBytesLocked(path = this.materializedDirectory): number {
+    let total = 0;
+    for (const name of this.#fs.readDir(path)) {
+      const child = join(path, name);
+      const stat = this.#fs.lstat(child);
+      if (stat.isDirectory()) {
+        total += this.#countMaterializedBytesLocked(child);
+      } else if (stat.isFile()) {
+        total += this.#fs.stat(child).size;
+      }
+      if (!Number.isSafeInteger(total)) {
+        throw new Error("Recovery materialized byte accounting overflow");
+      }
+    }
+    return total;
+  }
+
+  #refreshMaterializedQuotaFailSoftLocked(
+    snapshot: RecoverySnapshotV1,
+    incident: string,
+  ): void {
+    try {
+      this.#reconcileFilesLocked(snapshot);
+      return;
+    } catch {
+      this.#incidents.push(incident);
+    }
+    try {
+      const current = this.#readSnapshotLocked();
+      const actualBytes = this.#countMaterializedBytesLocked();
+      if (current.quota.reservedBytes !== actualBytes) {
+        current.quota.reservedBytes = actualBytes;
+        this.#writeSnapshotLocked(current);
+      }
+    } catch {
+      this.#incidents.push("materialized-quota-accounting-failed");
+    }
+  }
+
+  #validateMaterializedDirectoryLocked(
+    path: string,
+    record: RecoveryInboundRecord,
+  ): { paths: string[]; byteLength: number } {
+    if (!this.#fs.lstat(path).isDirectory()) {
+      throw new Error("Recovery materialized cache is not a directory");
+    }
+    this.#fs.chmod(path, RECOVERY_STORE_DIRECTORY_MODE);
+    const names = this.#fs.readDir(path).sort();
+    if (names.length !== record.spoolRefs.length) {
+      throw new Error("Recovery materialized cache file count mismatch");
+    }
+    let byteLength = 0;
+    const paths: string[] = [];
+    for (let index = 0; index < record.spoolRefs.length; index += 1) {
+      const name = names[index];
+      const reference = record.spoolRefs[index];
+      if (
+        !name ||
+        !reference ||
+        !name.startsWith(`${String(index).padStart(3, "0")}-`)
+      ) {
+        throw new Error("Recovery materialized cache index mismatch");
+      }
+      const filePath = join(path, name);
+      if (
+        !this.#fs.lstat(filePath).isFile() ||
+        this.#fs.stat(filePath).size !== reference.byteLength
+      ) {
+        throw new Error("Recovery materialized cache byte mismatch");
+      }
+      const bytes = this.#fs.readFile(filePath) as Buffer;
+      if (sha256Bytes(bytes) !== reference.sha256) {
+        throw new Error("Recovery materialized cache digest mismatch");
+      }
+      this.#fs.chmod(filePath, RECOVERY_STORE_FILE_MODE);
+      byteLength += reference.byteLength;
+      paths.push(filePath);
+    }
+    return { paths, byteLength };
+  }
+
+  #verifyRecordBinaries(record: RecoveryRecord): void {
+    if (record.payloadRef) {
+      this.#readVerifiedBinary(
+        this.payloadDirectory,
+        record.payloadRef,
+        record.recordId,
+      );
+    }
+    for (const spool of record.spoolRefs) {
+      this.#readVerifiedBinary(this.spoolDirectory, spool, record.recordId);
+    }
+  }
+
+  #readVerifiedBinary(
+    directory: string,
+    reference: RecoveryPayloadReference | RecoverySpoolReference,
+    recordId: string,
+  ): Buffer {
+    const id =
+      "payloadId" in reference ? reference.payloadId : reference.spoolId;
+    const path = makeBinaryPath(directory, id);
+    if (
+      !this.#fs.exists(path) ||
+      this.#fs.stat(path).size !== reference.byteLength
+    ) {
+      throw new Error(`Missing or truncated recovery binary for ${recordId}`);
+    }
+    const bytes = this.#fs.readFile(path) as Buffer;
+    if (sha256Bytes(bytes) !== reference.sha256) {
+      throw new Error(`Recovery binary digest mismatch for ${recordId}`);
+    }
+    return bytes;
+  }
+
+  #assertActive(snapshot: RecoverySnapshotV1): void {
+    if (this.#admissionDisabled || snapshot.mode !== "active") {
+      throw new Error("Recovery admission is disabled");
+    }
+  }
+
+  #assertNotFencedByReassignment(
+    snapshot: RecoverySnapshotV1,
+    identity: RecoveryIdentity,
+  ): void {
+    if (
+      snapshot.reassignments.some(
+        (entry) =>
+          entry.state !== "recovery-grant-committed" &&
+          entry.state !== "cancelled-before-transfer" &&
+          identity.profile === entry.profile &&
+          areRecoveryTargetsEqual(identity.target, entry.target),
+      )
+    ) {
+      throw new Error("Recovery inbound admission is fenced by reassignment");
+    }
+  }
+
+  #authenticate(identity: RecoveryIdentity): void {
+    const parsed = readIdentity(identity, "$claim.identity");
+    if (parsed.profile !== this.profile) {
+      throw new Error("Recovery claim profile mismatch");
+    }
+    if (!this.#isIdentityAuthenticated?.(parsed)) {
+      throw new Error("Recovery identity is not currently authenticated");
+    }
+  }
+
+  #hasCommittedGrant(
+    snapshot: RecoverySnapshotV1,
+    record: RecoveryInboundRecord,
+    identity: RecoveryIdentity,
+  ): boolean {
+    return snapshot.reassignments.some(
+      (entry) =>
+        entry.state === "recovery-grant-committed" &&
+        entry.unresolvedRecordIds.includes(record.recordId) &&
+        entry.profile === identity.profile &&
+        areRecoveryTargetsEqual(entry.target, identity.target) &&
+        areRecoveryOwnersEqual(entry.newOwner, identity.owner) &&
+        entry.newSessionGeneration === identity.sessionGeneration,
+    );
+  }
+
+  #assertClaim(
+    snapshot: RecoverySnapshotV1,
+    record: RecoveryInboundRecord,
+    claim: RecoveryIdentityClaim,
+  ): void {
+    this.#authenticate(claim.identity);
+    const blockingReassignment = snapshot.reassignments.some(
+      (entry) =>
+        entry.unresolvedRecordIds.includes(record.recordId) &&
+        entry.state !== "recovery-grant-committed" &&
+        entry.state !== "cancelled-before-transfer",
+    );
+    if (blockingReassignment) {
+      throw new Error("Recovery record is fenced by a pending reassignment");
+    }
+    if (
+      !identitiesEqual(record.identity, claim.identity) &&
+      !this.#hasCommittedGrant(snapshot, record, claim.identity)
+    ) {
+      throw new Error("Recovery record identity claim denied");
+    }
+  }
+
+  #commit<T>(
+    mutate: (
+      snapshot: RecoverySnapshotV1,
+      revision: number,
+      nowMs: number,
+      deleteAfterCommit: string[],
+    ) => T,
+  ): T {
+    return withTelegramFileTransaction(`${this.rootPath}.transaction`, () => {
+      const current = this.#readSnapshotForMutationLocked();
+      const snapshot = cloneSnapshot(current);
+      const revision = current.revision + 1;
+      const nowMs = this.#now();
+      const deleteAfterCommit: string[] = [];
+      const result = mutate(snapshot, revision, nowMs, deleteAfterCommit);
+      snapshot.revision = revision;
+      snapshot.writtenAtMs = nowMs;
+      this.#writeSnapshotLocked(snapshot);
+      const cleanedDirectories = new Set<string>();
+      for (const path of deleteAfterCommit) {
+        try {
+          this.#fs.remove(path, { force: true, recursive: true });
+          cleanedDirectories.add(dirname(path));
+        } catch {
+          this.#incidents.push("post-commit-cleanup-failed");
+        }
+      }
+      for (const directory of cleanedDirectories) {
+        try {
+          fsyncPath(this.#fs, directory);
+        } catch {
+          this.#incidents.push("post-commit-cleanup-fsync-failed");
+        }
+      }
+      if (
+        deleteAfterCommit.some(
+          (path) => dirname(path) === this.materializedDirectory,
+        )
+      ) {
+        this.#refreshMaterializedQuotaFailSoftLocked(
+          snapshot,
+          "post-commit-quota-refresh-failed",
+        );
+      }
+      return result;
+    });
+  }
+
+  observeInbound(
+    updateId: number,
+    identity: RecoveryIdentity,
+  ): RecoveryInboundRecord {
+    readSafeInteger(updateId, "$updateId", { minimum: 0 });
+    const parsedIdentity = readIdentity(identity, "$identity");
+    if (parsedIdentity.profile !== this.profile) {
+      throw new Error("Recovery identity profile mismatch");
+    }
+    return withTelegramFileTransaction(`${this.rootPath}.transaction`, () => {
+      const current = this.#readSnapshotForMutationLocked();
+      this.#assertActive(current);
+      const existing = current.inbound.find(
+        (record) => record.updateId === updateId && !record.linkedAttemptOf,
+      );
+      if (existing) {
+        if (!identitiesEqual(existing.identity, parsedIdentity)) {
+          throw new Error("Recovery update id collision with another identity");
+        }
+        this.#verifyRecordBinaries(existing);
+        return structuredClone(existing);
+      }
+      this.#assertNotFencedByReassignment(current, parsedIdentity);
+      this.#fault?.("IN-01");
+      const nowMs = this.#now();
+      const revision = current.revision + 1;
+      const snapshot = cloneSnapshot(current);
+      const record: RecoveryInboundRecord = {
+        family: "inbound",
+        recordId: this.#randomId(),
+        updateId,
+        turnId: this.#randomId(),
+        state: "observed",
+        identity: parsedIdentity,
+        createdRevision: revision,
+        stateRevision: revision,
+        createdAtMs: nowMs,
+        updatedAtMs: nowMs,
+        spoolRefs: [],
+      };
+      snapshot.inbound.push(record);
+      snapshot.revision = revision;
+      snapshot.writtenAtMs = nowMs;
+      this.#writeSnapshotLocked(snapshot);
+      return structuredClone(record);
+    });
+  }
+
+  recordTerminalInboundDisposition(
+    updateId: number,
+    identity: RecoveryIdentity,
+    reason: RecoveryInboundTerminalReason,
+  ): RecoveryInboundRecord {
+    readSafeInteger(updateId, "$updateId", { minimum: 0 });
+    const parsedIdentity = readIdentity(identity, "$identity");
+    readEnum(reason, "$reason", RECOVERY_INBOUND_TERMINAL_REASONS);
+    if (parsedIdentity.profile !== this.profile) {
+      throw new Error("Recovery identity profile mismatch");
+    }
+    return withTelegramFileTransaction(`${this.rootPath}.transaction`, () => {
+      const current = this.#readSnapshotForMutationLocked();
+      this.#assertActive(current);
+      this.#assertNotFencedByReassignment(current, parsedIdentity);
+      const existing = current.inbound.find(
+        (record) => record.updateId === updateId && !record.linkedAttemptOf,
+      );
+      if (existing) {
+        if (!identitiesEqual(existing.identity, parsedIdentity)) {
+          throw new Error("Recovery update id collision with another identity");
+        }
+        if (isInboundTerminal(existing.state)) {
+          if (existing.terminalReason !== reason) {
+            throw new Error("Recovery terminal disposition reason collision");
+          }
+          this.#verifyRecordBinaries(existing);
+          return structuredClone(existing);
+        }
+        if (existing.state !== "observed") {
+          throw new Error(
+            "Admitted recovery work cannot become an ignored disposition",
+          );
+        }
+      }
+      const nowMs = this.#now();
+      const revision = current.revision + 1;
+      const snapshot = cloneSnapshot(current);
+      const record = existing
+        ? this.#getInbound(snapshot, existing.recordId)
+        : {
+            family: "inbound" as const,
+            recordId: this.#randomId(),
+            updateId,
+            turnId: this.#randomId(),
+            state: "explicitly-discarded" as const,
+            terminalReason: reason,
+            identity: parsedIdentity,
+            createdRevision: revision,
+            stateRevision: revision,
+            createdAtMs: nowMs,
+            updatedAtMs: nowMs,
+            spoolRefs: [],
+          };
+      if (existing) {
+        record.state = "explicitly-discarded";
+        record.admissionRevision = revision;
+        record.terminalReason = reason;
+        record.stateRevision = revision;
+        record.updatedAtMs = nowMs;
+      } else {
+        record.admissionRevision = revision;
+        snapshot.inbound.push(record);
+      }
+      snapshot.revision = revision;
+      snapshot.writtenAtMs = nowMs;
+      this.#writeSnapshotLocked(snapshot);
+      return structuredClone(record);
+    });
+  }
+
+  admitInbound(input: RecoveryInboundAdmissionInput): RecoveryInboundRecord {
+    return withTelegramFileTransaction(`${this.rootPath}.transaction`, () => {
+      const current = this.#readSnapshotForMutationLocked();
+      this.#assertActive(current);
+      const existing = current.inbound.find(
+        (record) => record.recordId === input.recordId,
+      );
+      if (!existing) throw new Error("Unknown recovery inbound record");
+      if (existing.state !== "observed") {
+        if (isInboundTerminal(existing.state)) {
+          this.#verifyRecordBinaries(existing);
+          return structuredClone(existing);
+        }
+        this.#assertAdmissionBytes(existing, input);
+        return structuredClone(existing);
+      }
+
+      const nowMs = this.#now();
+      const revision = current.revision + 1;
+      const snapshot = cloneSnapshot(current);
+      const record = snapshot.inbound.find(
+        (entry) => entry.recordId === input.recordId,
+      )!;
+      const payloadId = this.#randomId();
+      assertSafeFileId(payloadId, "$payloadId");
+      const spoolIds = (input.spool ?? []).map(() => {
+        const id = this.#randomId();
+        assertSafeFileId(id, "$spoolId");
+        return id;
+      });
+      record.payloadRef = {
+        payloadId,
+        byteLength: input.payload.byteLength,
+        sha256: sha256Bytes(input.payload),
+      };
+      record.spoolRefs = spoolIds.map((spoolId, index) => ({
+        spoolId,
+        byteLength: input.spool![index]!.byteLength,
+        sha256: sha256Bytes(input.spool![index]!),
+      }));
+      record.state = "admitted";
+      record.admissionRevision = revision;
+      record.stateRevision = revision;
+      record.updatedAtMs = nowMs;
+      snapshot.revision = revision;
+      snapshot.writtenAtMs = nowMs;
+      const prospective = serializeAccountedSnapshot(snapshot);
+      void prospective;
+      if (snapshot.quota.totalBytes > this.quotaBytes) {
+        throw new RecoveryQuotaExceededError(
+          snapshot.quota.totalBytes,
+          this.quotaBytes,
+        );
+      }
+
+      const published: string[] = [];
+      const staged: string[] = [];
+      let committed = false;
+      try {
+        const binaries: Array<{
+          directory: string;
+          id: string;
+          bytes: Uint8Array;
+        }> = [
+          {
+            directory: this.payloadDirectory,
+            id: payloadId,
+            bytes: input.payload,
+          },
+          ...(input.spool ?? []).map((bytes, index) => ({
+            directory: this.spoolDirectory,
+            id: spoolIds[index]!,
+            bytes,
+          })),
+        ];
+        const publishedDirectories = new Set<string>();
+        for (const binary of binaries) {
+          const finalPath = makeBinaryPath(binary.directory, binary.id);
+          if (this.#fs.exists(finalPath)) {
+            throw new Error(`Recovery binary id collision: ${binary.id}`);
+          }
+          const tempPath = `${finalPath}${RECOVERY_TEMP_FILE_MARKER}${process.pid}-${this.#randomId()}`;
+          staged.push(tempPath);
+          writePrivateFile(this.#fs, tempPath, binary.bytes);
+          this.#fs.rename(tempPath, finalPath);
+          staged.pop();
+          published.push(finalPath);
+          publishedDirectories.add(binary.directory);
+        }
+        for (const directory of publishedDirectories)
+          fsyncPath(this.#fs, directory);
+        this.#fault?.("IN-02");
+        this.#writeSnapshotLocked(snapshot);
+        committed = true;
+        this.#fault?.("IN-03");
+        return structuredClone(record);
+      } catch (error) {
+        const injectedCrash =
+          (error as { faultId?: unknown })?.faultId === "IN-02";
+        if (!committed && !injectedCrash) {
+          const cleanedDirectories = new Set<string>();
+          for (const path of [...staged, ...published]) {
+            this.#fs.remove(path, { force: true, recursive: true });
+            cleanedDirectories.add(dirname(path));
+          }
+          for (const directory of cleanedDirectories)
+            fsyncPath(this.#fs, directory);
+        }
+        throw error;
+      }
+    });
+  }
+
+  #assertAdmissionBytes(
+    record: RecoveryInboundRecord,
+    input: RecoveryInboundAdmissionInput,
+  ): void {
+    if (
+      !record.payloadRef ||
+      record.spoolRefs.length !== (input.spool ?? []).length
+    ) {
+      throw new Error("Recovery admission idempotency payload mismatch");
+    }
+    const payload = this.#readVerifiedBinary(
+      this.payloadDirectory,
+      record.payloadRef,
+      record.recordId,
+    );
+    if (!payload.equals(Buffer.from(input.payload))) {
+      throw new Error("Recovery admission idempotency payload mismatch");
+    }
+    for (let index = 0; index < record.spoolRefs.length; index += 1) {
+      const stored = this.#readVerifiedBinary(
+        this.spoolDirectory,
+        record.spoolRefs[index]!,
+        record.recordId,
+      );
+      if (!stored.equals(Buffer.from(input.spool![index]!))) {
+        throw new Error("Recovery admission idempotency spool mismatch");
+      }
+    }
+  }
+
+  verifyInboundAdmissionProof(
+    proof: RecoveryInboundAdmissionProof,
+  ): RecoveryInboundRecord {
+    return withTelegramFileTransaction(`${this.rootPath}.transaction`, () => {
+      const snapshot = this.#readSnapshotLocked();
+      if (
+        proof.version !== 1 ||
+        proof.profile !== this.profile ||
+        !Number.isSafeInteger(proof.updateId) ||
+        proof.updateId < 0 ||
+        !Number.isSafeInteger(proof.sessionGeneration) ||
+        proof.sessionGeneration < 0 ||
+        !Number.isSafeInteger(proof.admissionRevision) ||
+        proof.admissionRevision < 0
+      ) {
+        throw new Error("Invalid recovery inbound admission proof");
+      }
+      const record = snapshot.inbound.find(
+        (entry) =>
+          entry.recordId === proof.recordId &&
+          entry.updateId === proof.updateId &&
+          !entry.linkedAttemptOf,
+      );
+      if (
+        !record ||
+        record.turnId !== proof.turnId ||
+        record.admissionRevision !== proof.admissionRevision ||
+        record.identity.profile !== proof.profile ||
+        record.identity.sessionGeneration !== proof.sessionGeneration ||
+        !areRecoveryTargetsEqual(record.identity.target, proof.target) ||
+        record.identity.owner.kind !== "manual-follower" ||
+        record.identity.owner.ownerId !== proof.ownerId ||
+        record.identity.owner.registrationGeneration !==
+          proof.registrationGeneration
+      ) {
+        throw new Error("Recovery inbound admission proof identity mismatch");
+      }
+      const terminal = isInboundTerminal(record.state);
+      if (
+        (proof.disposition === "terminal" && !terminal) ||
+        (proof.disposition === "admitted" && record.state === "observed")
+      ) {
+        throw new Error("Recovery inbound admission proof disposition mismatch");
+      }
+      this.#verifyRecordBinaries(record);
+      return structuredClone(record);
+    });
+  }
+
+  commitUpdatePrefix(updateId: number): number {
+    readSafeInteger(updateId, "$updateId", { minimum: 0 });
+    const result = this.#commit((snapshot) => {
+      this.#assertActive(snapshot);
+      if (
+        snapshot.committedUpdateId !== null &&
+        updateId < snapshot.committedUpdateId
+      ) {
+        throw new Error("Recovery committed prefix cannot move backwards");
+      }
+      const record = snapshot.inbound.find(
+        (entry) => entry.updateId === updateId && !entry.linkedAttemptOf,
+      );
+      if (!record || record.state === "observed") {
+        throw new Error(
+          "Recovery prefix requires a durable admitted or terminal record",
+        );
+      }
+      if (
+        snapshot.inbound.some(
+          (entry) =>
+            !entry.linkedAttemptOf &&
+            entry.updateId <= updateId &&
+            entry.state === "observed",
+        )
+      ) {
+        throw new Error(
+          "Recovery prefix cannot cross an observed admission gap",
+        );
+      }
+      snapshot.committedUpdateId = updateId;
+      return updateId;
+    });
+    this.#fault?.("IN-04");
+    return result;
+  }
+
+  getCommittedUpdateId(): number | null {
+    return withTelegramFileTransaction(
+      `${this.rootPath}.transaction`,
+      () => this.#readSnapshotLocked().committedUpdateId,
+    );
+  }
+
+  migrateCommittedUpdateId(updateId: number): number {
+    readSafeInteger(updateId, "$updateId", { minimum: 0 });
+    return this.#commit((snapshot) => {
+      this.#assertActive(snapshot);
+      if (snapshot.committedUpdateId !== null) {
+        return snapshot.committedUpdateId;
+      }
+      if (snapshot.inbound.length > 0) {
+        throw new Error(
+          "Recovery offset migration requires an empty inbound store",
+        );
+      }
+      snapshot.committedUpdateId = updateId;
+      return updateId;
+    });
+  }
+
+  materializeInbound(
+    input: RecoveryInboundMaterializationInput,
+  ): RecoveryInboundRecord {
+    return this.materializeInboundGroup([input])[0]!;
+  }
+
+  materializeInboundGroup(
+    inputs: readonly RecoveryInboundMaterializationInput[],
+  ): RecoveryInboundRecord[] {
+    if (inputs.length === 0) return [];
+    const uniqueIds = new Set(inputs.map((input) => input.recordId));
+    if (uniqueIds.size !== inputs.length) {
+      throw new Error(
+        "Recovery materialization group contains duplicate record ids",
+      );
+    }
+    return withTelegramFileTransaction(`${this.rootPath}.transaction`, () => {
+      const current = this.#readSnapshotForMutationLocked();
+      this.#assertActive(current);
+      const existingRecords = inputs.map((input) => {
+        const record = this.#getInbound(current, input.recordId);
+        this.#assertClaim(current, record, input.claim);
+        return record;
+      });
+      const exactMaterializedIds = new Set<string>();
+      for (let index = 0; index < existingRecords.length; index += 1) {
+        const record = existingRecords[index]!;
+        const input = inputs[index]!;
+        if (record.state === "admitted") continue;
+        if (record.state !== "pre-dispatch") {
+          throw new Error(
+            "Recovery materialization group must be entirely admitted or pre-dispatch",
+          );
+        }
+        try {
+          this.#assertAdmissionBytes(record, input);
+          exactMaterializedIds.add(record.recordId);
+        } catch (mismatch) {
+          if (
+            !input.previousPayload ||
+            !record.payloadRef ||
+            record.spoolRefs.length > 0
+          ) {
+            throw mismatch;
+          }
+          const prior = this.#readVerifiedBinary(
+            this.payloadDirectory,
+            record.payloadRef,
+            record.recordId,
+          );
+          if (!prior.equals(Buffer.from(input.previousPayload))) {
+            throw mismatch;
+          }
+        }
+      }
+      if (
+        existingRecords.every((record) => record.state === "pre-dispatch") &&
+        exactMaterializedIds.size === existingRecords.length
+      ) {
+        return existingRecords.map((record) => structuredClone(record));
+      }
+
+      const snapshot = cloneSnapshot(current);
+      const nowMs = this.#now();
+      const revision = snapshot.revision + 1;
+      const publications: Array<{
+        directory: string;
+        id: string;
+        bytes: Uint8Array;
+      }> = [];
+      const oldPaths: string[] = [];
+      const records = inputs.map((input) => {
+        const record = this.#getInbound(snapshot, input.recordId);
+        if (record.payloadRef) {
+          if (
+            input.previousPayload &&
+            !exactMaterializedIds.has(record.recordId)
+          ) {
+            const prior = this.#readVerifiedBinary(
+              this.payloadDirectory,
+              record.payloadRef,
+              record.recordId,
+            );
+            if (!prior.equals(Buffer.from(input.previousPayload))) {
+              throw new Error(
+                "Recovery materialization prior payload mismatch",
+              );
+            }
+          }
+          oldPaths.push(
+            makeBinaryPath(this.payloadDirectory, record.payloadRef.payloadId),
+          );
+        }
+        for (const spool of record.spoolRefs) {
+          oldPaths.push(makeBinaryPath(this.spoolDirectory, spool.spoolId));
+        }
+        const payloadId = this.#randomId();
+        assertSafeFileId(payloadId, "$payloadId");
+        const spoolIds = (input.spool ?? []).map(() => {
+          const id = this.#randomId();
+          assertSafeFileId(id, "$spoolId");
+          return id;
+        });
+        if (input.turnId) record.turnId = input.turnId;
+        record.payloadRef = {
+          payloadId,
+          byteLength: input.payload.byteLength,
+          sha256: sha256Bytes(input.payload),
+        };
+        record.spoolRefs = spoolIds.map((spoolId, index) => ({
+          spoolId,
+          byteLength: input.spool![index]!.byteLength,
+          sha256: sha256Bytes(input.spool![index]!),
+        }));
+        record.state = "pre-dispatch";
+        record.stateRevision = revision;
+        record.updatedAtMs = nowMs;
+        publications.push({
+          directory: this.payloadDirectory,
+          id: payloadId,
+          bytes: input.payload,
+        });
+        for (let index = 0; index < spoolIds.length; index += 1) {
+          publications.push({
+            directory: this.spoolDirectory,
+            id: spoolIds[index]!,
+            bytes: input.spool![index]!,
+          });
+        }
+        return record;
+      });
+      snapshot.revision = revision;
+      snapshot.writtenAtMs = nowMs;
+      const uniqueOldPaths = [...new Set(oldPaths)];
+      const oldPathBytes = new Map(
+        uniqueOldPaths.map((path) => [
+          path,
+          this.#fs.exists(path) ? this.#fs.stat(path).size : 0,
+        ]),
+      );
+      const retainedOldBytes = [...oldPathBytes.values()].reduce(
+        (total, byteLength) => total + byteLength,
+        0,
+      );
+      snapshot.quota.reservedBytes += retainedOldBytes;
+      serializeAccountedSnapshot(snapshot);
+      if (snapshot.quota.totalBytes > this.quotaBytes) {
+        throw new RecoveryQuotaExceededError(
+          snapshot.quota.totalBytes,
+          this.quotaBytes,
+        );
+      }
+
+      const published: string[] = [];
+      let committed = false;
+      try {
+        this.#fault?.("IN-GROUP-01");
+        const directories = new Set<string>();
+        for (let index = 0; index < publications.length; index += 1) {
+          const publication = publications[index]!;
+          const path = makeBinaryPath(publication.directory, publication.id);
+          if (this.#fs.exists(path)) {
+            throw new Error(`Recovery binary id collision: ${publication.id}`);
+          }
+          writePrivateFile(this.#fs, path, publication.bytes);
+          published.push(path);
+          directories.add(publication.directory);
+          if (index + 1 < publications.length) this.#fault?.("IN-GROUP-02");
+        }
+        for (const directory of directories) fsyncPath(this.#fs, directory);
+        this.#fault?.("IN-GROUP-03");
+        this.#writeSnapshotLocked(snapshot);
+        committed = true;
+        const cleanedDirectories = new Set<string>();
+        const retainedCleanupPaths = new Set<string>();
+        for (const path of uniqueOldPaths) {
+          try {
+            this.#fs.remove(path, { force: true, recursive: true });
+            cleanedDirectories.add(dirname(path));
+          } catch {
+            retainedCleanupPaths.add(path);
+            this.#incidents.push("post-commit-cleanup-failed");
+          }
+        }
+        for (const directory of cleanedDirectories) {
+          try {
+            fsyncPath(this.#fs, directory);
+          } catch {
+            for (const path of uniqueOldPaths) {
+              if (dirname(path) === directory) retainedCleanupPaths.add(path);
+            }
+            this.#incidents.push("post-commit-cleanup-fsync-failed");
+          }
+        }
+        const retainedCleanupBytes = [...retainedCleanupPaths].reduce(
+          (total, path) => total + (oldPathBytes.get(path) ?? 0),
+          0,
+        );
+        try {
+          snapshot.quota.reservedBytes =
+            this.#reconcileMaterializedFilesLocked(snapshot) +
+            retainedCleanupBytes;
+          this.#writeSnapshotLocked(snapshot);
+        } catch {
+          this.#incidents.push("post-commit-quota-refresh-failed");
+        }
+        this.#fault?.("IN-05");
+        return records.map((record) => structuredClone(record));
+      } catch (error) {
+        if (!committed) {
+          const cleanedDirectories = new Set<string>();
+          for (const path of published) {
+            this.#fs.remove(path, { force: true, recursive: true });
+            cleanedDirectories.add(dirname(path));
+          }
+          for (const directory of cleanedDirectories)
+            fsyncPath(this.#fs, directory);
+        }
+        throw error;
+      }
+    });
+  }
+
+  markPreDispatch(
+    recordId: string,
+    claim: RecoveryIdentityClaim,
+  ): RecoveryInboundRecord {
+    const result = this.#transition(
+      recordId,
+      claim,
+      ["admitted"],
+      "pre-dispatch",
+    );
+    this.#fault?.("IN-05");
+    return result;
+  }
+
+  markDispatching(
+    recordId: string,
+    claim: RecoveryIdentityClaim,
+  ): RecoveryInboundRecord {
+    return this.markDispatchingGroup([{ recordId, claim }])[0]!;
+  }
+
+  markDispatchingGroup(
+    claims: readonly RecoveryDispatchClaim[],
+  ): RecoveryInboundRecord[] {
+    if (claims.length === 0) return [];
+    const uniqueIds = new Set(claims.map((entry) => entry.recordId));
+    if (uniqueIds.size !== claims.length) {
+      throw new Error("Recovery dispatch group contains duplicate record ids");
+    }
+    const result = this.#commit((snapshot, revision, nowMs) => {
+      this.#assertActive(snapshot);
+      const records = claims.map(({ recordId, claim }) => {
+        const record = this.#getInbound(snapshot, recordId);
+        this.#assertClaim(snapshot, record, claim);
+        if (record.state !== "pre-dispatch" && record.state !== "dispatching") {
+          throw new Error(
+            `Invalid inbound transition ${record.state} -> dispatching`,
+          );
+        }
+        return record;
+      });
+      for (const record of records) {
+        if (record.state === "dispatching") continue;
+        record.state = "dispatching";
+        record.stateRevision = revision;
+        record.updatedAtMs = nowMs;
+      }
+      return records.map((record) => structuredClone(record));
+    });
+    this.#fault?.("IN-06");
+    return result;
+  }
+
+  restoreInboundSpool(
+    recordId: string,
+    claim: RecoveryIdentityClaim,
+    fileNames: readonly string[],
+  ): string[] {
+    return withTelegramFileTransaction(`${this.rootPath}.transaction`, () => {
+      const current = this.#readSnapshotForMutationLocked();
+      const record = this.#getInbound(current, recordId);
+      this.#assertClaim(current, record, claim);
+      if (record.state !== "pre-dispatch") {
+        throw new Error("Only pre-dispatch inbound spool may be restored");
+      }
+      if (record.spoolRefs.length !== fileNames.length) {
+        throw new Error("Recovery spool mapping length mismatch");
+      }
+      if (record.spoolRefs.length === 0) return [];
+      const finalDirectory = join(this.materializedDirectory, recordId);
+      if (this.#fs.exists(finalDirectory)) {
+        return this.#validateMaterializedDirectoryLocked(
+          finalDirectory,
+          record,
+        ).paths;
+      }
+
+      const projectedBytes = record.spoolRefs.reduce(
+        (total, reference) => total + reference.byteLength,
+        0,
+      );
+      const reservation = cloneSnapshot(current);
+      reservation.revision += 1;
+      reservation.writtenAtMs = this.#now();
+      reservation.quota.reservedBytes += projectedBytes;
+      this.#writeSnapshotLocked(reservation);
+
+      const tempDirectory = `${finalDirectory}${RECOVERY_TEMP_FILE_MARKER}${process.pid}-${this.#randomId()}`;
+      let published = false;
+      try {
+        this.#fs.remove(tempDirectory, { force: true, recursive: true });
+        this.#fs.mkdir(tempDirectory, { mode: RECOVERY_STORE_DIRECTORY_MODE });
+        const names = record.spoolRefs.map((reference, index) => {
+          const sourceName = fileNames[index];
+          if (sourceName === undefined) {
+            throw new Error("Recovery spool mapping is incomplete");
+          }
+          const safeBase =
+            basename(sourceName)
+              .replace(/[^a-zA-Z0-9._-]+/gu, "_")
+              .replace(/^\.+/u, "") || "attachment.bin";
+          const fileName = `${String(index).padStart(3, "0")}-${safeBase}`;
+          const bytes = this.#readVerifiedBinary(
+            this.spoolDirectory,
+            reference,
+            record.recordId,
+          );
+          writePrivateFile(this.#fs, join(tempDirectory, fileName), bytes);
+          return fileName;
+        });
+        fsyncPath(this.#fs, tempDirectory);
+        this.#fs.rename(tempDirectory, finalDirectory);
+        published = true;
+        this.#fs.chmod(finalDirectory, RECOVERY_STORE_DIRECTORY_MODE);
+        fsyncPath(this.#fs, this.materializedDirectory);
+        this.#reconcileFilesLocked(reservation);
+        return names.map((fileName) => join(finalDirectory, fileName));
+      } catch (error) {
+        try {
+          this.#fs.remove(tempDirectory, { force: true, recursive: true });
+          if (published) {
+            this.#fs.remove(finalDirectory, { force: true, recursive: true });
+          }
+          fsyncPath(this.#fs, this.materializedDirectory);
+          this.#refreshMaterializedQuotaFailSoftLocked(
+            reservation,
+            "materialized-rollback-cleanup-failed",
+          );
+        } catch {
+          this.#incidents.push("materialized-rollback-cleanup-failed");
+          this.#refreshMaterializedQuotaFailSoftLocked(
+            reservation,
+            "materialized-rollback-quota-refresh-failed",
+          );
+        }
+        throw error;
+      } finally {
+        if (this.#fs.exists(tempDirectory)) {
+          try {
+            this.#fs.remove(tempDirectory, { force: true, recursive: true });
+          } catch {
+            this.#incidents.push("materialized-temp-cleanup-failed");
+          }
+        }
+      }
+    });
+  }
+
+  markExecutionUncertain(
+    recordId: string,
+    claim: RecoveryIdentityClaim,
+  ): RecoveryInboundRecord {
+    return this.markExecutionUncertainGroup([{ recordId, claim }])[0]!;
+  }
+
+  markExecutionUncertainGroup(
+    claims: readonly RecoveryDispatchClaim[],
+  ): RecoveryInboundRecord[] {
+    const result = this.#transitionGroup(
+      claims,
+      ["dispatching"],
+      "execution-uncertain",
+    );
+    this.#fault?.("IN-07");
+    return result;
+  }
+
+  markCompleted(
+    recordId: string,
+    claim: RecoveryIdentityClaim,
+  ): RecoveryInboundRecord {
+    return this.markCompletedGroup([{ recordId, claim }])[0]!;
+  }
+
+  markCompletedGroup(
+    claims: readonly RecoveryDispatchClaim[],
+  ): RecoveryInboundRecord[] {
+    const result = this.#completeInboundGroup(claims, ["dispatching"]);
+    this.#fault?.("IN-08");
+    return result;
+  }
+
+  terminalizeInboundGroup(
+    claims: readonly RecoveryDispatchClaim[],
+  ): RecoveryInboundRecord[] {
+    return this.#completeInboundGroup(claims, ["admitted", "pre-dispatch"]);
+  }
+
+  #completeInboundGroup(
+    claims: readonly RecoveryDispatchClaim[],
+    from: readonly RecoveryInboundState[],
+  ): RecoveryInboundRecord[] {
+    if (claims.length === 0) return [];
+    const uniqueIds = new Set(claims.map((entry) => entry.recordId));
+    if (uniqueIds.size !== claims.length) {
+      throw new Error("Recovery completion group contains duplicate record ids");
+    }
+    return this.#commit((snapshot, revision, nowMs, deleteAfterCommit) => {
+      this.#assertActive(snapshot);
+      const records = claims.map(({ recordId, claim }) => {
+        const record = this.#getInbound(snapshot, recordId);
+        this.#assertClaim(snapshot, record, claim);
+        if (record.state !== "completed" && !from.includes(record.state)) {
+          throw new Error(
+            `Invalid inbound transition ${record.state} -> completed`,
+          );
+        }
+        return record;
+      });
+      for (const record of records) {
+        if (record.state === "completed") continue;
+        for (const spool of record.spoolRefs) {
+          deleteAfterCommit.push(
+            makeBinaryPath(this.spoolDirectory, spool.spoolId),
+          );
+        }
+        deleteAfterCommit.push(
+          join(this.materializedDirectory, record.recordId),
+        );
+        record.spoolRefs = [];
+        record.state = "completed";
+        record.stateRevision = revision;
+        record.updatedAtMs = nowMs;
+      }
+      return records.map((record) => structuredClone(record));
+    });
+  }
+
+  #transitionGroup(
+    claims: readonly RecoveryDispatchClaim[],
+    from: readonly RecoveryInboundState[],
+    to: RecoveryInboundState,
+  ): RecoveryInboundRecord[] {
+    if (claims.length === 0) return [];
+    const uniqueIds = new Set(claims.map((entry) => entry.recordId));
+    if (uniqueIds.size !== claims.length) {
+      throw new Error("Recovery transition group contains duplicate record ids");
+    }
+    return this.#commit((snapshot, revision, nowMs) => {
+      this.#assertActive(snapshot);
+      const records = claims.map(({ recordId, claim }) => {
+        const record = this.#getInbound(snapshot, recordId);
+        this.#assertClaim(snapshot, record, claim);
+        if (record.state !== to && !from.includes(record.state)) {
+          throw new Error(`Invalid inbound transition ${record.state} -> ${to}`);
+        }
+        return record;
+      });
+      for (const record of records) {
+        if (record.state === to) continue;
+        record.state = to;
+        record.stateRevision = revision;
+        record.updatedAtMs = nowMs;
+      }
+      return records.map((record) => structuredClone(record));
+    });
+  }
+
+  #transition(
+    recordId: string,
+    claim: RecoveryIdentityClaim,
+    from: readonly RecoveryInboundState[],
+    to: RecoveryInboundState,
+  ): RecoveryInboundRecord {
+    return this.#commit((snapshot, revision, nowMs) => {
+      this.#assertActive(snapshot);
+      const record = this.#getInbound(snapshot, recordId);
+      this.#assertClaim(snapshot, record, claim);
+      if (record.state === to) return structuredClone(record);
+      if (!from.includes(record.state)) {
+        throw new Error(`Invalid inbound transition ${record.state} -> ${to}`);
+      }
+      record.state = to;
+      record.stateRevision = revision;
+      record.updatedAtMs = nowMs;
+      return structuredClone(record);
+    });
+  }
+
+  discardInbound(
+    recordId: string,
+    claim: RecoveryIdentityClaim,
+  ): RecoveryInboundRecord {
+    return this.#commit((snapshot, revision, nowMs, deleteAfterCommit) => {
+      this.#assertActive(snapshot);
+      const record = this.#getInbound(snapshot, recordId);
+      this.#assertClaim(snapshot, record, claim);
+      if (record.state === "explicitly-discarded") {
+        return structuredClone(record);
+      }
+      if (record.state === "dispatching" || record.state === "completed") {
+        throw new Error(`Cannot discard inbound record in ${record.state}`);
+      }
+      if (record.payloadRef) {
+        deleteAfterCommit.push(
+          makeBinaryPath(this.payloadDirectory, record.payloadRef.payloadId),
+        );
+        delete record.payloadRef;
+      }
+      for (const spool of record.spoolRefs) {
+        deleteAfterCommit.push(
+          makeBinaryPath(this.spoolDirectory, spool.spoolId),
+        );
+      }
+      deleteAfterCommit.push(join(this.materializedDirectory, record.recordId));
+      record.spoolRefs = [];
+      record.state = "explicitly-discarded";
+      record.admissionRevision ??= revision;
+      record.stateRevision = revision;
+      record.updatedAtMs = nowMs;
+      return structuredClone(record);
+    });
+  }
+
+  markPoisonSkippedInbound(
+    recordId: string,
+    claim: RecoveryIdentityClaim,
+  ): RecoveryInboundRecord {
+    const record = this.discardInbound(recordId, claim);
+    return this.#commit((snapshot, revision, nowMs) => {
+      const current = this.#getInbound(snapshot, record.recordId);
+      this.#assertClaim(snapshot, current, claim);
+      current.terminalReason = "poison-skipped";
+      current.stateRevision = revision;
+      current.updatedAtMs = nowMs;
+      return structuredClone(current);
+    });
+  }
+
+  discardInboundAction(
+    actionId: string,
+    claim: RecoveryIdentityClaim,
+  ): RecoveryInboundActionResult {
+    const recordId = withTelegramFileTransaction(
+      `${this.rootPath}.transaction`,
+      () =>
+        this.#resolveInboundActionId(this.#readSnapshotLocked(), actionId)
+          .recordId,
+    );
+    const record = this.discardInbound(recordId, claim);
+    return {
+      actionId: this.#opaqueActionId(`record:${record.recordId}`),
+      turnId: record.turnId,
+      state: record.state,
+      spool: [],
+    };
+  }
+
+  retryUncertainInbound(
+    recordId: string,
+    claim: RecoveryIdentityClaim,
+  ): RecoveryInboundRetryResult {
+    return this.#commit((snapshot, revision, nowMs) => {
+      this.#assertActive(snapshot);
+      const source = this.#getInbound(snapshot, recordId);
+      this.#assertClaim(snapshot, source, claim);
+      const existing = snapshot.inbound.find(
+        (record) => record.linkedAttemptOf === source.recordId,
+      );
+      if (existing) {
+        this.#assertClaim(snapshot, existing, claim);
+        return {
+          ...this.#readDrainItem(existing),
+          duplicationWarning: true,
+        };
+      }
+      if (source.state !== "execution-uncertain") {
+        throw new Error("Only execution-uncertain inbound work may be retried");
+      }
+      const attempt: RecoveryInboundRecord = {
+        ...structuredClone(source),
+        identity: structuredClone(claim.identity),
+        recordId: this.#randomId(),
+        turnId: this.#randomId(),
+        state: "pre-dispatch",
+        admissionRevision: revision,
+        linkedAttemptOf: source.recordId,
+        createdRevision: revision,
+        stateRevision: revision,
+        createdAtMs: nowMs,
+        updatedAtMs: nowMs,
+      };
+      source.state = "explicitly-discarded";
+      source.stateRevision = revision;
+      source.updatedAtMs = nowMs;
+      delete source.payloadRef;
+      source.spoolRefs = [];
+      snapshot.inbound.push(attempt);
+      return {
+        ...this.#readDrainItem(attempt),
+        duplicationWarning: true,
+      };
+    });
+  }
+
+  retryUncertainInboundAction(
+    actionId: string,
+    claim: RecoveryIdentityClaim,
+  ): RecoveryInboundActionResult {
+    const recordId = withTelegramFileTransaction(
+      `${this.rootPath}.transaction`,
+      () =>
+        this.#resolveInboundActionId(this.#readSnapshotLocked(), actionId)
+          .recordId,
+    );
+    const result = this.retryUncertainInbound(recordId, claim);
+    return {
+      actionId: this.#opaqueActionId(`record:${result.record.recordId}`),
+      turnId: result.record.turnId,
+      state: result.record.state,
+      payload: result.payload,
+      spool: result.spool,
+      duplicationWarning: true,
+    };
+  }
+
+  listReplayableInboundRecords(): RecoveryInboundRecord[] {
+    return withTelegramFileTransaction(`${this.rootPath}.transaction`, () =>
+      this.#readSnapshotLocked()
+        .inbound.filter(
+          (record) =>
+            record.state === "admitted" || record.state === "pre-dispatch",
+        )
+        .map((record) => structuredClone(record)),
+    );
+  }
+
+  drainSafeInbound(claim: RecoveryIdentityClaim): RecoveryInboundDrainItem[] {
+    return this.#commit((snapshot, revision, nowMs) => {
+      this.#assertActive(snapshot);
+      this.#authenticate(claim.identity);
+      const drained: RecoveryInboundDrainItem[] = [];
+      for (const record of snapshot.inbound) {
+        if (record.state !== "admitted" && record.state !== "pre-dispatch") {
+          continue;
+        }
+        try {
+          this.#assertClaim(snapshot, record, claim);
+        } catch {
+          continue;
+        }
+        if (record.state === "admitted") {
+          record.state = "pre-dispatch";
+          record.stateRevision = revision;
+          record.updatedAtMs = nowMs;
+        }
+        drained.push(this.#readDrainItem(record));
+      }
+      return drained;
+    });
+  }
+
+  #readDrainItem(record: RecoveryInboundRecord): RecoveryInboundDrainItem {
+    if (!record.payloadRef) {
+      throw new Error(`Recovery record ${record.recordId} has no payload`);
+    }
+    return {
+      record: structuredClone(record),
+      payload: this.#readVerifiedBinary(
+        this.payloadDirectory,
+        record.payloadRef,
+        record.recordId,
+      ),
+      spool: record.spoolRefs.map((ref) =>
+        this.#readVerifiedBinary(this.spoolDirectory, ref, record.recordId),
+      ),
+    };
+  }
+
+  #opaqueActionId(stableInput: string): string {
+    return readStableString(this.#actionId(stableInput), "$actionId");
+  }
+
+  #recordActionIds(snapshot: RecoverySnapshotV1): Map<string, string> {
+    const result = new Map<string, string>();
+    for (const record of [
+      ...snapshot.inbound,
+      ...snapshot.outbound,
+      ...snapshot.bus,
+    ]) {
+      const actionId = this.#opaqueActionId(`record:${record.recordId}`);
+      if (result.has(actionId)) {
+        throw new Error(`Recovery opaque action id collision: ${actionId}`);
+      }
+      result.set(actionId, record.recordId);
+    }
+    return result;
+  }
+
+  #resolveInboundActionId(
+    snapshot: RecoverySnapshotV1,
+    actionId: string,
+  ): RecoveryInboundRecord {
+    const recordId = this.#recordActionIds(snapshot).get(actionId);
+    if (!recordId) throw new Error("Unknown recovery action id");
+    return this.#getInbound(snapshot, recordId);
+  }
+
+  #getInbound(
+    snapshot: RecoverySnapshotV1,
+    recordId: string,
+  ): RecoveryInboundRecord {
+    const record = snapshot.inbound.find(
+      (entry) => entry.recordId === recordId,
+    );
+    if (!record) throw new Error("Unknown recovery inbound record");
+    return record;
+  }
+
+  consumeSameProcessHandoff(
+    handoffValue: RecoverySameProcessHandoff,
+    currentIdentity: RecoveryIdentity,
+  ): { handoff: RecoverySameProcessHandoff; claimedRecordIds: string[] } {
+    const handoff = validateRecoverySameProcessHandoff(handoffValue);
+    const current = readIdentity(currentIdentity, "$currentIdentity");
+    this.#authenticate(current);
+    if (
+      handoff.profile !== current.profile ||
+      !areRecoveryTargetsEqual(handoff.target, current.target) ||
+      !areRecoveryOwnersEqual(handoff.owner, current.owner) ||
+      handoff.toSessionGeneration !== current.sessionGeneration ||
+      handoff.consumedAtMs !== undefined ||
+      this.#now() > handoff.expiresAtMs
+    ) {
+      throw new Error("Recovery same-process handoff claim denied");
+    }
+    const registry = getConsumedHandoffRegistry();
+    const registryKey = `${this.rootPath}\u0000${handoff.handoffId}`;
+    if (registry.has(registryKey)) {
+      throw new Error("Recovery same-process handoff was already consumed");
+    }
+    const claimedRecordIds = this.#commit((snapshot) => {
+      this.#assertActive(snapshot);
+      const claimed: string[] = [];
+      for (const record of [
+        ...snapshot.inbound,
+        ...snapshot.outbound,
+        ...snapshot.bus,
+      ]) {
+        if (
+          isUnresolvedRecord(record) &&
+          ownerTargetEqual(
+            record.identity,
+            handoff.profile,
+            handoff.target,
+            handoff.owner,
+          ) &&
+          record.identity.sessionGeneration === handoff.fromSessionGeneration
+        ) {
+          record.identity = structuredClone(current);
+          claimed.push(record.recordId);
+        }
+      }
+      return claimed;
+    });
+    registry.add(registryKey);
+    return {
+      handoff: { ...handoff, consumedAtMs: this.#now() },
+      claimedRecordIds,
+    };
+  }
+
+  getOrphanReassignmentCandidates(): RecoveryOrphanReassignmentCandidate[] {
+    return withTelegramFileTransaction(`${this.rootPath}.transaction`, () => {
+      const snapshot = this.#readSnapshotLocked();
+      const nowMs = this.#now();
+      return this.#collectOrphanCandidates(snapshot).map((candidate) => ({
+        actionId: candidate.actionId,
+        unresolvedCount: candidate.records.length,
+        oldestAgeMs: Math.max(
+          ...candidate.records.map((record) =>
+            Math.max(0, nowMs - record.createdAtMs),
+          ),
+        ),
+        states: [
+          ...new Set(candidate.records.map((record) => record.state)),
+        ].sort(),
+      }));
+    });
+  }
+
+  requestReassignmentAction(
+    actionId: string,
+    newIdentity: RecoveryIdentity,
+  ): RecoveryReassignmentActionResult {
+    const candidate = withTelegramFileTransaction(
+      `${this.rootPath}.transaction`,
+      () => {
+        const candidates = this.#collectOrphanCandidates(
+          this.#readSnapshotLocked(),
+        );
+        const match = candidates.find((entry) => entry.actionId === actionId);
+        if (!match) throw new Error("Unknown orphan reassignment action id");
+        return {
+          target: structuredClone(match.target),
+          oldOwner: structuredClone(match.oldOwner),
+        };
+      },
+    );
+    const reassignment = this.requestReassignment({
+      ...candidate,
+      newIdentity,
+    });
+    return {
+      actionId: this.#opaqueActionId(
+        `reassignment:${reassignment.reassignmentId}`,
+      ),
+      state: reassignment.state,
+      unresolvedCount: reassignment.unresolvedRecordIds.length,
+    };
+  }
+
+  #collectOrphanCandidates(snapshot: RecoverySnapshotV1): Array<{
+    actionId: string;
+    target: TelegramTarget;
+    oldOwner: RecoveryOwnerIdentity;
+    records: Array<
+      RecoveryInboundRecord | RecoveryOutboundRecord | RecoveryBusRecord
+    >;
+  }> {
+    const groups = new Map<
+      string,
+      {
+        target: TelegramTarget;
+        oldOwner: RecoveryOwnerIdentity;
+        records: Array<
+          RecoveryInboundRecord | RecoveryOutboundRecord | RecoveryBusRecord
+        >;
+      }
+    >();
+    for (const record of [
+      ...snapshot.inbound,
+      ...snapshot.outbound,
+      ...snapshot.bus,
+    ]) {
+      if (!isUnresolvedRecord(record)) continue;
+      if (this.#isIdentityAuthenticated?.(record.identity)) continue;
+      const key = JSON.stringify([
+        record.identity.profile,
+        record.identity.target.chatId,
+        record.identity.target.threadId ?? null,
+        record.identity.owner,
+      ]);
+      const group = groups.get(key) ?? {
+        target: structuredClone(record.identity.target),
+        oldOwner: structuredClone(record.identity.owner),
+        records: [],
+      };
+      group.records.push(record);
+      groups.set(key, group);
+    }
+    const seen = new Set<string>();
+    return [...groups.entries()].map(([key, group]) => {
+      const actionId = this.#opaqueActionId(`orphan:${key}`);
+      if (seen.has(actionId)) {
+        throw new Error(`Recovery orphan action id collision: ${actionId}`);
+      }
+      seen.add(actionId);
+      return { actionId, ...group };
+    });
+  }
+
+  #resolveReassignmentActionId(
+    snapshot: RecoverySnapshotV1,
+    actionId: string,
+  ): RecoveryReassignmentRecord {
+    const matches = snapshot.reassignments.filter(
+      (record) =>
+        this.#opaqueActionId(`reassignment:${record.reassignmentId}`) ===
+        actionId,
+    );
+    if (matches.length !== 1) {
+      throw new Error("Unknown recovery reassignment action id");
+    }
+    return matches[0]!;
+  }
+
+  requestReassignment(
+    request: RecoveryReassignmentRequest,
+  ): RecoveryReassignmentRecord {
+    const newIdentity = readIdentity(request.newIdentity, "$newIdentity");
+    this.#authenticate(newIdentity);
+    if (
+      newIdentity.profile !== this.profile ||
+      !areRecoveryTargetsEqual(newIdentity.target, request.target)
+    ) {
+      throw new Error("Recovery reassignment target/profile mismatch");
+    }
+    return this.#commit((snapshot, _revision, nowMs) => {
+      this.#assertActive(snapshot);
+      const unresolvedRecordIds = [
+        ...snapshot.inbound,
+        ...snapshot.outbound,
+        ...snapshot.bus,
+      ]
+        .filter(
+          (record) =>
+            isUnresolvedRecord(record) &&
+            ownerTargetEqual(
+              record.identity,
+              this.profile,
+              request.target,
+              request.oldOwner,
+            ),
+        )
+        .map((record) => record.recordId);
+      if (unresolvedRecordIds.length === 0) {
+        throw new Error("Recovery reassignment has no unresolved records");
+      }
+      const collision = snapshot.reassignments.find(
+        (entry) =>
+          entry.state !== "cancelled-before-transfer" &&
+          entry.unresolvedRecordIds.some((id) =>
+            unresolvedRecordIds.includes(id),
+          ),
+      );
+      if (collision) {
+        if (
+          areRecoveryOwnersEqual(collision.newOwner, newIdentity.owner) &&
+          collision.newSessionGeneration === newIdentity.sessionGeneration &&
+          areRecoveryTargetsEqual(collision.target, request.target)
+        ) {
+          return structuredClone(collision);
+        }
+        throw new Error("Recovery reassignment collision");
+      }
+      const record: RecoveryReassignmentRecord = {
+        family: "reassignment",
+        reassignmentId: this.#randomId(),
+        profile: this.profile,
+        target: structuredClone(request.target),
+        oldOwner: structuredClone(request.oldOwner),
+        newOwner: structuredClone(newIdentity.owner),
+        newSessionGeneration: newIdentity.sessionGeneration,
+        captureThroughRevision: snapshot.revision,
+        unresolvedRecordIds,
+        state: "requested",
+        createdAtMs: nowMs,
+        updatedAtMs: nowMs,
+      };
+      snapshot.reassignments.push(record);
+      return structuredClone(record);
+    });
+  }
+
+  completeReassignmentAction(
+    actionId: string,
+    authenticatedIdentity: RecoveryIdentity,
+  ): RecoveryReassignmentActionResult {
+    for (;;) {
+      const current = withTelegramFileTransaction(
+        `${this.rootPath}.transaction`,
+        () =>
+          structuredClone(
+            this.#resolveReassignmentActionId(
+              this.#readSnapshotLocked(),
+              actionId,
+            ),
+          ),
+      );
+      switch (current.state) {
+        case "requested":
+          this.advanceReassignment(
+            current.reassignmentId,
+            "requested",
+            "binding-transfer-pending",
+            authenticatedIdentity,
+          );
+          break;
+        case "binding-transfer-pending":
+          this.advanceReassignment(
+            current.reassignmentId,
+            "binding-transfer-pending",
+            "binding-transferred",
+            authenticatedIdentity,
+          );
+          break;
+        case "binding-transferred":
+          this.advanceReassignment(
+            current.reassignmentId,
+            "binding-transferred",
+            "recovery-grant-committed",
+            authenticatedIdentity,
+          );
+          break;
+        case "recovery-grant-committed":
+          return {
+            actionId,
+            state: current.state,
+            unresolvedCount: current.unresolvedRecordIds.length,
+          };
+        case "cancelled-before-transfer":
+        case "rollback-pending":
+          throw new Error(
+            `Recovery reassignment cannot complete from ${current.state}`,
+          );
+      }
+    }
+  }
+
+  advanceReassignment(
+    reassignmentId: string,
+    expected: RecoveryReassignmentState,
+    next: RecoveryReassignmentState,
+    authenticatedIdentity: RecoveryIdentity,
+  ): RecoveryReassignmentRecord {
+    const identity = readIdentity(authenticatedIdentity, "$identity");
+    this.#authenticate(identity);
+    const allowed: Record<
+      RecoveryReassignmentState,
+      readonly RecoveryReassignmentState[]
+    > = {
+      requested: ["binding-transfer-pending", "cancelled-before-transfer"],
+      "binding-transfer-pending": ["binding-transferred", "rollback-pending"],
+      "binding-transferred": ["recovery-grant-committed", "rollback-pending"],
+      "recovery-grant-committed": [],
+      "cancelled-before-transfer": [],
+      "rollback-pending": [
+        "cancelled-before-transfer",
+        "binding-transfer-pending",
+      ],
+    };
+    return this.#commit((snapshot, _revision, nowMs) => {
+      this.#assertActive(snapshot);
+      const record = snapshot.reassignments.find(
+        (entry) => entry.reassignmentId === reassignmentId,
+      );
+      if (!record) throw new Error("Unknown recovery reassignment");
+      if (
+        !areRecoveryOwnersEqual(record.newOwner, identity.owner) ||
+        !areRecoveryTargetsEqual(record.target, identity.target) ||
+        record.profile !== identity.profile ||
+        record.newSessionGeneration !== identity.sessionGeneration
+      ) {
+        throw new Error("Recovery reassignment owner claim denied");
+      }
+      if (record.state === next) return structuredClone(record);
+      if (record.state !== expected || !allowed[expected].includes(next)) {
+        throw new Error(
+          `Invalid recovery reassignment ${record.state} -> ${next}`,
+        );
+      }
+      const expectedBinding =
+        next === "binding-transferred" || next === "recovery-grant-committed"
+          ? "new-owner"
+          : expected === "rollback-pending" &&
+              next === "cancelled-before-transfer"
+            ? "old-owner-restored"
+            : undefined;
+      if (
+        expectedBinding &&
+        !this.#validateReassignmentBinding?.({
+          reassignment: structuredClone(record),
+          currentIdentity: structuredClone(identity),
+          expectedBinding,
+        })
+      ) {
+        throw new Error(
+          "Recovery reassignment binding/authentication revalidation failed",
+        );
+      }
+      record.state = next;
+      record.updatedAtMs = nowMs;
+      return structuredClone(record);
+    });
+  }
+
+  compact(): RecoveryMetadataStatus {
+    this.#commit((snapshot, _revision, nowMs, deleteAfterCommit) => {
+      this.#applyRetention(snapshot, nowMs, deleteAfterCommit);
+    });
+    return this.getStatus();
+  }
+
+  #applyRetention(
+    snapshot: RecoverySnapshotV1,
+    nowMs: number,
+    deleteAfterCommit: string[],
+  ): void {
+    const recordsById = new Map(
+      [...snapshot.inbound, ...snapshot.outbound, ...snapshot.bus].map(
+        (record) => [record.recordId, record] as const,
+      ),
+    );
+    snapshot.reassignments = snapshot.reassignments.filter((entry) => {
+      const terminal =
+        entry.state === "recovery-grant-committed" ||
+        entry.state === "cancelled-before-transfer";
+      const stillAuthorizesUnresolved = entry.unresolvedRecordIds.some(
+        (recordId) => {
+          const record = recordsById.get(recordId);
+          return record !== undefined && isUnresolvedRecord(record);
+        },
+      );
+      return (
+        !terminal ||
+        stillAuthorizesUnresolved ||
+        nowMs - entry.updatedAtMs <= RECOVERY_TERMINAL_METADATA_RETENTION_MS
+      );
+    });
+    const reassignmentsProtectingUnresolved = snapshot.reassignments.filter(
+      (entry) =>
+        entry.unresolvedRecordIds.some((recordId) => {
+          const record = recordsById.get(recordId);
+          return record !== undefined && isUnresolvedRecord(record);
+        }),
+    );
+    const protectedIds = new Set([
+      ...reassignmentsProtectingUnresolved.flatMap(
+        (entry) => entry.unresolvedRecordIds,
+      ),
+      // A terminal source linked from unresolved retry work is not
+      // terminal-only metadata; it remains part of that unresolved attempt.
+      ...snapshot.inbound.flatMap((record) =>
+        record.linkedAttemptOf ? [record.linkedAttemptOf] : [],
+      ),
+      ...snapshot.outbound.flatMap((record) =>
+        record.linkedAttemptOf ? [record.linkedAttemptOf] : [],
+      ),
+    ]);
+    const allRecords: RecoveryRecord[] = [
+      ...snapshot.inbound,
+      ...snapshot.outbound,
+      ...snapshot.bus,
+    ];
+    for (const record of allRecords) {
+      if (!isTerminalRecord(record)) continue;
+      if (
+        record.payloadRef &&
+        (!isSuccessfulTerminalRecord(record) ||
+          nowMs - record.updatedAtMs >= RECOVERY_DELIVERED_PAYLOAD_RETENTION_MS)
+      ) {
+        deleteAfterCommit.push(
+          makeBinaryPath(this.payloadDirectory, record.payloadRef.payloadId),
+        );
+        delete record.payloadRef;
+      }
+      for (const spool of record.spoolRefs) {
+        deleteAfterCommit.push(
+          makeBinaryPath(this.spoolDirectory, spool.spoolId),
+        );
+      }
+      record.spoolRefs = [];
+    }
+    let terminals = allRecords
+      .filter(isTerminalRecord)
+      .sort((left, right) => left.updatedAtMs - right.updatedAtMs);
+    const remove = new Set<string>();
+    for (const record of terminals) {
+      if (
+        !protectedIds.has(record.recordId) &&
+        nowMs - record.updatedAtMs > RECOVERY_TERMINAL_METADATA_RETENTION_MS
+      ) {
+        remove.add(record.recordId);
+      }
+    }
+    terminals = terminals.filter((record) => !remove.has(record.recordId));
+    let metadataBytes = terminals.reduce(
+      (sum, record) => sum + terminalMetadataBytes(record),
+      0,
+    );
+    let metadataCount = terminals.length;
+    for (const record of terminals) {
+      if (
+        metadataCount <= this.#terminalMetadataMaxRecords &&
+        metadataBytes <= this.#terminalMetadataMaxBytes
+      ) {
+        break;
+      }
+      if (protectedIds.has(record.recordId)) continue;
+      remove.add(record.recordId);
+      metadataCount -= 1;
+      metadataBytes -= terminalMetadataBytes(record);
+    }
+    for (const record of allRecords) {
+      if (!remove.has(record.recordId)) continue;
+      if (record.payloadRef) {
+        deleteAfterCommit.push(
+          makeBinaryPath(this.payloadDirectory, record.payloadRef.payloadId),
+        );
+      }
+      for (const spool of record.spoolRefs) {
+        deleteAfterCommit.push(
+          makeBinaryPath(this.spoolDirectory, spool.spoolId),
+        );
+      }
+    }
+    snapshot.reassignments = snapshot.reassignments.filter(
+      (entry) =>
+        !entry.unresolvedRecordIds.some((recordId) => remove.has(recordId)),
+    );
+    snapshot.inbound = snapshot.inbound.filter(
+      (record) => !remove.has(record.recordId),
+    );
+    snapshot.outbound = snapshot.outbound.filter(
+      (record) => !remove.has(record.recordId),
+    );
+    snapshot.bus = snapshot.bus.filter(
+      (record) => !remove.has(record.recordId),
+    );
+  }
+
+  getStatus(): RecoveryMetadataStatus {
+    return withTelegramFileTransaction(`${this.rootPath}.transaction`, () => {
+      const snapshot = this.#readSnapshotLocked();
+      const counts = emptyCounts();
+      const nowMs = this.#now();
+      const actionIdsByRecord = new Map(
+        [...this.#recordActionIds(snapshot)].map(([actionId, recordId]) => [
+          recordId,
+          actionId,
+        ]),
+      );
+      const unresolved = snapshot.inbound.filter((record) => {
+        counts[record.state] += 1;
+        return isInboundUnresolved(record.state);
+      });
+      const items: RecoveryStatusItem[] = [
+        ...unresolved.map((record): RecoveryStatusItem => ({
+          id: actionIdsByRecord.get(record.recordId)!,
+          actionId: actionIdsByRecord.get(record.recordId)!,
+          family: "inbound",
+          state: record.state,
+          ageMs: Math.max(0, nowMs - record.createdAtMs),
+          requiredAction:
+            record.state === "execution-uncertain"
+              ? "retry-or-discard"
+              : record.state === "admitted" || record.state === "pre-dispatch"
+                ? "drain"
+                : "none",
+        })),
+        ...snapshot.outbound
+          .filter(isUnresolvedRecord)
+          .map((record): RecoveryStatusItem => ({
+            id: actionIdsByRecord.get(record.recordId)!,
+            actionId: actionIdsByRecord.get(record.recordId)!,
+            family: "outbound",
+            state: record.state,
+            ageMs: Math.max(0, nowMs - record.createdAtMs),
+            requiredAction:
+              record.state === "delivery-uncertain" ||
+              record.state === "sending"
+                ? "retry-or-discard"
+                : "drain",
+          })),
+        ...snapshot.bus
+          .filter(isUnresolvedRecord)
+          .map((record): RecoveryStatusItem => ({
+            id: actionIdsByRecord.get(record.recordId)!,
+            actionId: actionIdsByRecord.get(record.recordId)!,
+            family: "bus",
+            state: record.state,
+            ageMs: Math.max(0, nowMs - record.createdAtMs),
+            requiredAction:
+              record.state === "bus-uncertain" ? "retry-or-discard" : "drain",
+          })),
+      ];
+      return {
+        profile: this.profile,
+        mode: snapshot.mode,
+        admissionEnabled:
+          !this.#admissionDisabled && snapshot.mode === "active",
+        committedUpdateId: snapshot.committedUpdateId,
+        counts,
+        quota: { ...snapshot.quota, limitBytes: this.quotaBytes },
+        oldestUnresolvedAgeMs:
+          items.length === 0
+            ? null
+            : Math.max(...items.map((item) => item.ageMs)),
+        items,
+        incidents: [...new Set(this.#incidents)],
+      };
+    });
+  }
+
+  downgradePreflight(): RecoveryDowngradePreflight {
+    const status = this.getStatus();
+    const blockers = status.items;
+    return {
+      safe: blockers.length === 0,
+      blockerCount: blockers.length,
+      blockers,
+    };
+  }
+
+  beginDowngradeExclusive(): RecoveryDowngradePreflight {
+    this.#admissionDisabled = true;
+    try {
+      return this.#commit((snapshot) => {
+        const blockers = snapshot.inbound.filter((record) =>
+          isInboundUnresolved(record.state),
+        );
+        if (
+          blockers.length > 0 ||
+          snapshot.outbound.some(isUnresolvedRecord) ||
+          snapshot.bus.some(isUnresolvedRecord)
+        ) {
+          throw new Error("Recovery downgrade blocked by nonterminal records");
+        }
+        this.#fault?.("DOWN-01");
+        snapshot.mode = "downgrade-exclusive";
+        return { safe: true, blockerCount: 0, blockers: [] };
+      });
+    } catch (error) {
+      this.#admissionDisabled = false;
+      throw error;
+    }
+  }
+
+  quarantineForDowngrade(): string {
+    this.#admissionDisabled = true;
+    return withTelegramFileTransaction(`${this.rootPath}.transaction`, () => {
+      const snapshot = this.#readSnapshotForMutationLocked();
+      if (snapshot.mode !== "downgrade-exclusive") {
+        throw new Error("Recovery downgrade-exclusive preflight is required");
+      }
+      if (
+        snapshot.inbound.some((record) => isInboundUnresolved(record.state)) ||
+        snapshot.outbound.some(isUnresolvedRecord) ||
+        snapshot.bus.some(isUnresolvedRecord)
+      ) {
+        throw new Error("Recovery downgrade blockers appeared after preflight");
+      }
+      const quarantinePath = join(
+        dirname(this.rootPath),
+        `${getQuarantineProfilePrefix(this.profile)}${this.#now()}-${this.#randomId()}`,
+      );
+      this.#fs.rename(this.rootPath, quarantinePath);
+      this.#fault?.("DOWN-02");
+      fsyncPath(this.#fs, dirname(this.rootPath));
+      return quarantinePath;
+    });
+  }
+
+  cancelDowngradeExclusive(): void {
+    this.#commit((snapshot) => {
+      if (snapshot.mode !== "downgrade-exclusive") {
+        throw new Error("Recovery store is not in downgrade-exclusive mode");
+      }
+      snapshot.mode = "active";
+    });
+    this.#admissionDisabled = false;
+  }
+}
+
+export function openRecoveryStore(
+  options: RecoveryStoreOpenOptions,
+): RecoveryStore {
+  return new RecoveryStore(options).initialize();
+}
+
+export function restoreRecoveryQuarantine(options: {
+  profile: string;
+  quarantinePath: string;
+  agentDir?: string;
+  rootPath?: string;
+  fs?: Partial<RecoveryFileSystem>;
+  now?: () => number;
+  randomId?: () => string;
+}): string {
+  const profile = readProfile(options.profile, "$profile");
+  const rootPath =
+    options.rootPath ?? resolveRecoveryStorePath(profile, options.agentDir);
+  const fs: RecoveryFileSystem = {
+    ...NODE_RECOVERY_FILE_SYSTEM,
+    ...options.fs,
+  };
+  const quarantines = listQuarantines(fs, rootPath, profile);
+  if (!quarantines.includes(options.quarantinePath)) {
+    throw new Error(
+      "Recovery quarantine path is not an exact compatible profile backup",
+    );
+  }
+  return withTelegramFileTransaction(`${rootPath}.transaction`, () => {
+    if (fs.exists(rootPath)) {
+      throw new Error(
+        "Cannot restore recovery quarantine over an active store",
+      );
+    }
+    const snapshot = validateRecoveryStoreBackup(
+      fs,
+      options.quarantinePath,
+      profile,
+    );
+    const active = cloneSnapshot(snapshot);
+    active.mode = "active";
+    active.revision += 1;
+    active.writtenAtMs = (options.now ?? Date.now)();
+    const serialized = serializeAccountedSnapshot(active);
+    const restorePublicationPeak =
+      physicalFileBytes(fs, options.quarantinePath) +
+      Buffer.byteLength(serialized);
+    if (restorePublicationPeak > RECOVERY_PROFILE_QUOTA_BYTES) {
+      throw new RecoveryQuotaExceededError(
+        restorePublicationPeak,
+        RECOVERY_PROFILE_QUOTA_BYTES,
+      );
+    }
+    fs.rename(options.quarantinePath, rootPath);
+    const tempPath = `${join(rootPath, RECOVERY_SNAPSHOT_FILE_NAME)}${RECOVERY_TEMP_FILE_MARKER}${process.pid}-${(options.randomId ?? randomUUID)()}`;
+    writePrivateFile(fs, tempPath, serialized);
+    fs.rename(tempPath, join(rootPath, RECOVERY_SNAPSHOT_FILE_NAME));
+    fsyncPath(fs, rootPath);
+    fsyncPath(fs, dirname(rootPath));
+    return rootPath;
+  });
 }

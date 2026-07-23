@@ -4,6 +4,7 @@
  * Owns queue item contracts, lane admission, pure queue mutations, and dispatch planning
  */
 
+import type { TelegramInboundHandlingOutcome } from "./updates.ts";
 import { isVoiceTurn } from "./voice.ts";
 
 // --- Queue Items ---
@@ -95,9 +96,20 @@ export interface TelegramQueueItemBase {
 export interface PendingTelegramTurn extends TelegramQueueItemBase {
   kind: "prompt";
   sourceMessageIds: number[];
+  recovery?: {
+    recordIds: string[];
+    turnId: string;
+  };
   queuedAttachments: QueuedAttachment[];
   content: TelegramPromptContent[];
   historyText: string;
+  /** Private recovery-only source files; never rendered or sent as Pi content. */
+  recoveryFiles?: Array<{
+    path: string;
+    fileName: string;
+    mimeType?: string;
+    kind?: string;
+  }>;
   priorityEmoji?: string;
 
   /** Turn should preferably be delivered as voice (mirror mode + user sent voice) */
@@ -341,6 +353,12 @@ function isDuplicateTelegramPromptTurn(
   left: PendingTelegramTurn,
   right: PendingTelegramTurn,
 ): boolean {
+  if (left.recovery?.turnId || right.recovery?.turnId) {
+    return (
+      left.recovery?.turnId !== undefined &&
+      left.recovery.turnId === right.recovery?.turnId
+    );
+  }
   return (
     left.chatId === right.chatId &&
     left.target?.threadId === right.target?.threadId &&
@@ -835,7 +853,9 @@ export type TelegramAgentLifecycleHooksRuntimeDeps<
   TReplyMarkup = unknown,
 > = TelegramAgentStartHookRuntimeDeps<TTurn, TContext> &
   TelegramAgentEndHookRuntimeDeps<TTurn, TContext, TMessage, TReplyMarkup> &
-  TelegramToolExecutionHookRuntimeDeps<TContext>;
+  TelegramToolExecutionHookRuntimeDeps<TContext> & {
+    onTurnSettled?: (turn: TTurn) => void;
+  };
 
 export function createTelegramAgentLifecycleHooks<
   TTurn extends PendingTelegramTurn,
@@ -883,6 +903,7 @@ export function createTelegramAgentLifecycleHooks<
           { phase: "recovered" },
         );
       }
+      if (turn) deps.onTurnSettled?.(turn);
       await deliverAgentEnd(event, ctx, assistant);
     },
     async onAgentSettled(_event: unknown, ctx: TContext): Promise<void> {
@@ -894,6 +915,8 @@ export function createTelegramAgentLifecycleHooks<
         new Error("Finalized retained Telegram turn after agent settled"),
         { phase: "settled-failure" },
       );
+      const turn = deps.getActiveTurn();
+      if (turn) deps.onTurnSettled?.(turn);
       await deliverAgentEnd(event, ctx);
     },
     clearRetainedAgentEnd(): void {
@@ -1694,7 +1717,10 @@ export interface TelegramPromptEnqueueControllerDeps<
 }
 
 export interface TelegramPromptEnqueueController<TMessage, TContext = unknown> {
-  enqueue: (messages: TMessage[], ctx: TContext) => Promise<void>;
+  enqueue: (
+    messages: TMessage[],
+    ctx: TContext,
+  ) => Promise<TelegramInboundHandlingOutcome>;
 }
 
 function isTelegramStaleContextError(error: unknown): boolean {
@@ -2014,18 +2040,27 @@ export async function enqueueTelegramPromptTurnRuntime<
 >(
   messages: TMessage[],
   deps: TelegramPromptEnqueueRuntimeDeps<TMessage, TContext>,
-): Promise<void> {
+): Promise<TelegramInboundHandlingOutcome> {
   const enqueuePlan = planTelegramPromptEnqueue(
     deps.getQueuedItems(),
     deps.getFoldQueuedPromptsIntoHistory(),
   );
   deps.setFoldQueuedPromptsIntoHistory(false);
   const turn = await deps.createTurn(messages, enqueuePlan.historyTurns);
-  deps.setQueuedItems(
-    appendTelegramQueueItem(enqueuePlan.remainingItems, turn),
+  const appended = appendTelegramPromptTurnOnce(
+    enqueuePlan.remainingItems,
+    turn,
   );
+  deps.setQueuedItems(appended.items);
   deps.updateStatus();
   deps.dispatchNextQueuedTelegramTurn();
+  return {
+    kind: "prompt-materialized",
+    turnId:
+      turn.recovery?.turnId ??
+      `queue:${turn.chatId}:${turn.replyToMessageId}:${turn.queueOrder}`,
+    recordIds: [...(turn.recovery?.recordIds ?? [])],
+  };
 }
 
 export function createTelegramPromptEnqueueController<
@@ -2284,6 +2319,8 @@ export interface TelegramQueueDispatchControllerDeps<
   onPromptDispatchStart: (ctx: TContext, chatId: number) => void;
   sendUserMessage: TelegramDispatchRuntimeDeps<TContext>["sendUserMessage"];
   onPromptDispatchFailure: (ctx: TContext, message: string) => void;
+  claimPromptDispatch?: (item: PendingTelegramTurn) => boolean;
+  onPromptDispatchFailedAfterClaim?: (item: PendingTelegramTurn) => void;
   isQueueItemTransportActive?: (item: TelegramQueueItem<TContext>) => boolean;
 }
 
@@ -2339,6 +2376,8 @@ export function createTelegramQueueDispatchRuntime<TContext = unknown>(
     onPromptDispatchStart: deps.onPromptDispatchStart,
     sendUserMessage: deps.sendUserMessage,
     onPromptDispatchFailure: deps.onPromptDispatchFailure,
+    claimPromptDispatch: deps.claimPromptDispatch,
+    onPromptDispatchFailedAfterClaim: deps.onPromptDispatchFailedAfterClaim,
     isQueueItemTransportActive: deps.isQueueItemTransportActive,
     recordRuntimeEvent: deps.recordRuntimeEvent,
   });
@@ -2373,6 +2412,14 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
         activeItems,
         deps.canDispatch(ctx),
       );
+      if (
+        dispatchPlan.kind === "prompt" &&
+        deps.claimPromptDispatch &&
+        !deps.claimPromptDispatch(dispatchPlan.item)
+      ) {
+        deps.updateStatus(ctx, "Durable Telegram turn dispatch is fenced.");
+        return;
+      }
       if (dispatchPlan.kind !== "none") {
         deps.setQueuedItems(dispatchPlan.remainingItems);
       }
@@ -2405,6 +2452,9 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
         },
         sendUserMessage: deps.sendUserMessage,
         onPromptDispatchFailure: (message) => {
+          if (dispatchPlan.kind === "prompt") {
+            deps.onPromptDispatchFailedAfterClaim?.(dispatchPlan.item);
+          }
           deps.onPromptDispatchFailure(ctx, message);
         },
         onIdle: () => {

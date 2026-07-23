@@ -4,6 +4,7 @@
  */
 
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdtempSync,
@@ -35,6 +36,7 @@ import {
   getTelegramBusFollowerSocketPath,
   getTelegramBusSocketPath,
   getTelegramFollowerTargetOwnership,
+  getTelegramProcessBirthIdentity,
   isTelegramFollowerApiCallAllowed,
   markTelegramBusAggregateDelivery,
   parseTelegramBusEnvelope,
@@ -61,6 +63,47 @@ test("Bus process runtime resolves live profile endpoints", () => {
   assert.notEqual(runtime.getFollowerSocketPath(), defaultFollowerPath);
   assert.match(runtime.getLeaderSocketPath(), /work/);
   assert.match(runtime.getFollowerSocketPath(), /work/);
+});
+
+test("Bus fallback owner identity survives reloads and changes only with a fresh process", () => {
+  const first = createTelegramBusProcessRuntime({
+    getActiveProfileName: () => undefined,
+    pid: 42,
+    parentPid: 987_654_321,
+    createdAtMs: 1000,
+  });
+  const reloaded = createTelegramBusProcessRuntime({
+    getActiveProfileName: () => undefined,
+    pid: 42,
+    parentPid: 987_654_321,
+    createdAtMs: 2000,
+  });
+  assert.equal(first.manualFollowerOwnerId, reloaded.manualFollowerOwnerId);
+  assert.doesNotMatch(first.manualFollowerOwnerId, /1000|2000/);
+  const sibling = createTelegramBusProcessRuntime({
+    getActiveProfileName: () => undefined,
+    pid: 43,
+    parentPid: 987_654_321,
+    createdAtMs: 1000,
+  });
+  assert.notEqual(first.manualFollowerOwnerId, sibling.manualFollowerOwnerId);
+
+  const moduleUrl = new URL("../lib/bus.ts", import.meta.url).href;
+  const script = `import { getTelegramProcessBirthIdentity } from ${JSON.stringify(moduleUrl)}; console.log(getTelegramProcessBirthIdentity(0, "ignored"));`;
+  const runFreshProcess = () => {
+    const result = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", "--input-type=module", "--eval", script],
+      { encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  assert.notEqual(runFreshProcess(), runFreshProcess());
+  assert.equal(
+    getTelegramProcessBirthIdentity(987_654_321, "a"),
+    getTelegramProcessBirthIdentity(987_654_321, "b"),
+  );
 });
 
 test("Bus process runtime falls back to pid without a parent pid", () => {
@@ -314,6 +357,70 @@ test("Bus contract encodes and parses follower target replacement envelopes", ()
   );
 });
 
+test("Bus contract strictly parses recovery fence envelopes and acknowledgements", () => {
+  const fence = {
+    kind: "leader.fenceRecovery" as const,
+    requestId: "leader:fence:1",
+    auth: "secret",
+    profile: "work",
+    recipientInstanceId: "follower-a",
+    recipientRegistrationGeneration: "registration-a",
+    fenceGeneration: "fence-a",
+    sentAtMs: 1000,
+  };
+  assert.deepEqual(
+    parseTelegramBusEnvelope(encodeTelegramBusEnvelope(fence).trimEnd()),
+    fence,
+  );
+  assert.equal(
+    parseTelegramBusEnvelope(JSON.stringify({ ...fence, extra: true })),
+    undefined,
+  );
+  assert.equal(
+    parseTelegramBusEnvelope(
+      JSON.stringify({ ...fence, recipientRegistrationGeneration: "" }),
+    ),
+    undefined,
+  );
+
+  const recoveryFence = {
+    version: 1 as const,
+    state: "fenced" as const,
+    profile: "work",
+    recipientInstanceId: "follower-a",
+    recipientRegistrationGeneration: "registration-a",
+    fenceGeneration: "fence-a",
+  };
+  assert.deepEqual(
+    parseTelegramBusEnvelope(
+      encodeTelegramBusEnvelope({
+        kind: "bus.ack",
+        requestId: fence.requestId,
+        ok: true,
+        recoveryFence,
+      }).trimEnd(),
+    ),
+    {
+      kind: "bus.ack",
+      requestId: fence.requestId,
+      ok: true,
+      message: undefined,
+      recoveryFence,
+    },
+  );
+  assert.equal(
+    parseTelegramBusEnvelope(
+      JSON.stringify({
+        kind: "bus.ack",
+        requestId: fence.requestId,
+        ok: true,
+        recoveryFence: { ...recoveryFence, unexpected: true },
+      }),
+    ),
+    undefined,
+  );
+});
+
 test("Bus contract encodes and parses follower API call envelopes", () => {
   const richBody = {
     chat_id: 1,
@@ -347,6 +454,76 @@ test("Bus contract encodes and parses follower API call envelopes", () => {
       sentAtMs: 4000,
     },
   );
+});
+
+test("Bus contract strictly parses durable follower admission envelopes and ACKs", () => {
+  const forward = {
+    kind: "leader.forwardUpdate" as const,
+    requestId: "leader:durable:1",
+    auth: "secret",
+    profile: "default",
+    target: { chatId: 7, threadId: 42 },
+    recipientInstanceId: "inst-b",
+    recipientRegistrationGeneration: "registration-b",
+    update: { update_id: 88, message: { message_id: 9 } },
+    sentAtMs: 1000,
+  };
+  assert.deepEqual(
+    parseTelegramBusEnvelope(encodeTelegramBusEnvelope(forward).trimEnd()),
+    forward,
+  );
+  assert.equal(
+    parseTelegramBusEnvelope(
+      JSON.stringify({ ...forward, unexpected: true }),
+    ),
+    undefined,
+  );
+
+  const durableAdmission = {
+    version: 1 as const,
+    updateId: 88,
+    recordId: "record-88",
+    turnId: "turn-88",
+    profile: "default",
+    target: { chatId: 7, threadId: 42 },
+    ownerId: "manual-owner-b",
+    registrationGeneration: "registration-b",
+    sessionGeneration: 3,
+    admissionRevision: 12,
+    disposition: "admitted" as const,
+  };
+  const ack = parseTelegramBusEnvelope(
+    encodeTelegramBusEnvelope({
+      kind: "bus.ack",
+      requestId: forward.requestId,
+      ok: true,
+      durableAdmission,
+    }).trimEnd(),
+  );
+  assert.equal(ack?.kind, "bus.ack");
+  assert.deepEqual(
+    ack?.kind === "bus.ack" ? ack.durableAdmission : undefined,
+    durableAdmission,
+  );
+  assert.equal(
+    parseTelegramBusEnvelope(
+      JSON.stringify({
+        kind: "bus.ack",
+        requestId: forward.requestId,
+        ok: true,
+        durableAdmission: { ...durableAdmission, extra: true },
+      }),
+    ),
+    undefined,
+  );
+  for (const invalid of [
+    { kind: "bus.ack", requestId: forward.requestId, ok: true, unexpected: true },
+    { kind: "bus.ack", requestId: forward.requestId, ok: false, durableAdmission },
+    { kind: "bus.ack", requestId: forward.requestId, ok: true, error: { code: "commit-unknown" } },
+    { kind: "bus.ack", requestId: "", ok: true },
+  ]) {
+    assert.equal(parseTelegramBusEnvelope(JSON.stringify(invalid)), undefined);
+  }
 });
 
 test("Bus contract encodes and parses forwarded update envelopes", () => {

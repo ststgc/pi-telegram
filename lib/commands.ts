@@ -7,6 +7,7 @@
 import { TELEGRAM_DEFAULT_PROFILE_NAME } from "./config.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "./pi.ts";
 import type { TelegramBridgeStatusLineOptions } from "./status.ts";
+import type { TelegramInboundHandlingOutcome } from "./updates.ts";
 import {
   createTelegramControlItemBuilder,
   createTelegramControlQueueController,
@@ -502,7 +503,10 @@ export interface TelegramCommandActionDeps<TMessage, TContext> {
   handleStop: (message: TMessage, ctx: TContext) => Promise<void>;
   handleAbort: (message: TMessage, ctx: TContext) => Promise<void>;
   handleNext: (message: TMessage, ctx: TContext) => Promise<void>;
-  handleContinue: (message: TMessage, ctx: TContext) => Promise<void>;
+  handleContinue: (
+    message: TMessage,
+    ctx: TContext,
+  ) => Promise<TelegramInboundHandlingOutcome>;
   handleQueue: (message: TMessage, ctx: TContext) => Promise<void>;
   handleCompact: (message: TMessage, ctx: TContext) => Promise<void>;
   handleStatus: (message: TMessage, ctx: TContext) => Promise<void>;
@@ -829,18 +833,21 @@ export interface TelegramCommandOrPromptRuntimeDeps<TMessage, TContext> {
     commandName: string | undefined,
     message: TMessage,
     ctx: TContext,
-  ) => Promise<boolean>;
+  ) => Promise<boolean | TelegramInboundHandlingOutcome>;
   executeExtensionCommand?: (
     command: ParsedTelegramCommand,
     message: TMessage,
     ctx: TContext,
-  ) => Promise<boolean>;
+  ) => Promise<TelegramInboundHandlingOutcome | undefined>;
   expandPromptTemplateCommand?: (
     commandName: string,
     args: string,
   ) => string | undefined;
   replaceMessageText: (message: TMessage, text: string) => TMessage;
-  enqueueTurn: (messages: TMessage[], ctx: TContext) => Promise<void>;
+  enqueueTurn: (
+    messages: TMessage[],
+    ctx: TContext,
+  ) => Promise<TelegramInboundHandlingOutcome>;
 }
 
 export interface TelegramCommandRuntimeDeps<
@@ -870,7 +877,10 @@ export interface TelegramCommandRuntimeDeps<
     options?: { target?: { chatId: number; threadId?: number } },
   ) => void;
   stopTypingLoop?: () => void;
-  enqueueContinueTurn: (message: TMessage, ctx: TContext) => Promise<void>;
+  enqueueContinueTurn: (
+    message: TMessage,
+    ctx: TContext,
+  ) => Promise<TelegramInboundHandlingOutcome>;
   compact: (
     ctx: TContext,
     callbacks: { onComplete: () => void; onError: (error: unknown) => void },
@@ -1105,10 +1115,13 @@ export async function handleTelegramContinueCommand<TMessage, TContext>(
   message: TMessage,
   ctx: TContext,
   deps: {
-    enqueueContinueTurn: (message: TMessage, ctx: TContext) => Promise<void>;
+    enqueueContinueTurn: (
+      message: TMessage,
+      ctx: TContext,
+    ) => Promise<TelegramInboundHandlingOutcome>;
   },
-): Promise<void> {
-  await deps.enqueueContinueTurn(message, ctx);
+): Promise<TelegramInboundHandlingOutcome> {
+  return deps.enqueueContinueTurn(message, ctx);
 }
 
 function dispatchNextQueuedTelegramTurnAfterCompact(
@@ -1289,7 +1302,7 @@ export async function executeTelegramCommandAction<TMessage, TContext>(
   message: TMessage,
   ctx: TContext,
   deps: TelegramCommandActionDeps<TMessage, TContext>,
-): Promise<boolean> {
+): Promise<boolean | TelegramInboundHandlingOutcome> {
   switch (action.kind) {
     case "ignore":
       return false;
@@ -1303,8 +1316,7 @@ export async function executeTelegramCommandAction<TMessage, TContext>(
       await deps.handleNext(message, ctx);
       return true;
     case "continue":
-      await deps.handleContinue(message, ctx);
-      return true;
+      return deps.handleContinue(message, ctx);
     case "queue":
       await deps.handleQueue(message, ctx);
       return true;
@@ -1359,7 +1371,7 @@ export function createTelegramCommandHandlerTargetRuntime<
   commandName: string | undefined,
   message: TMessage,
   ctx: TContext,
-) => Promise<boolean> {
+) => Promise<boolean | TelegramInboundHandlingOutcome> {
   const commandTargetRuntime = createTelegramCommandTargetQueueRuntime<
     TMessage,
     TContext
@@ -1419,7 +1431,7 @@ export function createTelegramCommandHandler<
     commandName: string | undefined,
     message: TMessage,
     ctx: TContext,
-  ): Promise<boolean> => {
+  ): Promise<boolean | TelegramInboundHandlingOutcome> => {
     return handleTelegramCommandRuntime(commandName, message, ctx, deps);
   };
 }
@@ -1431,24 +1443,26 @@ export function createTelegramCommandOrPromptRuntime<TMessage, TContext>(
     dispatchMessages: async (
       messages: TMessage[],
       ctx: TContext,
-    ): Promise<void> => {
+    ): Promise<TelegramInboundHandlingOutcome> => {
       const firstMessage = messages[0];
-      if (!firstMessage) return;
-      if (deps.shouldIgnoreMessages?.(messages)) return;
+      if (!firstMessage || deps.shouldIgnoreMessages?.(messages)) {
+        return { kind: "completed", reason: "ignored" };
+      }
       const command = parseTelegramCommand(deps.extractRawText(messages));
       const handled = await deps.handleCommand(
         command?.name,
         firstMessage,
         ctx,
       );
-      if (handled) return;
+      if (typeof handled !== "boolean") return handled;
+      if (handled) return { kind: "completed", reason: "command" };
       if (command && deps.executeExtensionCommand) {
-        const handledByExtension = await deps.executeExtensionCommand(
+        const extensionOutcome = await deps.executeExtensionCommand(
           command,
           messages[0]!,
           ctx,
         );
-        if (handledByExtension) return;
+        if (extensionOutcome) return extensionOutcome;
       }
       if (command?.name && deps.expandPromptTemplateCommand) {
         const expanded = deps.expandPromptTemplateCommand(
@@ -1456,17 +1470,16 @@ export function createTelegramCommandOrPromptRuntime<TMessage, TContext>(
           command.args,
         );
         if (expanded !== undefined) {
-          await deps.enqueueTurn(
+          return deps.enqueueTurn(
             [
               deps.replaceMessageText(firstMessage, expanded),
               ...messages.slice(1),
             ],
             ctx,
           );
-          return;
         }
       }
-      await deps.enqueueTurn(messages, ctx);
+      return deps.enqueueTurn(messages, ctx);
     },
   };
 }
@@ -1479,7 +1492,7 @@ async function handleTelegramCommandRuntime<
   message: TMessage,
   ctx: TContext,
   deps: TelegramCommandRuntimeDeps<TMessage, TContext>,
-): Promise<boolean> {
+): Promise<boolean | TelegramInboundHandlingOutcome> {
   const sendReplyFor = (nextMessage: TMessage) => (text: string) =>
     deps.sendTextReply(nextMessage, text);
   const updateStatusFor = (commandCtx: TContext) => () =>
@@ -1527,11 +1540,10 @@ async function handleTelegramCommandRuntime<
           sendTextReply: sendReplyFor(nextMessage),
         });
       },
-      handleContinue: async (nextMessage, commandCtx) => {
-        await handleTelegramContinueCommand(nextMessage, commandCtx, {
+      handleContinue: (nextMessage, commandCtx) =>
+        handleTelegramContinueCommand(nextMessage, commandCtx, {
           enqueueContinueTurn: deps.enqueueContinueTurn,
-        });
-      },
+        }),
       handleQueue: async (nextMessage, commandCtx) => {
         await deps.openQueueMenu(nextMessage, commandCtx);
       },

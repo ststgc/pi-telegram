@@ -5,11 +5,27 @@
  */
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
   areRecoveryOwnersEqual,
+  openRecoveryStore,
   parseRecoverySnapshot,
   RECOVERY_BUS_STATES,
   RECOVERY_DELIVERED_PAYLOAD_RETENTION_MS,
@@ -29,10 +45,15 @@ import {
   RECOVERY_UNRESOLVED_BUS_STATES,
   RECOVERY_UNRESOLVED_INBOUND_STATES,
   RECOVERY_UNRESOLVED_OUTBOUND_STATES,
+  RecoveryProfileOperationGate,
+  RecoveryQuarantineError,
+  RecoveryQuotaExceededError,
+  restoreRecoveryQuarantine,
   type RecoveryIdentity,
   type RecoveryOwnerIdentity,
   type RecoverySameProcessHandoff,
   type RecoverySnapshotV1,
+  type RecoveryStore,
   validateRecoverySameProcessHandoff,
   validateRecoverySnapshot,
 } from "../lib/recovery.ts";
@@ -42,6 +63,42 @@ import {
   ReliabilityFaultController,
   type ReliabilityFaultId,
 } from "./fixtures/reliability-faults.ts";
+
+test("profile downgrade gate fences races, drains in-flight work, and never reopens quarantine", async () => {
+  const gate = new RecoveryProfileOperationGate();
+  const first = gate.enter("default");
+  assert.ok(first);
+  assert.equal(gate.getState("default").inFlight, 1);
+
+  assert.equal(gate.beginFencing("default", "fence-a"), "fence-a");
+  assert.equal(gate.enter("default"), undefined);
+  let drained = false;
+  const drain = gate.awaitDrained("default", "fence-a").then(() => {
+    drained = true;
+  });
+  await Promise.resolve();
+  assert.equal(drained, false);
+  first.release();
+  await drain;
+  assert.equal(drained, true);
+
+  assert.throws(
+    () => gate.beginDowngradeExclusive("default", "fence-stale"),
+    /generation mismatch/,
+  );
+  gate.beginDowngradeExclusive("default", "fence-a");
+  assert.equal(gate.getState("default").phase, "downgrade-exclusive");
+  gate.resume("default", "fence-a");
+  assert.equal(gate.getState("default").phase, "active");
+
+  gate.beginFencing("default", "fence-b");
+  await gate.awaitDrained("default", "fence-b");
+  gate.beginDowngradeExclusive("default", "fence-b");
+  gate.markQuarantined("default", "fence-b");
+  assert.equal(gate.getState("default").phase, "quarantined");
+  assert.equal(gate.enter("default"), undefined);
+  assert.throws(() => gate.resume("default", "fence-b"), /cannot resume/);
+});
 
 const OLD_IDENTITY: RecoveryIdentity = {
   profile: "default",
@@ -53,6 +110,8 @@ const OLD_IDENTITY: RecoveryIdentity = {
   },
   sessionGeneration: 3,
 };
+const TEST_SHA256 = "0".repeat(64);
+
 const NEW_OWNER: RecoveryOwnerIdentity = {
   kind: "leader",
   ownerId: "leader-b",
@@ -87,10 +146,19 @@ function makeSnapshot(
     identity: OLD_IDENTITY,
     createdRevision: 1 + index,
     stateRevision: 1 + index,
+    ...(state !== "observed" ? { admissionRevision: 1 + index } : {}),
     createdAtMs: 100 + index,
     updatedAtMs: 200 + index,
-    payloadRef: { payloadId: `prompt-${index}`, byteLength: 10 + index },
-    spoolRefs: [{ spoolId: `in-spool-${index}`, byteLength: 20 + index }],
+    payloadRef: {
+      payloadId: `prompt-${index}`,
+      byteLength: 10 + index,
+      sha256: TEST_SHA256,
+    },
+    spoolRefs: [{
+      spoolId: `in-spool-${index}`,
+      byteLength: 20 + index,
+      sha256: TEST_SHA256,
+    }],
   }));
   const outbound = RECOVERY_OUTBOUND_STATES.map((state, index) => ({
     family: "outbound" as const,
@@ -103,8 +171,16 @@ function makeSnapshot(
     stateRevision: 10 + index,
     createdAtMs: 300 + index,
     updatedAtMs: 400 + index,
-    payloadRef: { payloadId: `answer-${index}`, byteLength: 30 + index },
-    spoolRefs: [{ spoolId: `out-spool-${index}`, byteLength: 40 + index }],
+    payloadRef: {
+      payloadId: `answer-${index}`,
+      byteLength: 30 + index,
+      sha256: TEST_SHA256,
+    },
+    spoolRefs: [{
+      spoolId: `out-spool-${index}`,
+      byteLength: 40 + index,
+      sha256: TEST_SHA256,
+    }],
   }));
   const bus = RECOVERY_BUS_STATES.map((state, index) => ({
     family: "bus" as const,
@@ -117,7 +193,11 @@ function makeSnapshot(
     stateRevision: 20 + index,
     createdAtMs: 500 + index,
     updatedAtMs: 600 + index,
-    payloadRef: { payloadId: `bus-payload-${index}`, byteLength: 50 + index },
+    payloadRef: {
+      payloadId: `bus-payload-${index}`,
+      byteLength: 50 + index,
+      sha256: TEST_SHA256,
+    },
     spoolRefs: [],
   }));
   const unresolvedRecordIds = [...inbound, ...outbound, ...bus]
@@ -144,6 +224,7 @@ function makeSnapshot(
       reservedBytes: 10,
       totalBytes: 2000,
     },
+    committedUpdateId: 1999,
     inbound,
     outbound,
     bus,
@@ -181,6 +262,119 @@ function expectInvalid(
 
 function records(value: Record<string, unknown>, family: "inbound" | "outbound" | "bus") {
   return value[family] as Array<Record<string, unknown>>;
+}
+
+function createStoreHarness(options: {
+  fault?: (faultId: ReliabilityFaultId) => void;
+  quotaBytes?: number;
+  authenticated?: (identity: RecoveryIdentity) => boolean;
+  validateReassignmentBinding?: Parameters<typeof openRecoveryStore>[0]["validateReassignmentBinding"];
+  actionId?: (stableInput: string) => string;
+  terminalMetadataMaxRecords?: number;
+  terminalMetadataMaxBytes?: number;
+  fs?: Parameters<typeof openRecoveryStore>[0]["fs"];
+} = {}): {
+  directory: string;
+  rootPath: string;
+  store: RecoveryStore;
+  now: { value: number };
+} {
+  const directory = mkdtempSync(join(tmpdir(), "pi-telegram-recovery-"));
+  const rootPath = join(directory, "recovery-v1");
+  const now = { value: 10_000 };
+  let id = 0;
+  const store = openRecoveryStore({
+    profile: "default",
+    rootPath,
+    now: () => now.value,
+    randomId: () => `id-${++id}`,
+    quotaBytes: options.quotaBytes,
+    fault: options.fault,
+    isIdentityAuthenticated:
+      options.authenticated ?? ((identity) => identitiesMatch(identity, OLD_IDENTITY)),
+    validateReassignmentBinding: options.validateReassignmentBinding,
+    actionId: options.actionId,
+    terminalMetadataMaxRecords: options.terminalMetadataMaxRecords,
+    terminalMetadataMaxBytes: options.terminalMetadataMaxBytes,
+    fs: options.fs,
+  });
+  return { directory, rootPath, store, now };
+}
+
+function identitiesMatch(left: RecoveryIdentity, right: RecoveryIdentity): boolean {
+  return (
+    left.profile === right.profile &&
+    left.target.chatId === right.target.chatId &&
+    left.target.threadId === right.target.threadId &&
+    left.sessionGeneration === right.sessionGeneration &&
+    areRecoveryOwnersEqual(left.owner, right.owner)
+  );
+}
+
+function reopenStore(
+  harness: ReturnType<typeof createStoreHarness>,
+  options: {
+    fault?: (faultId: ReliabilityFaultId) => void;
+    authenticated?: (identity: RecoveryIdentity) => boolean;
+    validateReassignmentBinding?: Parameters<typeof openRecoveryStore>[0]["validateReassignmentBinding"];
+    actionId?: (stableInput: string) => string;
+    terminalMetadataMaxRecords?: number;
+    terminalMetadataMaxBytes?: number;
+    fs?: Parameters<typeof openRecoveryStore>[0]["fs"];
+  } = {},
+): RecoveryStore {
+  let id = 1000;
+  return openRecoveryStore({
+    profile: "default",
+    rootPath: harness.rootPath,
+    now: () => harness.now.value,
+    randomId: () => `reopen-${++id}`,
+    fault: options.fault,
+    isIdentityAuthenticated:
+      options.authenticated ?? ((identity) => identitiesMatch(identity, OLD_IDENTITY)),
+    validateReassignmentBinding: options.validateReassignmentBinding,
+    actionId: options.actionId,
+    terminalMetadataMaxRecords: options.terminalMetadataMaxRecords,
+    terminalMetadataMaxBytes: options.terminalMetadataMaxBytes,
+    fs: options.fs,
+  });
+}
+
+function removeHarness(harness: ReturnType<typeof createStoreHarness>): void {
+  rmSync(harness.directory, { recursive: true, force: true });
+}
+
+function readStoreSnapshot(rootPath: string): RecoverySnapshotV1 {
+  return parseRecoverySnapshot(readFileSync(join(rootPath, "snapshot.json"), "utf8"));
+}
+
+function sha256(value: Uint8Array | string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function writeAccountedSnapshot(rootPath: string, snapshot: RecoverySnapshotV1): void {
+  const allRecords = [...snapshot.inbound, ...snapshot.outbound, ...snapshot.bus];
+  snapshot.quota.payloadBytes = allRecords.reduce(
+    (sum, record) => sum + (record.payloadRef?.byteLength ?? 0),
+    0,
+  );
+  snapshot.quota.spoolBytes = allRecords.reduce(
+    (sum, record) => sum + record.spoolRefs.reduce((nested, ref) => nested + ref.byteLength, 0),
+    0,
+  );
+  snapshot.quota.reservedBytes = 0;
+  let previous = -1;
+  let serialized = "";
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    snapshot.quota.recordBytes = Math.max(0, previous);
+    snapshot.quota.totalBytes =
+      snapshot.quota.recordBytes + snapshot.quota.payloadBytes + snapshot.quota.spoolBytes;
+    serialized = `${JSON.stringify(snapshot, null, 2)}\n`;
+    const next = Buffer.byteLength(serialized);
+    if (next === snapshot.quota.recordBytes) break;
+    previous = next;
+  }
+  writeFileSync(join(rootPath, "snapshot.json"), serialized, { mode: 0o600 });
 }
 
 test("recovery snapshot v1 roundtrips all states, quota, and store modes", () => {
@@ -312,6 +506,7 @@ test("captured reassignment survives grant or cancel followed by terminal resolu
     const snapshot = makeSnapshot("active", reassignmentState);
     const captured = snapshot.inbound[0]!;
     captured.state = "completed";
+    captured.admissionRevision = 40;
     captured.stateRevision = 60;
     assert.deepEqual(parseRecoverySnapshot(JSON.stringify(snapshot)), snapshot);
 
@@ -415,17 +610,1300 @@ test("quota accounting and global payload/spool references fail closed", () => {
     quota.payloadBytes = 527;
     quota.totalBytes = 1999;
   }, /referenced payload bytes/);
+  expectInvalid((value) => {
+    const payloadRef = records(value, "inbound")[0]!.payloadRef as Record<string, unknown>;
+    delete payloadRef.sha256;
+  }, /sha256.*missing field/);
+  expectInvalid((value) => {
+    const payloadRef = records(value, "inbound")[0]!.payloadRef as Record<string, unknown>;
+    payloadRef.sha256 = "not-a-digest";
+  }, /SHA-256/);
+});
+
+test("profile-scoped recovery store is private and admits idempotently with one prefix authority", () => {
+  const harness = createStoreHarness();
+  try {
+    const { store, rootPath } = harness;
+    const observed = store.observeInbound(101, OLD_IDENTITY);
+    assert.deepEqual(store.observeInbound(101, OLD_IDENTITY), observed);
+    const admitted = store.admitInbound({
+      recordId: observed.recordId,
+      payload: Buffer.from("prompt-body"),
+      spool: [Buffer.from("attachment")],
+    });
+    assert.equal(admitted.turnId, observed.turnId);
+    assert.equal(admitted.state, "admitted");
+    assert.deepEqual(
+      store.admitInbound({
+        recordId: observed.recordId,
+        payload: Buffer.from("prompt-body"),
+        spool: [Buffer.from("attachment")],
+      }),
+      admitted,
+    );
+    assert.throws(
+      () =>
+        store.admitInbound({
+          recordId: observed.recordId,
+          payload: Buffer.from("different"),
+          spool: [Buffer.from("attachment")],
+        }),
+      /payload mismatch/,
+    );
+    assert.equal(store.commitUpdatePrefix(101), 101);
+    assert.equal(store.getCommittedUpdateId(), 101);
+    assert.throws(() => store.commitUpdatePrefix(100), /backwards/);
+
+    const claim = { identity: OLD_IDENTITY };
+    assert.equal(store.markPreDispatch(observed.recordId, claim).state, "pre-dispatch");
+    assert.equal(store.markDispatching(observed.recordId, claim).state, "dispatching");
+    assert.equal(store.markCompleted(observed.recordId, claim).state, "completed");
+    assert.equal(readdirSync(join(rootPath, "spool")).length, 0);
+    assert.equal(statSync(rootPath).mode & 0o777, 0o700);
+    assert.equal(statSync(join(rootPath, "payloads")).mode & 0o777, 0o700);
+    assert.equal(statSync(join(rootPath, "snapshot.json")).mode & 0o777, 0o600);
+    const payloadName = readdirSync(join(rootPath, "payloads"))[0]!;
+    assert.equal(statSync(join(rootPath, "payloads", payloadName)).mode & 0o777, 0o600);
+    assert.equal(readStoreSnapshot(rootPath).committedUpdateId, 101);
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("immutable admission revision verifies exact manual-follower durable proofs", () => {
+  const harness = createStoreHarness();
+  try {
+    const observed = harness.store.observeInbound(101, OLD_IDENTITY);
+    assert.equal(observed.admissionRevision, undefined);
+    const admitted = harness.store.admitInbound({
+      recordId: observed.recordId,
+      payload: Buffer.from("forwarded-update"),
+    });
+    assert.ok(admitted.admissionRevision);
+    const proof = {
+      version: 1 as const,
+      updateId: admitted.updateId,
+      recordId: admitted.recordId,
+      turnId: admitted.turnId,
+      profile: admitted.identity.profile,
+      target: admitted.identity.target,
+      ownerId: "manual-owner-a",
+      registrationGeneration: "registration-a",
+      sessionGeneration: 3,
+      admissionRevision: admitted.admissionRevision!,
+      disposition: "admitted" as const,
+    };
+    assert.equal(
+      harness.store.verifyInboundAdmissionProof(proof).recordId,
+      admitted.recordId,
+    );
+    const materialized = harness.store.materializeInbound({
+      recordId: admitted.recordId,
+      claim: { identity: OLD_IDENTITY },
+      payload: Buffer.from("materialized-turn"),
+      previousPayload: Buffer.from("forwarded-update"),
+    });
+    assert.equal(materialized.admissionRevision, admitted.admissionRevision);
+    assert.throws(
+      () =>
+        harness.store.verifyInboundAdmissionProof({
+          ...proof,
+          target: { chatId: 1001, threadId: 43 },
+        }),
+      /identity mismatch/,
+    );
+    assert.throws(
+      () =>
+        harness.store.verifyInboundAdmissionProof({
+          ...proof,
+          admissionRevision: proof.admissionRevision + 1,
+        }),
+      /identity mismatch/,
+    );
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("quota reservation fails before partial admission and preserves observed retry state", () => {
+  const harness = createStoreHarness({ quotaBytes: 2_000 });
+  try {
+    const observed = harness.store.observeInbound(102, OLD_IDENTITY);
+    const before = readStoreSnapshot(harness.rootPath);
+    assert.throws(
+      () =>
+        harness.store.admitInbound({
+          recordId: observed.recordId,
+          payload: Buffer.alloc(4_000, 7),
+          spool: [Buffer.alloc(100, 8)],
+        }),
+      RecoveryQuotaExceededError,
+    );
+    const after = readStoreSnapshot(harness.rootPath);
+    assert.equal(after.revision, before.revision);
+    assert.equal(after.inbound[0]!.state, "observed");
+    assert.equal(after.quota.payloadBytes, 0);
+    assert.deepEqual(readdirSync(join(harness.rootPath, "payloads")), []);
+    assert.deepEqual(readdirSync(join(harness.rootPath, "spool")), []);
+    assert.throws(() => harness.store.commitUpdatePrefix(102), /durable admitted/);
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("lightweight terminal dispositions are idempotent, payload-free, and prefix eligible", () => {
+  const harness = createStoreHarness();
+  try {
+    const terminal = harness.store.recordTerminalInboundDisposition(
+      102,
+      OLD_IDENTITY,
+      "unauthorized",
+    );
+    assert.equal(terminal.state, "explicitly-discarded");
+    assert.equal(terminal.terminalReason, "unauthorized");
+    assert.equal(terminal.payloadRef, undefined);
+    assert.deepEqual(terminal.spoolRefs, []);
+    assert.deepEqual(
+      harness.store.recordTerminalInboundDisposition(102, OLD_IDENTITY, "unauthorized"),
+      terminal,
+    );
+    assert.equal(harness.store.commitUpdatePrefix(102), 102);
+    assert.throws(
+      () => harness.store.recordTerminalInboundDisposition(102, OLD_IDENTITY, "unsupported"),
+      /reason collision/,
+    );
+    const observed = harness.store.observeInbound(103, OLD_IDENTITY);
+    assert.equal(
+      harness.store.recordTerminalInboundDisposition(
+        103,
+        OLD_IDENTITY,
+        "poison-skipped",
+      ).recordId,
+      observed.recordId,
+    );
+    assert.equal(
+      harness.store.admitInbound({
+        recordId: observed.recordId,
+        payload: Buffer.from("late"),
+      }).state,
+      "explicitly-discarded",
+    );
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("reopen marks dispatching uncertain, never drains it, and explicit retry is linked and idempotent", () => {
+  const harness = createStoreHarness();
+  try {
+    const observed = harness.store.observeInbound(103, OLD_IDENTITY);
+    harness.store.admitInbound({
+      recordId: observed.recordId,
+      payload: Buffer.from("uncertain prompt"),
+    });
+    const claim = { identity: OLD_IDENTITY };
+    harness.store.markPreDispatch(observed.recordId, claim);
+    harness.store.markDispatching(observed.recordId, claim);
+
+    const reopened = reopenStore(harness);
+    const status = reopened.getStatus();
+    assert.equal(status.counts["execution-uncertain"], 1);
+    assert.equal(status.counts.dispatching, 0);
+    assert.deepEqual(reopened.drainSafeInbound(claim), []);
+    const uncertainActionId = status.items[0]!.actionId;
+    const retry = reopened.retryUncertainInboundAction(uncertainActionId, claim);
+    assert.equal(retry.duplicationWarning, true);
+    assert.equal(retry.state, "pre-dispatch");
+    assert.equal(Buffer.from(retry.payload!).toString(), "uncertain prompt");
+    assert.doesNotMatch(JSON.stringify(retry), /recordId|linkedAttemptOf/);
+    assert.equal(
+      reopened.retryUncertainInboundAction(uncertainActionId, claim).actionId,
+      retry.actionId,
+    );
+    assert.equal(
+      reopened.discardInboundAction(retry.actionId, claim).state,
+      "explicitly-discarded",
+    );
+    assert.deepEqual(readdirSync(join(harness.rootPath, "payloads")), []);
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("safe drain advances only admitted work and status remains metadata-only", () => {
+  const harness = createStoreHarness();
+  try {
+    const first = harness.store.observeInbound(104, OLD_IDENTITY);
+    harness.store.admitInbound({ recordId: first.recordId, payload: Buffer.from("secret prompt") });
+    const second = harness.store.observeInbound(105, OLD_IDENTITY);
+    harness.store.admitInbound({ recordId: second.recordId, payload: Buffer.from("another secret") });
+    harness.store.markPreDispatch(second.recordId, { identity: OLD_IDENTITY });
+    const drained = harness.store.drainSafeInbound({ identity: OLD_IDENTITY });
+    assert.deepEqual(drained.map((item) => item.record.recordId), [first.recordId, second.recordId]);
+    assert.ok(drained.every((item) => item.record.state === "pre-dispatch"));
+    const serializedStatus = JSON.stringify(harness.store.getStatus());
+    assert.doesNotMatch(serializedStatus, /secret prompt|another secret|1001|manual-owner-a|registration-a/);
+    assert.match(serializedStatus, /"id":"[0-9a-f]{12}"/);
+    assert.match(serializedStatus, /"requiredAction":"drain"/);
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("same-process handoff is exact, expiring, single-use, and reassigns only matching unresolved identity", () => {
+  const nextIdentity: RecoveryIdentity = { ...OLD_IDENTITY, sessionGeneration: 4 };
+  const harness = createStoreHarness({
+    authenticated: (identity) =>
+      identitiesMatch(identity, OLD_IDENTITY) || identitiesMatch(identity, nextIdentity),
+  });
+  try {
+    const observed = harness.store.observeInbound(106, OLD_IDENTITY);
+    harness.store.admitInbound({ recordId: observed.recordId, payload: Buffer.from("handoff") });
+    const { consumedAtMs: _consumedAtMs, ...unconsumedHandoff } = makeHandoff();
+    const handoff: RecoverySameProcessHandoff = {
+      ...unconsumedHandoff,
+      createdAtMs: harness.now.value,
+      expiresAtMs: harness.now.value + 500,
+    };
+    assert.throws(
+      () => harness.store.markPreDispatch(observed.recordId, { identity: nextIdentity }),
+      /claim denied/,
+    );
+    const claimed = harness.store.consumeSameProcessHandoff(handoff, nextIdentity);
+    assert.deepEqual(claimed.claimedRecordIds, [observed.recordId]);
+    assert.equal(claimed.handoff.consumedAtMs, harness.now.value);
+    assert.equal(
+      harness.store.markPreDispatch(observed.recordId, { identity: nextIdentity }).state,
+      "pre-dispatch",
+    );
+    assert.throws(
+      () => harness.store.consumeSameProcessHandoff(handoff, nextIdentity),
+      /already consumed/,
+    );
+    const wrongTarget = { ...nextIdentity, target: { chatId: 1001, threadId: 99 } };
+    assert.throws(
+      () =>
+        harness.store.consumeSameProcessHandoff(
+          { ...handoff, handoffId: "wrong-target" },
+          wrongTarget,
+        ),
+      /not currently authenticated|claim denied/,
+    );
+    harness.now.value = handoff.expiresAtMs + 1;
+    assert.throws(
+      () =>
+        harness.store.consumeSameProcessHandoff(
+          { ...handoff, handoffId: "expired-handoff" },
+          nextIdentity,
+        ),
+      /claim denied/,
+    );
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("same-process handoff updates matching unresolved inbound, outbound, and bus records", () => {
+  const nextIdentity: RecoveryIdentity = { ...OLD_IDENTITY, sessionGeneration: 4 };
+  const harness = createStoreHarness({
+    authenticated: (identity) => identitiesMatch(identity, nextIdentity),
+  });
+  try {
+    const inbound = harness.store.observeInbound(120, OLD_IDENTITY);
+    const snapshot = readStoreSnapshot(harness.rootPath);
+    snapshot.outbound.push({
+      family: "outbound",
+      recordId: "outbound-handoff",
+      intentId: "intent-handoff",
+      turnId: "turn-outbound-handoff",
+      state: "pending",
+      identity: structuredClone(OLD_IDENTITY),
+      createdRevision: snapshot.revision,
+      stateRevision: snapshot.revision,
+      createdAtMs: harness.now.value,
+      updatedAtMs: harness.now.value,
+      spoolRefs: [],
+    });
+    snapshot.bus.push({
+      family: "bus",
+      recordId: "bus-handoff",
+      requestId: "request-handoff",
+      payloadFingerprint: "fingerprint-handoff",
+      state: "pending",
+      identity: structuredClone(OLD_IDENTITY),
+      createdRevision: snapshot.revision,
+      stateRevision: snapshot.revision,
+      createdAtMs: harness.now.value,
+      updatedAtMs: harness.now.value,
+      spoolRefs: [],
+    });
+    writeAccountedSnapshot(harness.rootPath, snapshot);
+    const handoff: RecoverySameProcessHandoff = {
+      handoffId: "all-family-handoff",
+      profile: "default",
+      target: OLD_IDENTITY.target,
+      owner: OLD_IDENTITY.owner,
+      fromSessionGeneration: 3,
+      toSessionGeneration: 4,
+      createdAtMs: harness.now.value,
+      expiresAtMs: harness.now.value + 1000,
+    };
+    const result = harness.store.consumeSameProcessHandoff(handoff, nextIdentity);
+    assert.deepEqual(
+      [...result.claimedRecordIds].sort(),
+      [inbound.recordId, "outbound-handoff", "bus-handoff"].sort(),
+    );
+    const moved = readStoreSnapshot(harness.rootPath);
+    assert.ok(
+      [...moved.inbound, ...moved.outbound, ...moved.bus].every(
+        (record) => record.identity.sessionGeneration === 4,
+      ),
+    );
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("explicit reassignment captures exact unresolved ids, fences actions, and grants only the authenticated target", () => {
+  const newIdentity: RecoveryIdentity = {
+    profile: "default",
+    target: OLD_IDENTITY.target,
+    owner: NEW_OWNER,
+    sessionGeneration: 4,
+  };
+  let authoritativeBinding: "old" | "new" = "old";
+  const validateReassignmentBinding: NonNullable<
+    Parameters<typeof openRecoveryStore>[0]["validateReassignmentBinding"]
+  > = ({ currentIdentity, expectedBinding }) =>
+    identitiesMatch(currentIdentity, newIdentity) &&
+    ((expectedBinding === "new-owner" && authoritativeBinding === "new") ||
+      (expectedBinding === "old-owner-restored" && authoritativeBinding === "old"));
+  const harness = createStoreHarness({
+    authenticated: (identity) =>
+      identitiesMatch(identity, OLD_IDENTITY) || identitiesMatch(identity, newIdentity),
+    validateReassignmentBinding,
+  });
+  try {
+    const first = harness.store.observeInbound(107, OLD_IDENTITY);
+    harness.store.admitInbound({ recordId: first.recordId, payload: Buffer.from("move") });
+    const request = harness.store.requestReassignment({
+      target: OLD_IDENTITY.target,
+      oldOwner: OLD_IDENTITY.owner,
+      newIdentity,
+    });
+    assert.deepEqual(request.unresolvedRecordIds, [first.recordId]);
+    assert.throws(
+      () => harness.store.markPreDispatch(first.recordId, { identity: OLD_IDENTITY }),
+      /pending reassignment/,
+    );
+    assert.throws(
+      () => harness.store.observeInbound(108, OLD_IDENTITY),
+      /fenced by reassignment/,
+    );
+    assert.equal(
+      harness.store.requestReassignment({
+        target: OLD_IDENTITY.target,
+        oldOwner: OLD_IDENTITY.owner,
+        newIdentity,
+      }).reassignmentId,
+      request.reassignmentId,
+    );
+    let runtime = reopenStore(harness, {
+      authenticated: (identity) =>
+        identitiesMatch(identity, OLD_IDENTITY) || identitiesMatch(identity, newIdentity),
+      validateReassignmentBinding,
+    });
+    assert.equal(
+      runtime.requestReassignment({
+        target: OLD_IDENTITY.target,
+        oldOwner: OLD_IDENTITY.owner,
+        newIdentity,
+      }).reassignmentId,
+      request.reassignmentId,
+    );
+    runtime.advanceReassignment(request.reassignmentId, "requested", "binding-transfer-pending", newIdentity);
+    const missingBindingValidation = reopenStore(harness, {
+      authenticated: (identity) => identitiesMatch(identity, newIdentity),
+    });
+    assert.throws(
+      () => missingBindingValidation.advanceReassignment(
+        request.reassignmentId,
+        "binding-transfer-pending",
+        "binding-transferred",
+        newIdentity,
+      ),
+      /revalidation failed/,
+    );
+    const rejectedBindingValidation = reopenStore(harness, {
+      authenticated: (identity) => identitiesMatch(identity, newIdentity),
+      validateReassignmentBinding: () => false,
+    });
+    assert.throws(
+      () => rejectedBindingValidation.advanceReassignment(
+        request.reassignmentId,
+        "binding-transfer-pending",
+        "binding-transferred",
+        newIdentity,
+      ),
+      /revalidation failed/,
+    );
+    authoritativeBinding = "new";
+    runtime = reopenStore(harness, {
+      authenticated: (identity) => identitiesMatch(identity, newIdentity),
+      validateReassignmentBinding,
+    });
+    runtime.advanceReassignment(request.reassignmentId, "binding-transfer-pending", "binding-transferred", newIdentity);
+    runtime = reopenStore(harness, {
+      authenticated: (identity) => identitiesMatch(identity, newIdentity),
+      validateReassignmentBinding,
+    });
+    runtime.advanceReassignment(request.reassignmentId, "binding-transferred", "recovery-grant-committed", newIdentity);
+    runtime = reopenStore(harness, {
+      authenticated: (identity) => identitiesMatch(identity, newIdentity),
+      validateReassignmentBinding,
+    });
+    assert.equal(
+      runtime.markPreDispatch(first.recordId, { identity: newIdentity }).state,
+      "pre-dispatch",
+    );
+    const later = harness.store.observeInbound(108, OLD_IDENTITY);
+    harness.store.admitInbound({ recordId: later.recordId, payload: Buffer.from("later") });
+    assert.throws(
+      () => harness.store.markPreDispatch(later.recordId, { identity: newIdentity }),
+      /claim denied/,
+    );
+    const nonOwner = { ...newIdentity, owner: { kind: "leader" as const, ownerId: "other", leaderEpoch: "other" } };
+    assert.throws(
+      () =>
+        runtime.advanceReassignment(
+          request.reassignmentId,
+          "recovery-grant-committed",
+          "recovery-grant-committed",
+          nonOwner,
+        ),
+      /not currently authenticated/,
+    );
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("reassignment rollback requires authoritative old-binding restoration", () => {
+  const newIdentity: RecoveryIdentity = {
+    profile: "default",
+    target: OLD_IDENTITY.target,
+    owner: NEW_OWNER,
+    sessionGeneration: 4,
+  };
+  let authoritativeBinding: "old" | "new" = "old";
+  const harness = createStoreHarness({
+    authenticated: (identity) =>
+      identitiesMatch(identity, OLD_IDENTITY) ||
+      identitiesMatch(identity, newIdentity),
+    validateReassignmentBinding: ({ currentIdentity, expectedBinding }) =>
+      identitiesMatch(currentIdentity, newIdentity) &&
+      ((expectedBinding === "new-owner" && authoritativeBinding === "new") ||
+        (expectedBinding === "old-owner-restored" &&
+          authoritativeBinding === "old")),
+  });
+  try {
+    const observed = harness.store.observeInbound(129, OLD_IDENTITY);
+    harness.store.admitInbound({
+      recordId: observed.recordId,
+      payload: Buffer.from("rollback"),
+    });
+    const request = harness.store.requestReassignment({
+      target: OLD_IDENTITY.target,
+      oldOwner: OLD_IDENTITY.owner,
+      newIdentity,
+    });
+    harness.store.advanceReassignment(
+      request.reassignmentId,
+      "requested",
+      "binding-transfer-pending",
+      newIdentity,
+    );
+    authoritativeBinding = "new";
+    harness.store.advanceReassignment(
+      request.reassignmentId,
+      "binding-transfer-pending",
+      "binding-transferred",
+      newIdentity,
+    );
+    harness.store.advanceReassignment(
+      request.reassignmentId,
+      "binding-transferred",
+      "rollback-pending",
+      newIdentity,
+    );
+    assert.throws(
+      () =>
+        harness.store.advanceReassignment(
+          request.reassignmentId,
+          "rollback-pending",
+          "cancelled-before-transfer",
+          newIdentity,
+        ),
+      /revalidation failed/,
+    );
+    authoritativeBinding = "old";
+    assert.equal(
+      harness.store.advanceReassignment(
+        request.reassignmentId,
+        "rollback-pending",
+        "cancelled-before-transfer",
+        newIdentity,
+      ).state,
+      "cancelled-before-transfer",
+    );
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("terminal inbound dispositions cannot bypass a pending reassignment fence", () => {
+  const newIdentity: RecoveryIdentity = {
+    profile: "default",
+    target: OLD_IDENTITY.target,
+    owner: NEW_OWNER,
+    sessionGeneration: 4,
+  };
+  const harness = createStoreHarness({
+    authenticated: (identity) =>
+      identitiesMatch(identity, OLD_IDENTITY) ||
+      identitiesMatch(identity, newIdentity),
+  });
+  try {
+    harness.store.observeInbound(129, OLD_IDENTITY);
+    harness.store.requestReassignment({
+      target: OLD_IDENTITY.target,
+      oldOwner: OLD_IDENTITY.owner,
+      newIdentity,
+    });
+    assert.throws(
+      () =>
+        harness.store.recordTerminalInboundDisposition(
+          129,
+          OLD_IDENTITY,
+          "unauthorized",
+        ),
+      /fenced by reassignment/,
+    );
+    assert.throws(
+      () =>
+        harness.store.recordTerminalInboundDisposition(
+          130,
+          OLD_IDENTITY,
+          "unsupported",
+        ),
+      /fenced by reassignment/,
+    );
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("orphan candidates and recovery actions expose opaque handles and fail closed on collisions", () => {
+  const newIdentity: RecoveryIdentity = {
+    profile: "default",
+    target: OLD_IDENTITY.target,
+    owner: NEW_OWNER,
+    sessionGeneration: 4,
+  };
+  const harness = createStoreHarness({
+    authenticated: (identity) => identitiesMatch(identity, newIdentity),
+  });
+  try {
+    const observed = harness.store.observeInbound(130, OLD_IDENTITY);
+    harness.store.admitInbound({ recordId: observed.recordId, payload: Buffer.from("orphan") });
+    const candidates = harness.store.getOrphanReassignmentCandidates();
+    assert.equal(candidates.length, 1);
+    assert.equal(candidates[0]!.unresolvedCount, 1);
+    assert.doesNotMatch(
+      JSON.stringify(candidates),
+      /1001|manual-owner-a|registration-a|recordId|id-[0-9]/,
+    );
+    const requested = harness.store.requestReassignmentAction(
+      candidates[0]!.actionId,
+      newIdentity,
+    );
+    assert.equal(requested.state, "requested");
+    assert.equal(requested.unresolvedCount, 1);
+    assert.doesNotMatch(JSON.stringify(requested), /recordId|manual-owner-a|1001/);
+  } finally {
+    removeHarness(harness);
+  }
+
+  const collisionHarness = createStoreHarness({
+    authenticated: () => false,
+    actionId: () => "collision",
+  });
+  try {
+    collisionHarness.store.observeInbound(131, OLD_IDENTITY);
+    collisionHarness.store.observeInbound(132, {
+      ...OLD_IDENTITY,
+      target: { chatId: 1001, threadId: 99 },
+    });
+    assert.throws(
+      () => collisionHarness.store.getOrphanReassignmentCandidates(),
+      /orphan action id collision/,
+    );
+    assert.throws(() => collisionHarness.store.getStatus(), /action id collision/);
+  } finally {
+    removeHarness(collisionHarness);
+  }
+});
+
+test("retention removes terminal payload after 24 hours and metadata after seven days without touching unresolved payload", () => {
+  const harness = createStoreHarness();
+  try {
+    const completed = harness.store.observeInbound(109, OLD_IDENTITY);
+    harness.store.admitInbound({ recordId: completed.recordId, payload: Buffer.from("terminal") });
+    harness.store.markPreDispatch(completed.recordId, { identity: OLD_IDENTITY });
+    harness.store.markDispatching(completed.recordId, { identity: OLD_IDENTITY });
+    harness.store.markCompleted(completed.recordId, { identity: OLD_IDENTITY });
+    const pending = harness.store.observeInbound(110, OLD_IDENTITY);
+    harness.store.admitInbound({ recordId: pending.recordId, payload: Buffer.from("pending") });
+    harness.now.value += RECOVERY_DELIVERED_PAYLOAD_RETENTION_MS;
+    harness.store.compact();
+    let snapshot = readStoreSnapshot(harness.rootPath);
+    assert.equal(snapshot.inbound.find((record) => record.recordId === completed.recordId)!.payloadRef, undefined);
+    assert.ok(snapshot.inbound.find((record) => record.recordId === pending.recordId)!.payloadRef);
+    harness.now.value += RECOVERY_TERMINAL_METADATA_RETENTION_MS + 1;
+    harness.store.compact();
+    snapshot = readStoreSnapshot(harness.rootPath);
+    assert.equal(snapshot.inbound.some((record) => record.recordId === completed.recordId), false);
+    assert.equal(snapshot.inbound.some((record) => record.recordId === pending.recordId), true);
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("retention covers terminal outbound and bus payloads, spool cleanup, and dedup metadata horizon", () => {
+  const harness = createStoreHarness();
+  try {
+    const snapshot = readStoreSnapshot(harness.rootPath);
+    snapshot.revision = 1;
+    snapshot.writtenAtMs = harness.now.value;
+    const payloads = [
+      { id: "outbound-terminal-payload", body: Buffer.from("outbound-body") },
+      { id: "bus-terminal-payload", body: Buffer.from("bus-body") },
+    ];
+    const spools = [
+      { id: "outbound-terminal-spool", body: Buffer.from("outbound-spool") },
+      { id: "bus-terminal-spool", body: Buffer.from("bus-spool") },
+    ];
+    for (const entry of payloads) {
+      writeFileSync(join(harness.rootPath, "payloads", `${entry.id}.bin`), entry.body, { mode: 0o600 });
+    }
+    for (const entry of spools) {
+      writeFileSync(join(harness.rootPath, "spool", `${entry.id}.bin`), entry.body, { mode: 0o600 });
+    }
+    snapshot.outbound.push({
+      family: "outbound",
+      recordId: "outbound-terminal",
+      intentId: "outbound-terminal-intent",
+      turnId: "outbound-terminal-turn",
+      state: "delivered",
+      identity: structuredClone(OLD_IDENTITY),
+      createdRevision: 1,
+      stateRevision: 1,
+      createdAtMs: harness.now.value,
+      updatedAtMs: harness.now.value,
+      payloadRef: {
+        payloadId: payloads[0]!.id,
+        byteLength: payloads[0]!.body.byteLength,
+        sha256: sha256(payloads[0]!.body),
+      },
+      spoolRefs: [{
+        spoolId: spools[0]!.id,
+        byteLength: spools[0]!.body.byteLength,
+        sha256: sha256(spools[0]!.body),
+      }],
+    });
+    snapshot.bus.push({
+      family: "bus",
+      recordId: "bus-terminal",
+      requestId: "bus-terminal-request",
+      payloadFingerprint: "bus-terminal-fingerprint",
+      state: "completed",
+      identity: structuredClone(OLD_IDENTITY),
+      createdRevision: 1,
+      stateRevision: 1,
+      createdAtMs: harness.now.value,
+      updatedAtMs: harness.now.value,
+      payloadRef: {
+        payloadId: payloads[1]!.id,
+        byteLength: payloads[1]!.body.byteLength,
+        sha256: sha256(payloads[1]!.body),
+      },
+      spoolRefs: [{
+        spoolId: spools[1]!.id,
+        byteLength: spools[1]!.body.byteLength,
+        sha256: sha256(spools[1]!.body),
+      }],
+    });
+    writeAccountedSnapshot(harness.rootPath, snapshot);
+    harness.store.compact();
+    assert.deepEqual(readdirSync(join(harness.rootPath, "spool")), []);
+    assert.equal(readdirSync(join(harness.rootPath, "payloads")).length, 2);
+    harness.now.value += RECOVERY_DELIVERED_PAYLOAD_RETENTION_MS;
+    harness.store.compact();
+    let retained = readStoreSnapshot(harness.rootPath);
+    assert.equal(retained.outbound[0]!.payloadRef, undefined);
+    assert.equal(retained.bus[0]!.payloadRef, undefined);
+    assert.equal(retained.outbound.length, 1);
+    assert.equal(retained.bus.length, 1);
+    harness.now.value += RECOVERY_TERMINAL_METADATA_RETENTION_MS + 1;
+    harness.store.compact();
+    retained = readStoreSnapshot(harness.rootPath);
+    assert.equal(retained.outbound.length, 0);
+    assert.equal(retained.bus.length, 0);
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("terminal metadata byte cap evicts oldest full serialized records conservatively", () => {
+  const harness = createStoreHarness({ terminalMetadataMaxBytes: 1 });
+  try {
+    const completed = harness.store.observeInbound(140, OLD_IDENTITY);
+    harness.store.admitInbound({
+      recordId: completed.recordId,
+      payload: Buffer.from("terminal-cap"),
+    });
+    harness.store.markPreDispatch(completed.recordId, {
+      identity: OLD_IDENTITY,
+    });
+    harness.store.markDispatching(completed.recordId, {
+      identity: OLD_IDENTITY,
+    });
+    harness.store.markCompleted(completed.recordId, {
+      identity: OLD_IDENTITY,
+    });
+    const unresolved = harness.store.observeInbound(141, OLD_IDENTITY);
+    harness.store.admitInbound({
+      recordId: unresolved.recordId,
+      payload: Buffer.from("must-survive"),
+    });
+
+    harness.store.compact();
+    const snapshot = readStoreSnapshot(harness.rootPath);
+    assert.equal(
+      snapshot.inbound.some((record) => record.recordId === completed.recordId),
+      false,
+    );
+    assert.equal(
+      snapshot.inbound.some((record) => record.recordId === unresolved.recordId),
+      true,
+    );
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("terminal metadata cap prunes completed reassignment metadata without unresolved grants", () => {
+  const newIdentity: RecoveryIdentity = {
+    profile: "default",
+    target: OLD_IDENTITY.target,
+    owner: NEW_OWNER,
+    sessionGeneration: 4,
+  };
+  const harness = createStoreHarness({
+    terminalMetadataMaxBytes: 1,
+    authenticated: (identity) =>
+      identitiesMatch(identity, OLD_IDENTITY) ||
+      identitiesMatch(identity, newIdentity),
+    validateReassignmentBinding: ({ expectedBinding }) =>
+      expectedBinding === "new-owner",
+  });
+  try {
+    const admitted = harness.store.observeInbound(142, OLD_IDENTITY);
+    harness.store.admitInbound({
+      recordId: admitted.recordId,
+      payload: Buffer.from("reassigned-terminal"),
+    });
+    const reassignment = harness.store.requestReassignment({
+      target: OLD_IDENTITY.target,
+      oldOwner: OLD_IDENTITY.owner,
+      newIdentity,
+    });
+    harness.store.advanceReassignment(
+      reassignment.reassignmentId,
+      "requested",
+      "binding-transfer-pending",
+      newIdentity,
+    );
+    harness.store.advanceReassignment(
+      reassignment.reassignmentId,
+      "binding-transfer-pending",
+      "binding-transferred",
+      newIdentity,
+    );
+    harness.store.advanceReassignment(
+      reassignment.reassignmentId,
+      "binding-transferred",
+      "recovery-grant-committed",
+      newIdentity,
+    );
+    harness.store.markPreDispatch(admitted.recordId, {
+      identity: newIdentity,
+    });
+    harness.store.markDispatching(admitted.recordId, {
+      identity: newIdentity,
+    });
+    harness.store.markCompleted(admitted.recordId, {
+      identity: newIdentity,
+    });
+
+    harness.store.compact();
+    const snapshot = readStoreSnapshot(harness.rootPath);
+    assert.equal(snapshot.inbound.length, 0);
+    assert.equal(snapshot.reassignments.length, 0);
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("corrupt active snapshots and truncated referenced files fail closed while orphan tails reconcile", () => {
+  const harness = createStoreHarness();
+  try {
+    const observed = harness.store.observeInbound(111, OLD_IDENTITY);
+    harness.store.admitInbound({ recordId: observed.recordId, payload: Buffer.from("complete") });
+    writeFileSync(join(harness.rootPath, "payloads", "orphan.bin"), "tail", { mode: 0o600 });
+    writeFileSync(join(harness.rootPath, "snapshot.json.tmp-crash"), "{", { mode: 0o600 });
+    const reconciled = reopenStore(harness);
+    assert.equal(readdirSync(join(harness.rootPath, "payloads")).includes("orphan.bin"), false);
+    assert.equal(readdirSync(harness.rootPath).includes("snapshot.json.tmp-crash"), false);
+    assert.ok(reconciled.getStatus().incidents.includes("orphan-snapshot-tail-removed"));
+    const payloadName = readdirSync(join(harness.rootPath, "payloads"))[0]!;
+    const payloadPath = join(harness.rootPath, "payloads", payloadName);
+    writeFileSync(payloadPath, "corrupt!", { mode: 0o600 });
+    assert.throws(
+      () => harness.store.admitInbound({
+        recordId: observed.recordId,
+        payload: Buffer.from("complete"),
+      }),
+      /digest mismatch/,
+    );
+    assert.throws(
+      () => harness.store.drainSafeInbound({ identity: OLD_IDENTITY }),
+      /digest mismatch/,
+    );
+    assert.throws(() => reopenStore(harness), /digest mismatch/);
+    writeFileSync(payloadPath, "complete", { mode: 0o600 });
+    writeFileSync(payloadPath, "x", { mode: 0o600 });
+    assert.throws(() => reopenStore(harness), /truncated recovery binary/);
+    writeFileSync(join(harness.rootPath, "snapshot.json"), "{", { mode: 0o600 });
+    assert.throws(() => reopenStore(harness), /Invalid recovery snapshot JSON/);
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("filesystem durability ordering fsyncs parent, binary directories before snapshot, and cleanup directories", () => {
+  const events: string[] = [];
+  const descriptorPaths = new Map<number, string>();
+  const trackedOpen = ((...args: Parameters<typeof openSync>) => {
+    const descriptor = openSync(...args);
+    descriptorPaths.set(descriptor, String(args[0]));
+    return descriptor;
+  }) as typeof openSync;
+  const trackedFsync = ((descriptor: number) => {
+    events.push(`fsync:${descriptorPaths.get(descriptor) ?? "unknown"}`);
+    return fsyncSync(descriptor);
+  }) as typeof fsyncSync;
+  const trackedClose = ((descriptor: number) => {
+    descriptorPaths.delete(descriptor);
+    return closeSync(descriptor);
+  }) as typeof closeSync;
+  const trackedRename = ((...args: Parameters<typeof renameSync>) => {
+    events.push(`rename:${String(args[0])}->${String(args[1])}`);
+    return renameSync(...args);
+  }) as typeof renameSync;
+  const harness = createStoreHarness({
+    fs: {
+      open: trackedOpen,
+      fsync: trackedFsync,
+      close: trackedClose,
+      rename: trackedRename,
+    },
+  });
+  try {
+    assert.ok(events.includes(`fsync:${harness.directory}`));
+    events.length = 0;
+    const observed = harness.store.observeInbound(140, OLD_IDENTITY);
+    events.length = 0;
+    harness.store.admitInbound({
+      recordId: observed.recordId,
+      payload: Buffer.from("payload"),
+      spool: [Buffer.from("spool")],
+    });
+    const payloadRename = events.findIndex((entry) => entry.includes("/payloads/") && entry.startsWith("rename:"));
+    const payloadDirectoryFsync = events.findIndex((entry) => entry === `fsync:${join(harness.rootPath, "payloads")}`);
+    const spoolDirectoryFsync = events.findIndex((entry) => entry === `fsync:${join(harness.rootPath, "spool")}`);
+    const snapshotRename = events.findIndex(
+      (entry) => entry.startsWith("rename:") && entry.endsWith("->" + join(harness.rootPath, "snapshot.json")),
+    );
+    assert.ok(payloadRename >= 0);
+    assert.ok(payloadDirectoryFsync > payloadRename);
+    assert.ok(spoolDirectoryFsync > payloadRename);
+    assert.ok(snapshotRename > payloadDirectoryFsync);
+    assert.ok(snapshotRename > spoolDirectoryFsync);
+
+    harness.store.markPreDispatch(observed.recordId, { identity: OLD_IDENTITY });
+    harness.store.markDispatching(observed.recordId, { identity: OLD_IDENTITY });
+    events.length = 0;
+    harness.store.markCompleted(observed.recordId, { identity: OLD_IDENTITY });
+    assert.ok(events.includes(`fsync:${join(harness.rootPath, "spool")}`));
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("downgrade is exclusive, refuses blockers, quarantines durably, and requires explicit restore", () => {
+  const harness = createStoreHarness();
+  try {
+    const observed = harness.store.observeInbound(112, OLD_IDENTITY);
+    assert.throws(() => harness.store.beginDowngradeExclusive(), /blocked by nonterminal/);
+    assert.equal(harness.store.getStatus().admissionEnabled, true);
+    harness.store.discardInbound(observed.recordId, { identity: OLD_IDENTITY });
+    assert.deepEqual(harness.store.beginDowngradeExclusive(), {
+      safe: true,
+      blockerCount: 0,
+      blockers: [],
+    });
+    assert.equal(harness.store.getStatus().admissionEnabled, false);
+    assert.throws(() => harness.store.observeInbound(113, OLD_IDENTITY), /admission is disabled/);
+    const quarantinePath = harness.store.quarantineForDowngrade();
+    assert.equal(statSync(quarantinePath).isDirectory(), true);
+    assert.throws(
+      () => reopenStore(harness),
+      (error: unknown) => error instanceof RecoveryQuarantineError,
+    );
+    restoreRecoveryQuarantine({
+      profile: "default",
+      rootPath: harness.rootPath,
+      quarantinePath,
+    });
+    assert.equal(reopenStore(harness).getStatus().admissionEnabled, true);
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("quarantine restore validates every referenced binary before activation", () => {
+  const harness = createStoreHarness();
+  try {
+    const completed = harness.store.observeInbound(150, OLD_IDENTITY);
+    harness.store.admitInbound({
+      recordId: completed.recordId,
+      payload: Buffer.from("restore-ok"),
+    });
+    harness.store.markPreDispatch(completed.recordId, {
+      identity: OLD_IDENTITY,
+    });
+    harness.store.markDispatching(completed.recordId, {
+      identity: OLD_IDENTITY,
+    });
+    harness.store.markCompleted(completed.recordId, {
+      identity: OLD_IDENTITY,
+    });
+    harness.store.beginDowngradeExclusive();
+    const quarantinePath = harness.store.quarantineForDowngrade();
+    const payloadPath = join(
+      quarantinePath,
+      "payloads",
+      readdirSync(join(quarantinePath, "payloads"))[0]!,
+    );
+    writeFileSync(payloadPath, "restore-no", { mode: 0o600 });
+
+    assert.throws(
+      () =>
+        restoreRecoveryQuarantine({
+          profile: "default",
+          rootPath: harness.rootPath,
+          quarantinePath,
+        }),
+      /digest mismatch/,
+    );
+    assert.equal(existsSync(harness.rootPath), false);
+    assert.equal(statSync(quarantinePath).isDirectory(), true);
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("all injected inbound and downgrade store seams leave a fail-closed reopen state", () => {
+  const cases = [
+    "IN-01", "IN-02", "IN-03", "IN-04", "IN-05",
+    "IN-06", "IN-07", "IN-08", "DOWN-01", "DOWN-02",
+  ] as const;
+  for (const faultId of cases) {
+    const controller = new ReliabilityFaultController(faultId, { seed: `seed-${faultId}` });
+    const harness = createStoreHarness({
+      fault: (id) => controller.hit(id),
+    });
+    try {
+      if (faultId === "IN-01") {
+        assert.throws(() => harness.store.observeInbound(200, OLD_IDENTITY), InjectedReliabilityFaultError);
+        assert.equal(reopenStore(harness).getStatus().counts.observed, 0);
+      } else {
+        const observed = harness.store.observeInbound(200, OLD_IDENTITY);
+        if (faultId === "IN-02" || faultId === "IN-03") {
+          assert.throws(
+            () => harness.store.admitInbound({ recordId: observed.recordId, payload: Buffer.from("fault") }),
+            InjectedReliabilityFaultError,
+          );
+          const reopened = reopenStore(harness);
+          const reopenedStatus = reopened.getStatus();
+          assert.equal(
+            reopenedStatus.counts[faultId === "IN-02" ? "observed" : "admitted"],
+            1,
+          );
+          if (faultId === "IN-02") {
+            assert.deepEqual(readdirSync(join(harness.rootPath, "payloads")), []);
+            assert.ok(reopenedStatus.incidents.includes("orphan-recovery-file-removed"));
+          }
+        } else {
+          harness.store.admitInbound({ recordId: observed.recordId, payload: Buffer.from("fault") });
+          const claim = { identity: OLD_IDENTITY };
+          if (faultId === "IN-04") {
+            assert.throws(() => harness.store.commitUpdatePrefix(200), InjectedReliabilityFaultError);
+            const reopened = reopenStore(harness);
+            assert.equal(reopened.getCommittedUpdateId(), 200);
+            const rehydrated = reopened.drainSafeInbound(claim);
+            assert.equal(rehydrated.length, 1);
+            assert.equal(rehydrated[0]!.record.state, "pre-dispatch");
+            assert.equal(Buffer.from(rehydrated[0]!.payload).toString(), "fault");
+          } else if (faultId === "IN-05") {
+            assert.throws(() => harness.store.markPreDispatch(observed.recordId, claim), InjectedReliabilityFaultError);
+            assert.equal(reopenStore(harness).getStatus().counts["pre-dispatch"], 1);
+          } else if (faultId === "IN-06") {
+            harness.store.markPreDispatch(observed.recordId, claim);
+            assert.throws(() => harness.store.markDispatching(observed.recordId, claim), InjectedReliabilityFaultError);
+            assert.equal(reopenStore(harness).getStatus().counts["execution-uncertain"], 1);
+          } else if (faultId === "IN-07") {
+            harness.store.markPreDispatch(observed.recordId, claim);
+            harness.store.markDispatching(observed.recordId, claim);
+            assert.throws(() => harness.store.markExecutionUncertain(observed.recordId, claim), InjectedReliabilityFaultError);
+            assert.equal(reopenStore(harness).getStatus().counts["execution-uncertain"], 1);
+          } else if (faultId === "IN-08") {
+            harness.store.markPreDispatch(observed.recordId, claim);
+            harness.store.markDispatching(observed.recordId, claim);
+            assert.throws(() => harness.store.markCompleted(observed.recordId, claim), InjectedReliabilityFaultError);
+            assert.equal(reopenStore(harness).getStatus().counts.completed, 1);
+          } else {
+            harness.store.discardInbound(observed.recordId, claim);
+            if (faultId === "DOWN-01") {
+              assert.throws(() => harness.store.beginDowngradeExclusive(), InjectedReliabilityFaultError);
+              assert.equal(reopenStore(harness).getStatus().mode, "active");
+            } else {
+              harness.store.beginDowngradeExclusive();
+              assert.throws(() => harness.store.quarantineForDowngrade(), InjectedReliabilityFaultError);
+              assert.throws(() => reopenStore(harness), RecoveryQuarantineError);
+            }
+          }
+        }
+      }
+      controller.assertInjected();
+    } finally {
+      removeHarness(harness);
+    }
+  }
 });
 
 const EXPECTED_FAULT_IDS = [
   "IN-01", "IN-02", "IN-03", "IN-04", "IN-05", "IN-06", "IN-07", "IN-08",
+  "IN-GROUP-01", "IN-GROUP-02", "IN-GROUP-03",
   "OUT-01", "OUT-02", "OUT-03", "OUT-04", "OUT-05", "OUT-06",
   "BUS-01", "BUS-02", "BUS-03", "BUS-04", "PAIR-01", "PAIR-02", "DOWN-01", "DOWN-02",
 ] satisfies ReliabilityFaultId[];
 
+test("post-commit cleanup is fail-soft and the next mutation reconciles physical files", () => {
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-telegram-cleanup-"));
+  const rootPath = join(agentDir, "recovery-v1");
+  let failNextPayloadCleanup = false;
+  let payloadCleanupAttempts = 0;
+  const trackedRemove = ((...args: Parameters<typeof rmSync>) => {
+    const path = String(args[0]);
+    if (path.includes(`${join(rootPath, "payloads")}/`) && path.endsWith(".bin")) {
+      payloadCleanupAttempts += 1;
+      if (failNextPayloadCleanup) {
+        failNextPayloadCleanup = false;
+        throw new Error("injected cleanup failure");
+      }
+    }
+    return rmSync(...args);
+  }) as typeof rmSync;
+  try {
+    const identity = {
+      profile: "default",
+      target: { chatId: 7 },
+      owner: {
+        kind: "leader" as const,
+        ownerId: "owner",
+        leaderEpoch: "epoch",
+      },
+      sessionGeneration: 1,
+    };
+    const store = openRecoveryStore({
+      profile: "default",
+      rootPath,
+      fs: { remove: trackedRemove },
+      isIdentityAuthenticated: () => true,
+    });
+    const observed = store.observeInbound(500, identity);
+    store.admitInbound({
+      recordId: observed.recordId,
+      payload: Buffer.from("raw-update"),
+    });
+    failNextPayloadCleanup = true;
+    assert.doesNotThrow(() =>
+      store.materializeInbound({
+        recordId: observed.recordId,
+        claim: { identity },
+        payload: Buffer.from("materialized-turn"),
+        previousPayload: Buffer.from("raw-update"),
+      }),
+    );
+    assert.ok(store.getStatus().incidents.includes("post-commit-cleanup-failed"));
+    assert.equal(payloadCleanupAttempts, 1);
+    store.observeInbound(501, identity);
+    assert.equal(payloadCleanupAttempts, 2);
+  } finally {
+    rmSync(agentDir, { force: true, recursive: true });
+  }
+});
+
+test("materialized spool bytes are reserved, reconciled, verified, and quota-fenced before publication", () => {
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-telegram-materialized-quota-"));
+  try {
+    const rootPath = join(agentDir, "recovery-v1");
+    const store = openRecoveryStore({
+      profile: "default",
+      rootPath,
+      isIdentityAuthenticated: () => true,
+    });
+    const spool = Buffer.from("materialized-attachment");
+    const observed = store.observeInbound(601, OLD_IDENTITY);
+    store.admitInbound({
+      recordId: observed.recordId,
+      payload: Buffer.from("turn"),
+      spool: [spool],
+    });
+    store.markPreDispatch(observed.recordId, { identity: OLD_IDENTITY });
+    const beforeRestore = store.getStatus();
+    const limited = openRecoveryStore({
+      profile: "default",
+      rootPath,
+      quotaBytes: beforeRestore.quota.totalBytes + spool.byteLength - 1,
+      isIdentityAuthenticated: () => true,
+    });
+    assert.throws(
+      () =>
+        limited.restoreInboundSpool(
+          observed.recordId,
+          { identity: OLD_IDENTITY },
+          ["attachment.txt"],
+        ),
+      RecoveryQuotaExceededError,
+    );
+    assert.deepEqual(readdirSync(store.materializedDirectory), []);
+    assert.equal(store.getStatus().quota.reservedBytes, 0);
+
+    const [materializedPath] = store.restoreInboundSpool(
+      observed.recordId,
+      { identity: OLD_IDENTITY },
+      ["attachment.txt"],
+    );
+    assert.ok(materializedPath);
+    assert.equal(readFileSync(materializedPath).toString(), spool.toString());
+    const restoredStatus = store.getStatus();
+    assert.equal(restoredStatus.quota.reservedBytes, spool.byteLength);
+    assert.equal(
+      restoredStatus.quota.totalBytes,
+      restoredStatus.quota.recordBytes +
+        restoredStatus.quota.payloadBytes +
+        restoredStatus.quota.spoolBytes +
+        restoredStatus.quota.reservedBytes,
+    );
+
+    writeFileSync(materializedPath, Buffer.alloc(spool.byteLength, 0x78));
+    const orphan = join(store.materializedDirectory, "orphan.tmp-tail");
+    writeFileSync(orphan, "orphan");
+    store.observeInbound(602, OLD_IDENTITY);
+    assert.equal(existsSync(materializedPath), false);
+    assert.equal(existsSync(orphan), false);
+    assert.equal(store.getStatus().quota.reservedBytes, 0);
+    assert.ok(
+      store
+        .getStatus()
+        .incidents.includes("corrupt-materialized-cache-removed"),
+    );
+  } finally {
+    rmSync(agentDir, { force: true, recursive: true });
+  }
+});
+
+test("materialized cleanup failure is fail-soft, remains reserved, and blocks later quota mutation", () => {
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-telegram-materialized-cleanup-"));
+  const rootPath = join(agentDir, "recovery-v1");
+  let failMaterializedCleanup = false;
+  const trackedRemove = ((...args: Parameters<typeof rmSync>) => {
+    const path = String(args[0]);
+    if (
+      failMaterializedCleanup &&
+      path.startsWith(join(rootPath, "materialized"))
+    ) {
+      throw new Error("persistent materialized cleanup failure");
+    }
+    return rmSync(...args);
+  }) as typeof rmSync;
+  try {
+    const store = openRecoveryStore({
+      profile: "default",
+      rootPath,
+      fs: { remove: trackedRemove },
+      isIdentityAuthenticated: () => true,
+    });
+    const spool = Buffer.from("retained-cache");
+    const observed = store.observeInbound(611, OLD_IDENTITY);
+    store.admitInbound({
+      recordId: observed.recordId,
+      payload: Buffer.from("turn"),
+      spool: [spool],
+    });
+    store.markPreDispatch(observed.recordId, { identity: OLD_IDENTITY });
+    const [materializedPath] = store.restoreInboundSpool(
+      observed.recordId,
+      { identity: OLD_IDENTITY },
+      ["attachment.txt"],
+    );
+    assert.ok(materializedPath);
+    failMaterializedCleanup = true;
+    store.markDispatching(observed.recordId, { identity: OLD_IDENTITY });
+    assert.doesNotThrow(() =>
+      store.markCompleted(observed.recordId, { identity: OLD_IDENTITY }),
+    );
+    assert.equal(existsSync(materializedPath), true);
+    const status = store.getStatus();
+    assert.equal(status.quota.reservedBytes, spool.byteLength);
+    assert.ok(status.incidents.includes("post-commit-cleanup-failed"));
+    assert.ok(status.incidents.includes("post-commit-quota-refresh-failed"));
+    assert.throws(
+      () => store.observeInbound(612, OLD_IDENTITY),
+      /persistent materialized cleanup failure/,
+    );
+  } finally {
+    failMaterializedCleanup = false;
+    rmSync(agentDir, { force: true, recursive: true });
+  }
+});
+
 test("fault inventory is exact and controller injects once with seed", () => {
   assert.deepEqual(RELIABILITY_FAULT_IDS, EXPECTED_FAULT_IDS);
-  assert.equal(new Set(RELIABILITY_FAULT_IDS).size, 22);
+  assert.equal(new Set(RELIABILITY_FAULT_IDS).size, 25);
   const controller = new ReliabilityFaultController("OUT-04", { seed: 2026072201 });
   controller.hit("IN-01");
   assert.throws(
@@ -458,4 +1936,174 @@ test("fault helper remains excluded from package files", () => {
   const manifest = JSON.parse(readFileSync("package.json", "utf8")) as { files?: string[] };
   assert.ok(manifest.files);
   assert.equal(manifest.files.some((entry) => entry.startsWith("tests")), false);
+});
+
+test("inbound group materialization faults preserve all records, quota, and files", () => {
+  for (const faultId of [
+    "IN-GROUP-01",
+    "IN-GROUP-02",
+    "IN-GROUP-03",
+  ] as const) {
+    const agentDir = mkdtempSync(join(tmpdir(), `pi-telegram-${faultId}-`));
+    try {
+      const controller = new ReliabilityFaultController(faultId, {
+        seed: `group-${faultId}`,
+      });
+      const store = openRecoveryStore({
+        profile: "default",
+        agentDir,
+        isIdentityAuthenticated: () => true,
+        fault: (id) => controller.hit(id),
+      });
+      const records = [701, 702].map((updateId) => {
+        const observed = store.observeInbound(updateId, OLD_IDENTITY);
+        return store.admitInbound({
+          recordId: observed.recordId,
+          payload: Buffer.from(`raw-${updateId}`),
+        });
+      });
+      const before = parseRecoverySnapshot(
+        readFileSync(store.snapshotPath, "utf8"),
+      );
+      const payloadNames = readdirSync(store.payloadDirectory).sort();
+      const spoolNames = readdirSync(store.spoolDirectory).sort();
+      assert.throws(
+        () =>
+          store.materializeInboundGroup(
+            records.map((record) => ({
+              recordId: record.recordId,
+              claim: { identity: OLD_IDENTITY },
+              turnId: "group-turn",
+              payload: Buffer.from("materialized-group"),
+              spool: [Buffer.from("spool-a"), Buffer.from("spool-b")],
+              previousPayload: Buffer.from(`raw-${record.updateId}`),
+            }))),
+        InjectedReliabilityFaultError,
+      );
+      controller.assertInjected();
+      const after = parseRecoverySnapshot(
+        readFileSync(store.snapshotPath, "utf8"),
+      );
+      assert.deepEqual(
+        after.inbound.map((record) => record.state),
+        ["admitted", "admitted"],
+      );
+      assert.deepEqual(after.quota, before.quota);
+      assert.deepEqual(readdirSync(store.payloadDirectory).sort(), payloadNames);
+      assert.deepEqual(readdirSync(store.spoolDirectory).sort(), spoolNames);
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("inbound group materialization and lifecycle transitions commit one group revision", () => {
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-telegram-group-commit-"));
+  try {
+    const store = openRecoveryStore({
+      profile: "default",
+      agentDir,
+      isIdentityAuthenticated: () => true,
+    });
+    const records = [711, 712].map((updateId) => {
+      const observed = store.observeInbound(updateId, OLD_IDENTITY);
+      return store.admitInbound({
+        recordId: observed.recordId,
+        payload: Buffer.from(`raw-${updateId}`),
+      });
+    });
+    const materialized = store.materializeInboundGroup(
+      records.map((record) => ({
+        recordId: record.recordId,
+        claim: { identity: OLD_IDENTITY },
+        turnId: "canonical-group-turn",
+        payload: Buffer.from("materialized-group"),
+        previousPayload: Buffer.from(`raw-${record.updateId}`),
+      })),
+    );
+    assert.deepEqual(
+      materialized.map(({ state, turnId, stateRevision }) => ({
+        state,
+        turnId,
+        stateRevision,
+      })),
+      [
+        {
+          state: "pre-dispatch",
+          turnId: "canonical-group-turn",
+          stateRevision: materialized[0]!.stateRevision,
+        },
+        {
+          state: "pre-dispatch",
+          turnId: "canonical-group-turn",
+          stateRevision: materialized[0]!.stateRevision,
+        },
+      ],
+    );
+    const claims = materialized.map((record) => ({
+      recordId: record.recordId,
+      claim: { identity: OLD_IDENTITY },
+    }));
+    const dispatching = store.markDispatchingGroup(claims);
+    const completed = store.markCompletedGroup(claims);
+    assert.equal(new Set(dispatching.map((record) => record.stateRevision)).size, 1);
+    assert.equal(new Set(completed.map((record) => record.stateRevision)).size, 1);
+    assert.deepEqual(completed.map((record) => record.state), ["completed", "completed"]);
+  } finally {
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("opaque reassignment completion resumes crash stages idempotently and fences the target tuple", () => {
+  const harness = createStoreHarness();
+  try {
+    const observed = harness.store.observeInbound(9090, OLD_IDENTITY);
+    harness.store.admitInbound({
+      recordId: observed.recordId,
+      payload: Buffer.from("reassign-once"),
+    });
+    const newIdentity: RecoveryIdentity = {
+      ...OLD_IDENTITY,
+      owner: NEW_OWNER,
+      sessionGeneration: OLD_IDENTITY.sessionGeneration + 1,
+    };
+    const runtime = reopenStore(harness, {
+      authenticated: (identity) => identitiesMatch(identity, newIdentity),
+      validateReassignmentBinding: () => true,
+    });
+    const candidate = runtime.getOrphanReassignmentCandidates()[0]!;
+    const requested = runtime.requestReassignmentAction(
+      candidate.actionId,
+      newIdentity,
+    );
+    const snapshot = readStoreSnapshot(harness.rootPath);
+    const reassignment = snapshot.reassignments[0]!;
+
+    runtime.advanceReassignment(
+      reassignment.reassignmentId,
+      "requested",
+      "binding-transfer-pending",
+      newIdentity,
+    );
+    assert.throws(
+      () => runtime.observeInbound(9091, newIdentity),
+      /fenced by reassignment/,
+    );
+
+    const completed = runtime.completeReassignmentAction(
+      requested.actionId,
+      newIdentity,
+    );
+    assert.equal(completed.state, "recovery-grant-committed");
+    assert.deepEqual(
+      runtime.completeReassignmentAction(requested.actionId, newIdentity),
+      completed,
+    );
+    assert.throws(
+      () => runtime.completeReassignmentAction("wrong-action", newIdentity),
+      /Unknown recovery reassignment action id/,
+    );
+  } finally {
+    removeHarness(harness);
+  }
 });

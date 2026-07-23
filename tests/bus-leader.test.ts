@@ -11,6 +11,7 @@ import test from "node:test";
 
 import {
   createTelegramBusFollowerRegistry,
+  createTelegramBusLocalServer,
   resolveTelegramBusSocketPath,
   sendTelegramBusLocalEnvelope,
 } from "../lib/bus.ts";
@@ -24,9 +25,302 @@ import {
   createTelegramBusLeaderRuntime,
   createTelegramBusLeaderRuntimeAssembly,
   createTelegramBusLeaderTargetProvisioner,
+  createTelegramRecoveryDowngradeCoordinator,
 } from "../lib/bus-leader.ts";
+import { RecoveryProfileOperationGate } from "../lib/recovery.ts";
 import { createTelegramTopicTargetStore } from "../lib/threads.ts";
 import { TelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
+
+test("Recovery downgrade coordinator cancels store exclusive and resumes after rename failure", async () => {
+  const gate = new RecoveryProfileOperationGate();
+  const events: string[] = [];
+  let storeExclusive = false;
+  const downgrade = createTelegramRecoveryDowngradeCoordinator<string>({
+    canCoordinate: () => true,
+    getCoordinationGeneration: () => "leader-epoch-1",
+    getProfile: () => "default",
+    getFollowers: () => [],
+    getAuthSecret: () => "secret",
+    createRequestId: () => "leader:1",
+    gate,
+    preflight: () => ({ safe: true, blockerCount: 0 }),
+    beginStoreExclusive() {
+      storeExclusive = true;
+      events.push("store-exclusive");
+    },
+    quarantineStore() {
+      events.push("rename-failed");
+      throw new Error("rename failed");
+    },
+    cancelStoreExclusive() {
+      assert.equal(storeExclusive, true);
+      storeExclusive = false;
+      events.push("store-cancelled");
+    },
+    stopPolling() {
+      events.push("polling-stopped");
+    },
+    suspendRuntime() {
+      events.push("runtime-suspended");
+    },
+    resumeRuntime() {
+      events.push("runtime-resumed");
+    },
+    createFenceGeneration: () => "fence-a",
+  });
+
+  await assert.rejects(() => downgrade("ctx"), /rename failed/);
+  assert.equal(storeExclusive, false);
+  assert.equal(gate.getState("default").phase, "active");
+  assert.deepEqual(events, [
+    "polling-stopped",
+    "runtime-suspended",
+    "store-exclusive",
+    "rename-failed",
+    "store-cancelled",
+    "runtime-resumed",
+  ]);
+});
+
+test("Recovery downgrade leader remains exactly fenced when runtime resume fails", async () => {
+  const gate = new RecoveryProfileOperationGate();
+  const downgrade = createTelegramRecoveryDowngradeCoordinator<string>({
+    canCoordinate: () => true,
+    getCoordinationGeneration: () => "leader-epoch-1",
+    getProfile: () => "default",
+    getFollowers: () => [],
+    getAuthSecret: () => undefined,
+    createRequestId: () => "leader:resume-failure",
+    gate,
+    preflight: () => ({ safe: true, blockerCount: 0 }),
+    beginStoreExclusive() {
+      throw new Error("new blocker");
+    },
+    quarantineStore: () => "never",
+    cancelStoreExclusive() {},
+    stopPolling() {},
+    suspendRuntime() {},
+    resumeRuntime() {
+      assert.equal(gate.getState("default").phase, "downgrade-exclusive");
+      throw new Error("leader resume failed");
+    },
+    createFenceGeneration: () => "fence-resume-failure",
+  });
+
+  await assert.rejects(() => downgrade("ctx"), /leader resume failed/);
+  assert.equal(gate.getState("default").phase, "downgrade-exclusive");
+  assert.equal(
+    gate.getState("default").fenceGeneration,
+    "fence-resume-failure",
+  );
+  assert.equal(gate.enter("default"), undefined);
+});
+
+test("Recovery downgrade coordinator leaves gates closed when quarantine commit is uncertain", async () => {
+  const gate = new RecoveryProfileOperationGate();
+  let resumed = 0;
+  const downgrade = createTelegramRecoveryDowngradeCoordinator<string>({
+    canCoordinate: () => true,
+    getCoordinationGeneration: () => "leader-epoch-1",
+    getProfile: () => "default",
+    getFollowers: () => [],
+    getAuthSecret: () => undefined,
+    createRequestId: () => "leader:1",
+    gate,
+    preflight: () => ({ safe: true, blockerCount: 0 }),
+    beginStoreExclusive() {},
+    quarantineStore() {
+      throw new Error("post-rename fsync failed");
+    },
+    cancelStoreExclusive() {
+      throw new Error("store root already moved");
+    },
+    stopPolling() {},
+    suspendRuntime() {},
+    resumeRuntime() {
+      resumed += 1;
+    },
+    createFenceGeneration: () => "fence-a",
+  });
+
+  await assert.rejects(() => downgrade("ctx"), /post-rename fsync failed/);
+  assert.equal(resumed, 0);
+  assert.equal(gate.getState("default").phase, "downgrade-exclusive");
+  assert.equal(gate.enter("default"), undefined);
+});
+
+test("Recovery downgrade coordinator reopens nothing after successful quarantine", async () => {
+  const gate = new RecoveryProfileOperationGate();
+  let quarantineCalls = 0;
+  let resumed = 0;
+  const downgrade = createTelegramRecoveryDowngradeCoordinator<string>({
+    canCoordinate: () => true,
+    getCoordinationGeneration: () => "leader-epoch-1",
+    getProfile: () => "default",
+    getFollowers: () => [],
+    getAuthSecret: () => undefined,
+    createRequestId: () => "leader:1",
+    gate,
+    preflight: () => ({ safe: true, blockerCount: 0 }),
+    beginStoreExclusive() {},
+    quarantineStore() {
+      quarantineCalls += 1;
+      return "/private/quarantine";
+    },
+    cancelStoreExclusive() {
+      assert.fail("successful downgrade must not cancel the store");
+    },
+    stopPolling() {},
+    suspendRuntime() {},
+    resumeRuntime() {
+      resumed += 1;
+    },
+    createFenceGeneration: () => "fence-a",
+  });
+
+  assert.deepEqual(await downgrade("ctx"), { status: "downgraded" });
+  assert.equal(quarantineCalls, 1);
+  assert.equal(resumed, 0);
+  assert.equal(gate.getState("default").phase, "quarantined");
+  assert.equal(gate.enter("default"), undefined);
+  await assert.rejects(() => downgrade("ctx"), /already fenced/);
+  assert.equal(quarantineCalls, 1);
+});
+
+test("Recovery downgrade coordinator aborts and resumes on stale follower acknowledgement", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-stale-fence-ack-"));
+  const socketPath = join(dir, "follower.sock");
+  const gate = new RecoveryProfileOperationGate();
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope(envelope) {
+      return {
+        kind: "bus.ack",
+        requestId: envelope.requestId,
+        ok: true,
+        recoveryFence: {
+          version: 1,
+          state: "fenced",
+          profile: "default",
+          recipientInstanceId: "follower-a",
+          recipientRegistrationGeneration: "stale-generation",
+          fenceGeneration: "fence-a",
+        },
+      };
+    },
+  });
+  const follower = {
+    instanceId: "follower-a",
+    registrationGeneration: "generation-a",
+    busSocketPath: socketPath,
+    connectedAtMs: 1,
+    lastHeartbeatMs: 1,
+  };
+  const downgrade = createTelegramRecoveryDowngradeCoordinator<string>({
+    canCoordinate: () => true,
+    getCoordinationGeneration: () => "leader-epoch-1",
+    getProfile: () => "default",
+    getFollowers: () => [follower],
+    getAuthSecret: () => "secret",
+    createRequestId: () => "leader:1",
+    gate,
+    preflight: () => ({ safe: true, blockerCount: 0 }),
+    beginStoreExclusive() {
+      assert.fail("stale follower ACK must abort before store exclusive");
+    },
+    quarantineStore: () => "never",
+    cancelStoreExclusive() {},
+    stopPolling() {},
+    suspendRuntime() {},
+    resumeRuntime() {},
+    createFenceGeneration: () => "fence-a",
+  });
+  try {
+    await server.start();
+    await assert.rejects(() => downgrade("ctx"), /acknowledgement mismatch/);
+    assert.equal(gate.getState("default").phase, "fencing");
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Recovery downgrade coordinator aborts when a follower fence times out", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-fence-timeout-"));
+  const socketPath = join(dir, "follower.sock");
+  const gate = new RecoveryProfileOperationGate();
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: () => new Promise(() => undefined),
+  });
+  const follower = {
+    instanceId: "follower-a",
+    registrationGeneration: "generation-a",
+    busSocketPath: socketPath,
+    connectedAtMs: 1,
+    lastHeartbeatMs: 1,
+  };
+  const downgrade = createTelegramRecoveryDowngradeCoordinator<string>({
+    canCoordinate: () => true,
+    getCoordinationGeneration: () => "leader-epoch-1",
+    getProfile: () => "default",
+    getFollowers: () => [follower],
+    getAuthSecret: () => "secret",
+    createRequestId: () => "leader:timeout",
+    gate,
+    preflight: () => ({ safe: true, blockerCount: 0 }),
+    beginStoreExclusive() {
+      assert.fail("timed out follower must abort before store exclusive");
+    },
+    quarantineStore: () => "never",
+    cancelStoreExclusive() {},
+    stopPolling() {},
+    suspendRuntime() {},
+    resumeRuntime() {},
+    timeoutMs: 20,
+    createFenceGeneration: () => "fence-a",
+  });
+  try {
+    await server.start();
+    await assert.rejects(() => downgrade("ctx"), /Timed out/);
+    assert.equal(gate.getState("default").phase, "fencing");
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Recovery downgrade coordinator resumes a begin-exclusive blocker", async () => {
+  const gate = new RecoveryProfileOperationGate();
+  let resumed = 0;
+  const downgrade = createTelegramRecoveryDowngradeCoordinator<string>({
+    canCoordinate: () => true,
+    getCoordinationGeneration: () => "leader-epoch-1",
+    getProfile: () => "default",
+    getFollowers: () => [],
+    getAuthSecret: () => undefined,
+    createRequestId: () => "leader:1",
+    gate,
+    preflight: () => ({ safe: true, blockerCount: 0 }),
+    beginStoreExclusive() {
+      throw new Error("new nonterminal blocker");
+    },
+    quarantineStore: () => "never",
+    cancelStoreExclusive() {
+      assert.fail("unchanged store exclusive must not be cancelled");
+    },
+    stopPolling() {},
+    suspendRuntime() {},
+    resumeRuntime() {
+      resumed += 1;
+    },
+    createFenceGeneration: () => "fence-a",
+  });
+
+  await assert.rejects(() => downgrade("ctx"), /new nonterminal blocker/);
+  assert.equal(resumed, 1);
+  assert.equal(gate.getState("default").phase, "active");
+});
 
 test("Bus leader preserves a binding through follower reload handoff", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-gap-"));

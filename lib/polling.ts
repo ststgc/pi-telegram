@@ -178,6 +178,8 @@ export type TelegramPollingControllerDeps<TContext> = Omit<
 export interface TelegramPollingController<TContext> {
   isActive: () => boolean;
   start: (ctx: TContext) => void;
+  requestStop: () => void;
+  restartAfterStop: (ctx: TContext) => Promise<void>;
   stop: () => Promise<void>;
 }
 
@@ -218,6 +220,7 @@ export function createTelegramPollingControllerRuntime<
     updateStatus: deps.updateStatus,
     sleep: deps.sleep,
     maxUpdateFailures: deps.maxUpdateFailures,
+    durableInbound: deps.durableInbound,
     isPermanentError: deps.isPermanentError,
     propagateStop: true,
     recordRuntimeEvent: deps.recordRuntimeEvent,
@@ -271,6 +274,20 @@ export function createTelegramPollingController<TContext>(
   return {
     isActive: () => isTelegramPollingControllerActive(state),
     start: (ctx) => startTelegramPollingRuntime(ctx, runtimeDeps),
+    requestStop: () => {
+      try {
+        runtimeDeps.stopTypingLoop();
+      } catch (error) {
+        runtimeDeps.recordRuntimeEvent?.("polling", error, {
+          phase: "typing-stop",
+        });
+      }
+      runtimeDeps.getPollingController()?.abort();
+    },
+    restartAfterStop: async (ctx) => {
+      await stopTelegramPollingRuntime(runtimeDeps);
+      startTelegramPollingRuntime(ctx, runtimeDeps);
+    },
     stop: () => stopTelegramPollingRuntime(runtimeDeps),
   };
 }
@@ -1209,6 +1226,28 @@ interface TelegramPollingAdmissionState {
   admittedUpdates: Set<number>;
 }
 
+export type TelegramDurableInboundAdmission = {
+  kind: "admitted" | "follower-admitted" | "terminal" | "pairing-proof";
+};
+
+export interface TelegramDurableInboundPollingPort<
+  TUpdate extends TelegramUpdate,
+  TContext,
+> {
+  initializeOffset: (config: TelegramPollingConfig) => Promise<number | undefined>;
+  admitUpdate: (
+    update: TUpdate,
+    ctx: TContext,
+  ) => Promise<TelegramDurableInboundAdmission>;
+  commitUpdate: (updateId: number) => Promise<number>;
+  handleAdmittedUpdate: (
+    update: TUpdate,
+    ctx: TContext,
+    handle: (update: TUpdate, ctx: TContext) => Promise<unknown>,
+  ) => Promise<void>;
+  markPoisonSkipped: (updateId: number) => Promise<void>;
+}
+
 export interface TelegramPollLoopDeps<
   TUpdate extends TelegramUpdate,
   TContext = unknown,
@@ -1222,13 +1261,14 @@ export interface TelegramPollLoopDeps<
     signal: AbortSignal,
   ) => Promise<TUpdate[]>;
   persistConfig: (config: TelegramPollingConfig) => Promise<void>;
-  handleUpdate: (update: TUpdate, ctx: TContext) => Promise<void>;
+  handleUpdate: (update: TUpdate, ctx: TContext) => Promise<unknown>;
   prepareUpdateBatch?: (updates: readonly TUpdate[]) => void;
   onErrorStatus: (message: string) => void;
   onStatusReset: () => void;
   sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   maxUpdateFailures?: number;
   admissionState?: TelegramPollingAdmissionState;
+  durableInbound?: TelegramDurableInboundPollingPort<TUpdate, TContext>;
   isPermanentError?: (error: unknown) => boolean;
 }
 
@@ -1243,11 +1283,12 @@ export interface TelegramPollLoopRunnerDeps<
     signal: AbortSignal,
   ) => Promise<TUpdate[]>;
   persistConfig: (config: TelegramPollingConfig) => Promise<void>;
-  handleUpdate: (update: TUpdate, ctx: TContext) => Promise<void>;
+  handleUpdate: (update: TUpdate, ctx: TContext) => Promise<unknown>;
   prepareUpdateBatch?: (updates: readonly TUpdate[]) => void;
   updateStatus: (ctx: TContext, message?: string) => void;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   maxUpdateFailures?: number;
+  durableInbound?: TelegramDurableInboundPollingPort<TUpdate, TContext>;
   isPermanentError?: (error: unknown) => boolean;
   propagateStop?: boolean;
 }
@@ -1320,6 +1361,7 @@ export function createTelegramPollLoopRunner<
       sleep,
       maxUpdateFailures: deps.maxUpdateFailures,
       admissionState,
+      durableInbound: deps.durableInbound,
       isPermanentError: deps.isPermanentError,
       recordRuntimeEvent: deps.recordRuntimeEvent,
     }).then((outcome) => {
@@ -1340,6 +1382,168 @@ export function isTelegramGetUpdatesConflictError(error: unknown): boolean {
   );
 }
 
+async function runDurableTelegramPollLoop<
+  TUpdate extends TelegramUpdate,
+  TContext,
+>(deps: TelegramPollLoopDeps<TUpdate, TContext>): Promise<"stopped" | void> {
+  const durable = deps.durableInbound!;
+  const stopped = (): boolean => deps.signal.aborted;
+  let committedUpdateId: number | undefined;
+  try {
+    committedUpdateId = await durable.initializeOffset(deps.config);
+    if (stopped()) return "stopped";
+    deps.config.lastUpdateId = committedUpdateId;
+  } catch (error) {
+    if (stopped()) return "stopped";
+    throw new TelegramPollingPhaseError("bootstrap", error);
+  }
+  const maxUpdateFailures = Math.max(
+    1,
+    deps.maxUpdateFailures ?? TELEGRAM_POLLING_DEFAULT_MAX_UPDATE_FAILURES,
+  );
+  let consecutiveGetUpdatesConflicts = 0;
+  while (!stopped()) {
+    try {
+      const updates = await deps.getUpdates(
+        buildTelegramLongPollRequest(committedUpdateId),
+        deps.signal,
+      );
+      if (stopped()) return "stopped";
+      deps.prepareUpdateBatch?.(updates);
+      consecutiveGetUpdatesConflicts = 0;
+      let admissionGap = false;
+      for (const update of updates) {
+        if (stopped()) return "stopped";
+        let admission: TelegramDurableInboundAdmission;
+        try {
+          admission = await durable.admitUpdate(update, deps.ctx);
+          if (stopped()) return "stopped";
+        } catch (error) {
+          if (stopped()) return "stopped";
+          deps.recordRuntimeEvent?.("recovery", error, {
+            phase: "admission-gap",
+          });
+          deps.onErrorStatus(
+            "Telegram durable admission is blocked; offset remains at the contiguous prefix.",
+          );
+          admissionGap = true;
+          break;
+        }
+
+        if (admission.kind === "pairing-proof") {
+          let handled = false;
+          for (let attempt = 1; attempt <= maxUpdateFailures; attempt += 1) {
+            if (stopped()) return "stopped";
+            try {
+              await durable.handleAdmittedUpdate(
+                update,
+                deps.ctx,
+                deps.handleUpdate,
+              );
+              if (stopped()) return "stopped";
+              handled = true;
+              break;
+            } catch (error) {
+              if (stopped()) return "stopped";
+              deps.recordRuntimeEvent?.("polling", error, {
+                phase: "pairing-proof-handler",
+                failureCount: attempt,
+              });
+              if (attempt < maxUpdateFailures) {
+                await deps.sleep(TELEGRAM_POLLING_RETRY_MS, deps.signal);
+                if (stopped()) return "stopped";
+              }
+            }
+          }
+          if (!handled) {
+            await durable.markPoisonSkipped(update.update_id);
+          }
+        }
+
+        if (stopped()) return "stopped";
+        try {
+          committedUpdateId = await durable.commitUpdate(update.update_id);
+          if (stopped()) return "stopped";
+        } catch (error) {
+          if (stopped()) return "stopped";
+          throw new TelegramPollingPhaseError("persist", error);
+        }
+
+        deps.config.lastUpdateId = committedUpdateId;
+        const mirror = { ...deps.config, lastUpdateId: committedUpdateId };
+        try {
+          await deps.persistConfig(mirror);
+          if (stopped()) return "stopped";
+        } catch (error) {
+          if (stopped()) return "stopped";
+          deps.recordRuntimeEvent?.("recovery", error, {
+            phase: "offset-mirror",
+          });
+        }
+
+        if (admission.kind === "admitted") {
+          let handled = false;
+          for (let attempt = 1; attempt <= maxUpdateFailures; attempt += 1) {
+            if (stopped()) return "stopped";
+            try {
+              await durable.handleAdmittedUpdate(
+                update,
+                deps.ctx,
+                deps.handleUpdate,
+              );
+              if (stopped()) return "stopped";
+              handled = true;
+              break;
+            } catch (error) {
+              if (stopped()) return "stopped";
+              deps.recordRuntimeEvent?.("recovery", error, {
+                phase: "post-offset-materialization",
+                failureCount: attempt,
+              });
+              if (attempt < maxUpdateFailures) {
+                await deps.sleep(TELEGRAM_POLLING_RETRY_MS, deps.signal);
+                if (stopped()) return "stopped";
+              }
+            }
+          }
+          if (!handled) {
+            await durable.markPoisonSkipped(update.update_id);
+            deps.onErrorStatus(
+              `skipping Telegram update after ${maxUpdateFailures} durable materialization failures`,
+            );
+          }
+        }
+      }
+      if (admissionGap) {
+        await deps.sleep(TELEGRAM_POLLING_RETRY_MS, deps.signal);
+        if (stopped()) return "stopped";
+      }
+    } catch (error) {
+      if (shouldStopTelegramPolling(stopped(), error)) return "stopped";
+      if (error instanceof TelegramPollingPhaseError) throw error;
+      if (deps.isPermanentError?.(error)) {
+        throw new TelegramPollingPhaseError("api", error);
+      }
+      if (isTelegramGetUpdatesConflictError(error)) {
+        deps.recordRuntimeEvent?.("polling", error, { phase: "loop" });
+        consecutiveGetUpdatesConflicts += 1;
+        await deps.sleep(
+          consecutiveGetUpdatesConflicts <
+            TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_LIMIT
+            ? TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_MS
+            : TELEGRAM_GET_UPDATES_CONFLICT_SLOW_RETRY_MS,
+          deps.signal,
+        );
+        if (stopped()) return "stopped";
+        continue;
+      }
+      throw new TelegramPollingPhaseError("api", error);
+    }
+    deps.onStatusReset();
+  }
+  return "stopped";
+}
+
 export async function runTelegramPollLoop<
   TUpdate extends TelegramUpdate,
   TContext = unknown,
@@ -1355,6 +1559,9 @@ export async function runTelegramPollLoop<
   } catch (error) {
     if (shouldStopTelegramPolling(deps.signal.aborted, error)) return "stopped";
     throw new TelegramPollingPhaseError("bootstrap", error);
+  }
+  if (deps.durableInbound) {
+    return runDurableTelegramPollLoop(deps);
   }
   if (deps.config.lastUpdateId === undefined) {
     let updates: TUpdate[];
