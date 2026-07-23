@@ -53,13 +53,13 @@ The connected Pi instance owns Telegram polling. Use `/telegram-connect <name>` 
 
 ### 4. Pair your Telegram account
 
-Open the bot DM and send:
+When the bot is not yet paired, `/telegram-setup` and `/telegram-connect` display a one-time pairing code only in the local Pi UI. Open the private bot DM and send the exact command shown locally:
 
 ```text
-/start
+/start <code>
 ```
 
-The first Telegram user to message the bot becomes the allowed owner. Other users are ignored.
+The code expires after 10 minutes and is single-use. The bridge stores only a strictly validated salted verifier; the raw code never enters `telegram.json`, diagnostics, status, or public update handlers. Re-running setup/connect in the creating process redisplays the same unexpired code; another process or a restarted runtime reports a pending claim without rotating or revealing it. Proof-shaped updates remain private even if replayed after pairing. Every other update is ignored until pairing succeeds. Existing `allowedUserId` profiles remain paired and do not generate a code.
 
 ## What It Feels Like
 

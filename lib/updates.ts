@@ -11,11 +11,16 @@ import {
 } from "./target.ts";
 import type { TelegramMessageOwnershipStore } from "./ownership.ts";
 import {
-  createTelegramUserPairingRuntime,
   getTelegramAuthorizationState,
+  isValidTelegramAllowedUserId,
   type TelegramAuthorizationState,
-  type TelegramUserPairingRuntimeDeps,
 } from "./config.ts";
+import {
+  parseTelegramPairingCandidate,
+  TELEGRAM_PAIRING_RESPONSE,
+  type TelegramPairingClaimInput,
+  type TelegramPairingClaimResult,
+} from "./pairing.ts";
 
 // --- Extraction ---
 
@@ -443,20 +448,16 @@ export type TelegramUpdateExecutionPlan<
   | {
       kind: "callback";
       query: TCallbackQuery;
-      shouldPair: boolean;
       shouldDeny: boolean;
     }
   | {
       kind: "message";
       message: TMessage & { from: TelegramUser };
-      shouldPair: boolean;
-      shouldNotifyPaired: boolean;
       shouldDeny: boolean;
     }
   | {
       kind: "edited-message";
       message: TMessage & { from: TelegramUser };
-      shouldPair: boolean;
       shouldDeny: boolean;
     }
   | {
@@ -496,22 +497,18 @@ export function buildTelegramUpdateExecutionPlan<
       return {
         kind: "callback",
         query: action.query,
-        shouldPair: action.authorization.kind === "pair",
         shouldDeny: action.authorization.kind === "deny",
       };
     case "message":
       return {
         kind: "message",
         message: action.message,
-        shouldPair: action.authorization.kind === "pair",
-        shouldNotifyPaired: action.authorization.kind === "pair",
         shouldDeny: action.authorization.kind === "deny",
       };
     case "edited-message":
       return {
         kind: "edited-message",
         message: action.message,
-        shouldPair: action.authorization.kind === "pair",
         shouldDeny: action.authorization.kind === "deny",
       };
     case "guest":
@@ -580,7 +577,6 @@ export interface TelegramUpdateRuntimeDeps<
     lifecycle: TelegramTopicLifecycleUpdate<TMessage>,
     ctx: TContext,
   ) => Promise<void> | void;
-  pairTelegramUserIfNeeded: (userId: number, ctx: TContext) => Promise<boolean>;
   answerCallbackQuery: (
     callbackQueryId: string,
     text?: string,
@@ -648,7 +644,6 @@ export interface TelegramUpdateRuntimeControllerDeps<
     priorityEmoji?: string,
     scope?: { chatId?: number; threadId?: number },
   ) => boolean;
-  pairTelegramUserIfNeeded: (userId: number, ctx: TContext) => Promise<boolean>;
   answerCallbackQuery: (
     callbackQueryId: string,
     text?: string,
@@ -816,15 +811,11 @@ export async function executeTelegramUpdate<
 export type TelegramPairedUpdateRuntimeControllerDeps<
   TContext = unknown,
   TUpdate extends TelegramUpdateFlow = TelegramUpdateFlow,
-> = Omit<
-  TelegramUpdateRuntimeControllerDeps<
-    TContext,
-    NonNullable<TUpdate["callback_query"]>,
-    NonNullable<TUpdate["message"] | TUpdate["edited_message"]>
-  >,
-  "pairTelegramUserIfNeeded"
-> &
-  TelegramUserPairingRuntimeDeps<TContext>;
+> = TelegramUpdateRuntimeControllerDeps<
+  TContext,
+  NonNullable<TUpdate["callback_query"]>,
+  NonNullable<TUpdate["message"] | TUpdate["edited_message"]>
+>;
 
 export function createTelegramPairedUpdateRuntime<
   TContext = unknown,
@@ -847,12 +838,6 @@ export function createTelegramPairedUpdateRuntime<
       deps.clearQueuedTelegramTurnPriorityByMessageId,
     prioritizeQueuedTelegramTurnByMessageId:
       deps.prioritizeQueuedTelegramTurnByMessageId,
-    pairTelegramUserIfNeeded: createTelegramUserPairingRuntime({
-      getAllowedUserId: deps.getAllowedUserId,
-      setAllowedUserId: deps.setAllowedUserId,
-      persistConfig: deps.persistConfig,
-      updateStatus: deps.updateStatus,
-    }).pairIfNeeded,
     answerCallbackQuery: deps.answerCallbackQuery,
     answerGuestQuery: deps.answerGuestQuery,
     handleAuthorizedTelegramCallbackQuery:
@@ -912,7 +897,6 @@ export function createTelegramUpdateRuntime<
         handleAuthorizedTelegramReactionUpdate: handleAuthorizedReactionUpdate,
         handleTelegramTopicLifecycleUpdate:
           deps.handleTelegramTopicLifecycleUpdate,
-        pairTelegramUserIfNeeded: deps.pairTelegramUserIfNeeded,
         answerCallbackQuery: deps.answerCallbackQuery,
         answerGuestQuery: deps.answerGuestQuery,
         handleAuthorizedTelegramCallbackQuery:
@@ -1092,9 +1076,6 @@ export async function executeTelegramUpdatePlan<
         }
         return;
       }
-      if (plan.shouldPair) {
-        await deps.pairTelegramUserIfNeeded(plan.query.from.id, deps.ctx);
-      }
       if (plan.shouldDeny) {
         const callbackQueryId = getTelegramCallbackQueryId(plan.query);
         if (callbackQueryId) {
@@ -1181,23 +1162,7 @@ export async function executeTelegramUpdatePlan<
       await deps.handleUnboundTelegramTopicMessage(plan.message, deps.ctx);
       return;
     }
-    const pairedNow = plan.shouldPair
-      ? await deps.pairTelegramUserIfNeeded(plan.message.from.id, deps.ctx)
-      : false;
     const replyTarget = getTelegramMessageReplyTarget(plan.message);
-    if (
-      plan.kind === "message" &&
-      pairedNow &&
-      plan.shouldNotifyPaired &&
-      replyTarget
-    ) {
-      await deps.sendTextReply(
-        replyTarget.chatId,
-        replyTarget.messageId,
-        "Telegram bridge paired with this account.",
-        { target: replyTarget },
-      );
-    }
     if (plan.shouldDeny) {
       if (replyTarget) {
         await deps.sendTextReply(
@@ -1306,20 +1271,75 @@ export function getTelegramUpdateHandlerRegistry(): TelegramUpdateHandlerRegistr
   return getOrCreateUpdateHandlerRegistry();
 }
 
+export interface TelegramUnpairedUpdateGateDeps<TContext> {
+  getAllowedUserId: () => number | undefined;
+  claim: (input: TelegramPairingClaimInput) => Promise<TelegramPairingClaimResult>;
+  sendGenericResponse: (target: {
+    chatId: number;
+    messageId: number;
+    threadId?: number;
+    text: typeof TELEGRAM_PAIRING_RESPONSE;
+  }) => Promise<void>;
+  onPaired: (ctx: TContext) => Promise<void> | void;
+  recordSideEffectFailure: (
+    phase: "response" | "on-paired",
+    error: unknown,
+  ) => void;
+}
+
 export interface TelegramUpdateHandlerWrapDeps<TUpdate, TContext> {
   defaultHandle: (update: TUpdate, ctx: TContext) => Promise<void>;
+  pairingGate: TelegramUnpairedUpdateGateDeps<TContext>;
   registry?: TelegramUpdateHandlerRegistry;
 }
 
 /**
- * Wrap a default polling `handleUpdate` with the public update handler registry.
+ * Wrap default polling with the unpaired proof gate and public registry.
+ * Unpaired updates never cross the public handler membrane; paired ordering is unchanged.
  */
 export function createTelegramUpdateHandle<TUpdate, TContext>(
   deps: TelegramUpdateHandlerWrapDeps<TUpdate, TContext>,
 ): (update: TUpdate, ctx: TContext) => Promise<void> {
   const registry = deps.registry ?? getOrCreateUpdateHandlerRegistry();
-  const { defaultHandle } = deps;
+  const { defaultHandle, pairingGate } = deps;
   return async (update, ctx) => {
+    const pairingCandidate = parseTelegramPairingCandidate(update);
+    if (pairingCandidate) {
+      if (isValidTelegramAllowedUserId(pairingGate.getAllowedUserId())) return;
+      const result = await pairingGate.claim({
+        senderId: pairingCandidate.senderId,
+        code: pairingCandidate.code,
+      });
+      try {
+        await pairingGate.sendGenericResponse({
+          chatId: pairingCandidate.chatId,
+          messageId: pairingCandidate.messageId,
+          ...(pairingCandidate.threadId !== undefined
+            ? { threadId: pairingCandidate.threadId }
+            : {}),
+          text: TELEGRAM_PAIRING_RESPONSE,
+        });
+      } catch (error) {
+        try {
+          pairingGate.recordSideEffectFailure("response", error);
+        } catch {
+          // Diagnostics must not reject an already admitted pairing claim.
+        }
+      }
+      if (result.kind === "claimed") {
+        try {
+          await pairingGate.onPaired(ctx);
+        } catch (error) {
+          try {
+            pairingGate.recordSideEffectFailure("on-paired", error);
+          } catch {
+            // Diagnostics must not reject an already admitted pairing claim.
+          }
+        }
+      }
+      return;
+    }
+    if (!isValidTelegramAllowedUserId(pairingGate.getAllowedUserId())) return;
     const verdict = await registry.dispatch(update);
     if (verdict === "consume") return;
     await defaultHandle(update, ctx);

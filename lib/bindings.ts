@@ -95,6 +95,7 @@ interface TelegramCommandsAndToolsBindingDeps {
   pi: Pi.ExtensionAPI;
   configStore: Config.TelegramConfigStore;
   persistConfig: (config?: Config.TelegramConfig) => Promise<void>;
+  getPairingInstructions: () => Promise<string | undefined>;
   setup: Setup.TelegramSetupGuard;
   activeTurnRuntime: Queue.TelegramActiveTurnStore<Queue.PendingTelegramTurn>;
   lockedPollingRuntime: Locks.TelegramLockedPollingRuntime<Pi.ExtensionContext>;
@@ -123,6 +124,7 @@ export function registerTelegramCommandsAndTools({
   pi,
   configStore,
   persistConfig,
+  getPairingInstructions,
   setup,
   activeTurnRuntime,
   lockedPollingRuntime,
@@ -222,6 +224,7 @@ export function registerTelegramCommandsAndTools({
         setupGuard: setup,
         getMe: TelegramApi.fetchTelegramBotIdentity,
         persistConfig: persistSetupConfig,
+        getPairingInstructions,
         startPolling: lockedPollingRuntime.start,
         updateStatus,
         recordRuntimeEvent,
@@ -234,6 +237,7 @@ export function registerTelegramCommandsAndTools({
     getStatusLines,
     reloadConfig: configStore.load,
     hasBotToken: configStore.hasBotToken,
+    getPairingInstructions,
     startPolling: lockedPollingRuntime.start,
     stopPolling: stopPolling ?? lockedPollingRuntime.stop,
     getDisconnectThreadName,

@@ -90,7 +90,6 @@ test("Setup runner validates token, persists config, starts polling, and updates
     "getMe:token",
     "persist",
     "info:Telegram bot connected: @demo_bot",
-    "info:Send /start to your bot in Telegram to pair this extension with your account.",
     "info:Polling started",
     "status",
   ]);
@@ -195,7 +194,6 @@ test("Setup prompt runtime stores config before starting polling", async () => {
     "set:token",
     "persist:token",
     "notify:Telegram bot connected: @demo_bot",
-    "notify:Send /start to your bot in Telegram to pair this extension with your account.",
     "start:token",
     "status",
     "finish",
@@ -397,4 +395,22 @@ test("Setup prompt runtime reports token check errors and always finishes", asyn
     "guard-finish",
   ]);
   assert.equal(locked, false);
+});
+
+test("Setup displays transient pairing instructions only through local UI", async () => {
+  const notifications: string[] = [];
+  await runTelegramSetup({
+    hasUI: true,
+    env: {},
+    config: {},
+    promptInput: async () => "token",
+    promptEditor: async () => undefined,
+    getMe: async () => ({ ok: true, result: { id: 7, username: "demo_bot" } }),
+    persistConfig: async () => {},
+    getPairingInstructions: async () => "Pairing code: local-only",
+    notify: (message) => notifications.push(message),
+    startPolling: () => ({ ok: true }),
+    updateStatus: () => {},
+  });
+  assert.ok(notifications.includes("Pairing code: local-only"));
 });

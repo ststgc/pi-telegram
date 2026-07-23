@@ -26,6 +26,7 @@ import * as Menu from "./lib/menu.ts";
 import * as Model from "./lib/model.ts";
 import * as Outbound from "./lib/outbound.ts";
 import * as Ownership from "./lib/ownership.ts";
+import * as Pairing from "./lib/pairing.ts";
 import * as Paths from "./lib/paths.ts";
 import * as Pi from "./lib/pi.ts";
 import * as Polling from "./lib/polling.ts";
@@ -107,6 +108,10 @@ export default function (pi: Pi.ExtensionAPI) {
   const runtimeEvents = runtimeDiagnostics.events;
   const recordRuntimeEvent = runtimeDiagnostics.recordRuntimeEvent;
   const configStore = Config.createTelegramConfigStore({ recordRuntimeEvent });
+  const pairingRuntime = Pairing.createTelegramPairingRuntime({
+    configStore,
+    recordRuntimeEvent,
+  });
   const isTelegramBusConfigured = function (): boolean {
     return true;
   };
@@ -834,6 +839,29 @@ export default function (pi: Pi.ExtensionAPI) {
     prepareUpdateBatch: textGroupRuntime.prepareUpdateBatch,
     handleUpdate: Updates.createTelegramUpdateHandle({
       defaultHandle: inboundRouteRuntime.handleUpdate,
+      pairingGate: {
+        getAllowedUserId: configStore.getAllowedUserId,
+        claim: pairingRuntime.claim,
+        async sendGenericResponse(target) {
+          await sendTextReply(
+            target.chatId,
+            target.messageId,
+            target.text,
+            {
+              target: {
+                chatId: target.chatId,
+                ...(target.threadId !== undefined
+                  ? { threadId: target.threadId }
+                  : {}),
+              },
+            },
+          );
+        },
+        onPaired: updateStatus,
+        recordSideEffectFailure(phase, error) {
+          recordRuntimeEvent("pairing", error, { phase });
+        },
+      },
     }),
     stopTypingLoop: typing.stop,
     updateStatus,
@@ -1033,6 +1061,7 @@ export default function (pi: Pi.ExtensionAPI) {
     pi,
     configStore,
     persistConfig: persistTelegramConfigWithSync,
+    getPairingInstructions: pairingRuntime.getLocalInstructions,
     setup,
     activeTurnRuntime,
     lockedPollingRuntime,

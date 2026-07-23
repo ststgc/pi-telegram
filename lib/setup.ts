@@ -44,6 +44,7 @@ export interface TelegramSetupDeps {
     description?: string;
   }>;
   persistConfig: (config: TelegramSetupConfig) => Promise<void>;
+  getPairingInstructions?: () => Promise<string | undefined>;
   notify: (message: string, level: "info" | "error") => void;
   startPolling: () => unknown | Promise<unknown>;
   updateStatus: () => void;
@@ -72,6 +73,7 @@ export interface TelegramSetupPromptRuntimeDeps<
   setupGuard: TelegramSetupGuard;
   getMe: TelegramSetupDeps["getMe"];
   persistConfig: (config: TelegramSetupConfig) => Promise<void>;
+  getPairingInstructions?: () => Promise<string | undefined>;
   startPolling: (ctx: TContext) => unknown | Promise<unknown>;
   updateStatus: (ctx: TContext) => void;
   recordRuntimeEvent?: (
@@ -159,10 +161,8 @@ export async function runTelegramSetup(
     `Telegram bot connected: @${nextConfig.botUsername ?? "unknown"}`,
     "info",
   );
-  deps.notify(
-    "Send /start to your bot in Telegram to pair this extension with your account.",
-    "info",
-  );
+  const pairingInstructions = await deps.getPairingInstructions?.();
+  if (pairingInstructions) deps.notify(pairingInstructions, "info");
   let startResult: unknown;
   try {
     startResult = await deps.startPolling();
@@ -206,6 +206,7 @@ export function createTelegramSetupPromptRuntime<
             throw error;
           }
         },
+        getPairingInstructions: deps.getPairingInstructions,
         notify: (message, level) => ctx.ui.notify(message, level),
         startPolling: () => deps.startPolling(ctx),
         updateStatus: () => deps.updateStatus(ctx),

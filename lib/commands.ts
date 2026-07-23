@@ -4,10 +4,7 @@
  * Owns Telegram slash-command normalization, bot command metadata, and pi-side command registration behind runtime ports
  */
 
-import {
-  pairTelegramUserIfNeeded,
-  TELEGRAM_DEFAULT_PROFILE_NAME,
-} from "./config.ts";
+import { TELEGRAM_DEFAULT_PROFILE_NAME } from "./config.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "./pi.ts";
 import type { TelegramBridgeStatusLineOptions } from "./status.ts";
 import {
@@ -302,6 +299,7 @@ export interface TelegramBridgeCommandRegistrationDeps {
   getStatusLines: (options?: TelegramBridgeStatusLineOptions) => string[];
   reloadConfig: () => Promise<void>;
   hasBotToken: () => boolean;
+  getPairingInstructions?: () => Promise<string | undefined>;
   startPolling: (
     ctx: ExtensionCommandContext,
     options?: TelegramBridgeCommandStartPollingOptions,
@@ -390,6 +388,8 @@ export function registerTelegramBridgeCommands(
         await deps.promptForConfig(ctx, profileName);
         return;
       }
+      const pairingInstructions = await deps.getPairingInstructions?.();
+      if (pairingInstructions) ctx.ui.notify(pairingInstructions, "info");
       let result = await deps.startPolling(ctx, {
         forceFreshLeaderThread: true,
       });
@@ -616,12 +616,6 @@ export interface TelegramCommandMessageTarget {
   chatId: number;
   threadId?: number;
   replyToMessageId: number;
-}
-
-function canPairTelegramUserFromCommandMessage(
-  message: TelegramCommandRuntimeMessage,
-): boolean {
-  return message.chat.type === undefined || message.chat.type === "private";
 }
 
 export interface TelegramCommandTargetRuntimeDeps<TContext> {
@@ -898,10 +892,8 @@ export interface TelegramCommandRuntimeDeps<
   openQueueMenu: (message: TMessage, ctx: TContext) => Promise<void>;
   openSettingsMenu?: (message: TMessage, ctx: TContext) => Promise<void>;
   getAllowedUserId: () => number | undefined;
-  setAllowedUserId: (userId: number) => void;
   registerBotCommands: () => Promise<void>;
   getPromptTemplateCommands?: () => readonly TelegramPromptTemplateMenuCommand[];
-  persistConfig: () => Promise<void>;
   sendTextReply: (message: TMessage, text: string) => Promise<void>;
   sendInteractiveMessage?: TelegramCompactConfirmationDeps["sendInteractiveMessage"];
 }
@@ -1411,11 +1403,9 @@ export function createTelegramCommandHandlerTargetRuntime<
     openSettingsMenu: commandTargetRuntime.openSettingsMenu,
     handleForumBootstrap: deps.handleForumBootstrap,
     getAllowedUserId: deps.getAllowedUserId,
-    setAllowedUserId: deps.setAllowedUserId,
     registerBotCommands: createTelegramBotCommandRegistrar({
       setMyCommands: deps.setMyCommands,
     }),
-    persistConfig: deps.persistConfig,
     sendTextReply: commandTargetRuntime.sendTextReply,
     recordRuntimeEvent: deps.recordRuntimeEvent,
   });
@@ -1610,18 +1600,6 @@ async function handleTelegramCommandRuntime<
             nextMessage,
             `Warning: failed to register bot commands menu: ${errorMessage}`,
           );
-        }
-        if (
-          nextMessage.from?.id !== undefined &&
-          canPairTelegramUserFromCommandMessage(nextMessage)
-        ) {
-          await pairTelegramUserIfNeeded(nextMessage.from.id, {
-            allowedUserId: deps.getAllowedUserId(),
-            ctx: undefined,
-            setAllowedUserId: deps.setAllowedUserId,
-            persistConfig: deps.persistConfig,
-            updateStatus: updateStatusFor(commandCtx),
-          });
         }
         const forumBootstrapMessage =
           nextCommandName === "start"

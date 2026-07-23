@@ -573,7 +573,7 @@ test("Follower aggregate delivery crosses the authorized leader transport", asyn
   ]);
 });
 
-test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn into pi", async () => {
+test("Extension runtime preserves paired polling and dispatches an inbound Telegram turn into pi", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const sentMessages: RuntimeHarnessMessage[] = [];
   let resolveDispatch: ((value: RuntimeHarnessMessage) => void) | undefined;
@@ -629,7 +629,11 @@ test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn in
     throw new Error(`Unexpected Telegram API method: ${method}`);
   });
   try {
-    await telegramConfig.write({ botToken: "123:abc", lastUpdateId: 0 });
+    await telegramConfig.write({
+      botToken: "123:abc",
+      allowedUserId: 77,
+      lastUpdateId: 0,
+    });
     (await getRuntimeTelegramExtension())(pi);
     const ctx = createRuntimeExtensionContext();
     await handlers.get("session_start")?.({}, ctx);
@@ -637,8 +641,7 @@ test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn in
     const dispatchedContent = await dispatched;
     assert.equal(sentMessages.length, 1);
     assert.equal(Array.isArray(dispatchedContent), true);
-    assert.equal(apiCalls.includes("sendMessage"), true);
-    assert.equal(sendMessageCalls, 2);
+    assert.equal(sendMessageCalls, 0);
     assert.equal(apiCalls.includes("sendChatAction"), true);
     const promptBlock = getRuntimeHarnessTextBlock(dispatchedContent);
     assert.equal(promptBlock.type, "text");

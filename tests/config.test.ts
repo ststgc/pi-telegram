@@ -28,14 +28,12 @@ import {
   createTelegramProactivePushTargetGetter,
   createTelegramTimeInjectionModeGetter,
   createTelegramTimeInjectionModeSetter,
-  createTelegramUserPairingRuntime,
   createTelegramVoiceReplyModeConfiguredChecker,
   createTelegramVoiceReplyModeGetter,
   createTelegramVoiceReplyModeSetter,
   getTelegramAuthorizationState,
   isValidTelegramProfileName,
   normalizeTelegramDefaultProfileConfig,
-  pairTelegramUserIfNeeded,
   readTelegramConfig,
   setGlobalTelegramConfigRuntime,
   updateTelegramVoiceConfig,
@@ -581,6 +579,74 @@ test("Telegram config load recovers invalid JSON and records a diagnostic", asyn
   assert.match(events[0] ?? "", /^config:SyntaxError:load:/);
 });
 
+test("Telegram config quarantines malformed persisted pairing verifier schemas", async (t) => {
+  const verifier = Buffer.alloc(32, 1).toString("base64url");
+  const salt = Buffer.alloc(16, 2).toString("base64url");
+  const valid = {
+    verifier,
+    salt,
+    createdAtMs: 1_000,
+    expiresAtMs: 601_000,
+  };
+  const cases: Array<[string, unknown]> = [
+    ["non-object", null],
+    ["empty verifier", { ...valid, verifier: "" }],
+    ["noncanonical verifier", { ...valid, verifier: `${verifier}=` }],
+    ["empty salt", { ...valid, salt: "" }],
+    ["non-finite timestamp", { ...valid, createdAtMs: "1000" }],
+    ["non-positive lifetime", { ...valid, expiresAtMs: 1_000 }],
+    ["non-exact lifetime", { ...valid, expiresAtMs: 601_001 }],
+    ["extra field", { ...valid, rawCode: "forbidden" }],
+  ];
+  for (const [name, pairing] of cases) {
+    await t.test(name, async () => {
+      const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-pairing-schema-"));
+      const configPath = join(agentDir, "telegram.json");
+      await writeFile(
+        configPath,
+        `${JSON.stringify({ profiles: { default: { botToken: "token", pairing } } })}\n`,
+        { encoding: "utf8", mode: 0o600 },
+      );
+      const events: string[] = [];
+      const store = createTelegramConfigStore({
+        agentDir,
+        configPath,
+        recordRuntimeEvent: (_category, error, details) => {
+          events.push(`${error instanceof Error ? error.message : String(error)}:${details?.phase}`);
+        },
+      });
+      await store.load();
+      assert.equal(store.hasBotToken(), false);
+      assert.deepEqual(store.get(), {});
+      const entries = await readdir(agentDir);
+      assert.equal(entries.includes("telegram.json"), false);
+      assert.ok(entries.some((entry) => entry.startsWith("telegram.json.invalid-")));
+      assert.equal(events.length, 1);
+      assert.match(events[0] ?? "", /^Invalid Telegram pairing verifier at profiles\.default:load$/);
+    });
+  }
+});
+
+test("Telegram config transaction rejects malformed pairing verifier before mutation", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-pairing-transaction-"));
+  const configPath = join(agentDir, "telegram.json");
+  await writeFile(
+    configPath,
+    `${JSON.stringify({ profiles: { default: { botToken: "token", pairing: { verifier: "bad" } } } })}\n`,
+    { encoding: "utf8", mode: 0o600 },
+  );
+  const store = createTelegramConfigStore({ agentDir, configPath });
+  await assert.rejects(
+    () =>
+      store.transactActiveProfile((profile) => ({
+        profile: profile ? { ...profile, allowedUserId: 7 } : profile,
+        result: undefined,
+      })),
+    /Invalid Telegram pairing verifier at profiles\.default/,
+  );
+  assert.match(await readFile(configPath, "utf8"), /"verifier":"bad"/);
+});
+
 test("Telegram voice reply mode helpers normalize legacy manual to hidden", () => {
   let config: TelegramConfig = {};
   const store = { get: () => config };
@@ -963,98 +1029,9 @@ test("Telegram config store owns load, mutation, and persistence", async () => {
 });
 
 test("Telegram config helpers classify authorization state for pair, allow, and deny", () => {
-  assert.deepEqual(getTelegramAuthorizationState(10), {
-    kind: "pair",
-    userId: 10,
-  });
+  assert.deepEqual(getTelegramAuthorizationState(10), { kind: "deny" });
   assert.deepEqual(getTelegramAuthorizationState(10, 10), { kind: "allow" });
   assert.deepEqual(getTelegramAuthorizationState(10, 11), { kind: "deny" });
-});
-
-test("Telegram config helpers pair only when no user is configured", async () => {
-  const events: string[] = [];
-  let allowedUserId: number | undefined;
-  assert.equal(
-    await pairTelegramUserIfNeeded(10, {
-      allowedUserId,
-      ctx: "ctx",
-      setAllowedUserId: (userId) => {
-        allowedUserId = userId;
-        events.push(`set:${userId}`);
-      },
-      persistConfig: async () => {
-        events.push("persist");
-      },
-      updateStatus: (ctx) => {
-        events.push(`status:${ctx}`);
-      },
-    }),
-    true,
-  );
-  assert.equal(
-    await pairTelegramUserIfNeeded(11, {
-      allowedUserId,
-      ctx: "ctx",
-      setAllowedUserId: () => {
-        events.push("unexpected:set");
-      },
-      persistConfig: async () => {
-        events.push("unexpected:persist");
-      },
-      updateStatus: () => {
-        events.push("unexpected:status");
-      },
-    }),
-    false,
-  );
-  assert.equal(allowedUserId, 10);
-  assert.deepEqual(events, ["set:10", "persist", "status:ctx"]);
-});
-
-test("Telegram config pairing swallows only stale context status errors", async () => {
-  await assert.doesNotReject(() =>
-    pairTelegramUserIfNeeded(10, {
-      ctx: "ctx",
-      setAllowedUserId: () => {},
-      persistConfig: async () => {},
-      updateStatus: () => {
-        throw new Error("ctx is stale after session replacement");
-      },
-    }),
-  );
-  await assert.rejects(
-    () =>
-      pairTelegramUserIfNeeded(10, {
-        ctx: "ctx",
-        setAllowedUserId: () => {},
-        persistConfig: async () => {},
-        updateStatus: () => {
-          throw new Error("status broke");
-        },
-      }),
-    /status broke/,
-  );
-});
-
-test("Telegram config pairing runtime binds config and status ports", async () => {
-  const events: string[] = [];
-  let allowedUserId: number | undefined;
-  const runtime = createTelegramUserPairingRuntime({
-    getAllowedUserId: () => allowedUserId,
-    setAllowedUserId: (userId) => {
-      allowedUserId = userId;
-      events.push(`set:${userId}`);
-    },
-    persistConfig: async () => {
-      events.push("persist");
-    },
-    updateStatus: (ctx: string) => {
-      events.push(`status:${ctx}`);
-    },
-  });
-  assert.equal(await runtime.pairIfNeeded(7, "ctx"), true);
-  assert.equal(await runtime.pairIfNeeded(8, "ctx"), false);
-  assert.deepEqual(events, ["set:7", "persist", "status:ctx"]);
 });
 
 test("Bot token input prefers stored config over env vars", () => {
@@ -1173,7 +1150,6 @@ test("Setup runtime prompts, validates token, persists config, and starts pollin
     "getMe:new-token",
     "persist:new-token:demo_bot",
     "notify:info:Telegram bot connected: @demo_bot",
-    "notify:info:Send /start to your bot in Telegram to pair this extension with your account.",
     "poll",
     "status",
   ]);
@@ -1285,7 +1261,6 @@ test("Setup prompt runtime guards concurrent setup and stores successful config"
     "set:demo_bot",
     "persist:new-token",
     "notify:info:Telegram bot connected: @demo_bot",
-    "notify:info:Send /start to your bot in Telegram to pair this extension with your account.",
     "poll",
     "status",
     "finish",

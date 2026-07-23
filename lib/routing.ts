@@ -548,7 +548,7 @@ export interface TelegramInboundRouteRuntimeDeps<
 > {
   configStore: Pick<
     TelegramConfigStore,
-    "get" | "getAllowedUserId" | "setAllowedUserId" | "persist"
+    "get" | "getAllowedUserId" | "persist"
   > & { set?: TelegramConfigStore["set"] };
   callApi?: <TResponse>(
     method: string,
@@ -1623,10 +1623,8 @@ export function createTelegramInboundRouteRuntime<
     },
     openSettingsMenu: deps.openSettingsMenu,
     getAllowedUserId: deps.configStore.getAllowedUserId,
-    setAllowedUserId: deps.configStore.setAllowedUserId,
     setMyCommands: deps.setMyCommands,
     getPromptTemplateCommands,
-    persistConfig: deps.configStore.persist,
     sendTextReply: deps.sendTextReply,
     sendInteractiveMessage: deps.sendInteractiveMessage,
     recordRuntimeEvent: deps.recordRuntimeEvent,
@@ -2066,9 +2064,6 @@ export function createTelegramInboundRouteRuntime<
     recordMessageOwnership: deps.recordMessageOwnership,
     handleTelegramTopicLifecycleUpdate,
     foreignOwnedUpdateForwarder: deps.foreignOwnedUpdateForwarder,
-    setAllowedUserId: deps.configStore.setAllowedUserId,
-    persistConfig: deps.configStore.persist,
-    updateStatus: deps.updateStatus,
     removePendingMediaGroupMessages: deps.mediaGroupRuntime.removeMessages,
     removeQueuedTelegramTurnsByMessageIds:
       deps.queueMutationRuntime.removeByMessageIds,

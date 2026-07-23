@@ -923,21 +923,13 @@ test("Command helpers open compact confirmation and handle callbacks", async () 
     openThinkingMenu: async () => {},
     openQueueMenu: async () => {},
     getAllowedUserId: () => 1,
-    setAllowedUserId: () => {},
     registerBotCommands: async () => {},
-    persistConfig: async () => {},
     sendTextReply: async () => {},
-    sendInteractiveMessage: async (
-      chatId,
-      text,
-      mode,
-      replyMarkup,
-      options,
-    ) => {
-      events.push(`${chatId}:${mode}:${text}`);
+    sendInteractiveMessage: async (chatId, text, parseMode, replyMarkup, options) => {
+      events.push(`${chatId}:${parseMode}:${text}`);
       events.push(JSON.stringify(replyMarkup.inline_keyboard));
       events.push(JSON.stringify(options));
-      return 77;
+      return 1;
     },
   });
   assert.equal(await handleCommand("compact", message, {}), true);
@@ -1276,12 +1268,8 @@ test("Command handler target runtime binds command targets into command handling
     openThinkingMenu: async () => {},
     openQueueMenu: async () => {},
     getAllowedUserId: () => 7,
-    setAllowedUserId: () => {},
     setMyCommands: async () => {},
-    persistConfig: async () => {},
-    sendTextReply: async (_chatId, _replyToMessageId, text) => {
-      calls.push(`reply:${text}`);
-    },
+    sendTextReply: async () => {},
   });
   assert.equal(
     await handleCommand("status", { chat: { id: 7 }, message_id: 11 }, "ctx"),
@@ -1389,15 +1377,8 @@ test("Command runtime routes commands through runtime ports", async () => {
       events.push(`queue:${nextMessage.chat.id}`);
     },
     getAllowedUserId: () => allowedUserId,
-    setAllowedUserId: (userId: number) => {
-      allowedUserId = userId;
-      events.push(`pair:${userId}`);
-    },
     registerBotCommands: async () => {
       events.push("register");
-    },
-    persistConfig: async () => {
-      events.push("persist");
     },
     sendTextReply: async (nextMessage: typeof message, text: string) => {
       events.push(`reply:${nextMessage.message_id}:${text}`);
@@ -1416,15 +1397,12 @@ test("Command runtime routes commands through runtime ports", async () => {
   compactComplete?.();
   assert.equal(await handleCommand("stop", message, { idle: true }), true);
   assert.equal(await handleCommand("unknown", message, { idle: true }), false);
-  assert.equal(allowedUserId, 7);
+  assert.equal(allowedUserId, undefined);
   assert.deepEqual(events, [
     "show:42",
     "model:42",
     "thinking:42",
     "register",
-    "pair:7",
-    "persist",
-    "status",
     "show:42",
     "register",
     "show:42",
@@ -1484,15 +1462,8 @@ test("Command runtime does not first-pair from group start", async () => {
     openThinkingMenu: async () => {},
     openQueueMenu: async () => {},
     getAllowedUserId: () => allowedUserId,
-    setAllowedUserId: (userId: number) => {
-      allowedUserId = userId;
-      events.push(`pair:${userId}`);
-    },
     registerBotCommands: async () => {
       events.push("register");
-    },
-    persistConfig: async () => {
-      events.push("persist");
     },
     sendTextReply: async (_message: typeof message, text: string) => {
       events.push(`reply:${text}`);
@@ -1634,4 +1605,22 @@ test("Command helpers execute command actions through provided handlers", async 
     true,
   );
   assert.deepEqual(events, ["stop", "help:start"]);
+});
+
+test("Connect displays pairing instructions locally before polling", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  const events: string[] = [];
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => {},
+    getStatusLines: () => [],
+    reloadConfig: async () => {},
+    hasBotToken: () => true,
+    getPairingInstructions: async () => "Pairing code: local-only",
+    startPolling: async () => { events.push("poll"); },
+    stopPolling: async () => {},
+    updateStatus: () => {},
+  });
+  const ctx = createBridgeCommandContext((message) => events.push(message));
+  await getRequiredCommand(harness.commands, "telegram-connect").handler("", ctx);
+  assert.deepEqual(events, ["Pairing code: local-only", "poll"]);
 });

@@ -48,7 +48,7 @@ Stable commands inside Pi:
 
 Stable commands inside the paired Telegram DM:
 
-- `/start` — pair when needed and open the main application menu.
+- `/start` — open the main application menu after pairing. Initial pairing uses the exact `/start <code>` command displayed only in the local Pi UI by `/telegram-setup` or `/telegram-connect`; the proof never reaches companion update handlers.
 - `/compact` — open confirmation and compact when idle.
 - `/next` — dispatch the next queued turn, aborting active work first when needed.
 - `/continue` — enqueue a priority `continue` prompt.
@@ -84,6 +84,12 @@ interface TelegramBotProfile {
   botId?: number; // runtime-managed
   allowedUserId?: number;
   lastUpdateId?: number; // runtime-managed
+  pairing?: { // runtime-managed; never contains the raw code
+    verifier: string;
+    salt: string;
+    createdAtMs: number;
+    expiresAtMs: number;
+  };
 }
 
 interface TelegramConfig {
@@ -108,6 +114,8 @@ interface TelegramConfig {
 ```
 
 Bot/session identity always persists under `profiles.<name>`. The ordinary setup path uses `profiles.default`; `/telegram-setup default` and `/telegram-connect default` are exact aliases for the bare commands. Named profiles use the same shape. Shared handlers plus `assistant`, `voice`, and `time` remain top-level. On the first `0.24.0` load, unambiguous legacy root identity moves atomically into `profiles.default`; identical duplicates collapse, complementary fields merge, and conflicting values fail closed without modifying the file.
+
+When `allowedUserId` is absent, setup/connect creates a cryptographically random, single-use proof with a 10-minute lifetime and displays it only in the local Pi UI. An unexpired verifier is never rotated by another setup/connect: the creating process may redisplay its cached code, while restarted or concurrent processes report that pairing is pending without showing a code. `pairing` is runtime-managed, strictly validated verifier metadata; malformed metadata is quarantined on load and rejected by config transactions. Do not edit or expose it. Pairing-proof updates are excluded from `registerTelegramUpdateHandler()` even when replayed after pairing; all other unpaired raw updates are excluded as well. Existing valid `allowedUserId` values remain authoritative and suppress proof generation.
 
 The file is global across Pi instances. Cooperating instances serialize recursive delta merges through `telegram.json.transaction`, preserve unrelated global/profile changes from newer disk snapshots, and merge `lastUpdateId` monotonically. A semantically unchanged merge adopts the latest disk state in memory without replacing the file; later commits win when two deltas intentionally change the same leaf. For manual edits, stop or idle the connected instances, publish a complete valid file atomically, and let them reload. A non-transactional editor racing Pi persistence has no same-leaf conflict guarantee.
 
@@ -152,7 +160,7 @@ Low-level stable buses:
 
 - `registerTelegramUpdateHandler()`
   - Identity: no id.
-  - Purpose: observe or consume raw Telegram updates before default routing.
+  - Purpose: observe or consume paired raw Telegram updates before default routing. Unpaired claims and rejected unpaired updates are security-gated first and are never observable or consumable here.
 - `registerTelegramInboundHandler()`
   - Identity: no id.
   - Purpose: generic Telegram-to-Pi transforms.
