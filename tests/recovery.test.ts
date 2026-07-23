@@ -429,6 +429,8 @@ function prepareOutbound(
   options: {
     updateId?: number;
     intentId?: string;
+    replyToMessageId?: number;
+    guestQueryId?: string;
     units?: Parameters<RecoveryStore["planOutbound"]>[0]["units"];
     spool?: readonly Uint8Array[];
   } = {},
@@ -461,11 +463,12 @@ function prepareOutbound(
     turnId: inbound.turnId,
     sourceInboundRecordIds: [inbound.recordId],
     claim: { identity: OLD_IDENTITY },
-    replyToMessageId: 77,
+    replyToMessageId: options.replyToMessageId ?? 77,
     renderingMode: "rich",
     finalMarkdown: "first\n\nsecond",
     renderedChunks: [],
     units,
+    ...(options.guestQueryId ? { guestQueryId: options.guestQueryId } : {}),
     spool: options.spool,
   });
   return { inbound, outbound, units };
@@ -541,7 +544,7 @@ test("outbound policy constants freeze automatic starts, delays, and uncertainty
   ]);
 });
 
-test("strict outbound record parsing rejects state-specific metadata, skipped receipts, and mismatched sources", () => {
+test("strict outbound record parsing rejects state-specific metadata, unordered receipts, and mismatched sources", () => {
   expectInvalid((value) => {
     records(value, "outbound")[0]!.unknown = true;
   }, /unknown field/);
@@ -564,7 +567,7 @@ test("strict outbound record parsing rejects state-specific metadata, skipped re
   expectInvalid((value) => {
     const delivered = records(value, "outbound")[3]!;
     (delivered.receipts as Array<Record<string, unknown>>)[0]!.unitIndex = 1;
-  }, /contiguous and ordered/);
+  }, /must follow every confirmed receipt/);
   expectInvalid((value) => {
     const delivered = records(value, "outbound")[3]!;
     const receipts = delivered.receipts as Array<Record<string, unknown>>;
@@ -1322,6 +1325,34 @@ test("outbound planning strictly validates semantic payloads, filenames, operati
     removeHarness(filenameHarness);
   }
 
+  const guestHarness = createStoreHarness();
+  try {
+    const guest = prepareOutbound(guestHarness, {
+      replyToMessageId: 0,
+      guestQueryId: "guest-query-1",
+      units: [{
+        kind: "guest",
+        operationId: "guest-operation",
+        method: "answerGuestQuery",
+        markdown: "Guest answer",
+      }],
+    });
+    assert.equal(guest.outbound.state, "planned");
+  } finally {
+    removeHarness(guestHarness);
+  }
+
+  const zeroReplyHarness = createStoreHarness();
+  try {
+    assert.throws(
+      () => prepareOutbound(zeroReplyHarness, { replyToMessageId: 0 }),
+      /positive for non-Guest plans/,
+    );
+    assert.equal(readStoreSnapshot(zeroReplyHarness.rootPath).outbound.length, 0);
+  } finally {
+    removeHarness(zeroReplyHarness);
+  }
+
   const harness = createStoreHarness();
   try {
     const prepared = prepareOutbound(harness);
@@ -1362,6 +1393,266 @@ test("outbound planning strictly validates semantic payloads, filenames, operati
   } finally {
     removeHarness(harness);
   }
+});
+
+test("outbound fallback branches preserve stable operations and strict state on reopen", () => {
+  const harness = createStoreHarness();
+  try {
+    const units: Parameters<RecoveryStore["planOutbound"]>[0]["units"] = [
+      {
+        kind: "rich-media",
+        operationId: "rich-primary",
+        method: "sendRichMessage",
+        spoolRefIndex: 0,
+        fileName: "result.png",
+        mediaKind: "photo",
+        caption: "Result",
+        fallback: {
+          trigger: "known-failure",
+          operationIds: ["fallback-text", "fallback-file"],
+        },
+      },
+      {
+        kind: "final-text",
+        operationId: "fallback-text",
+        method: "sendRichMessage",
+        content: "Result",
+        contentMode: "rich-markdown",
+      },
+      {
+        kind: "attachment",
+        operationId: "fallback-file",
+        method: "sendPhoto",
+        spoolRefIndex: 0,
+        fileName: "result.png",
+        mediaKind: "photo",
+      },
+    ];
+    const { outbound } = prepareOutbound(harness, {
+      intentId: "branch-intent",
+      units,
+      spool: [Buffer.from("image")],
+    });
+    assert.equal(outbound.state, "planned");
+    assert.equal(outbound.nextUnitIndex, 0);
+    harness.store.activateOutbound(outbound.recordId, {
+      identity: OLD_IDENTITY,
+    });
+    const primary = harness.store.claimOutboundUnit({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+    });
+    const fallbackPending = harness.store.recordOutboundSafeFailure({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+      attemptId: primary.record.activeUnit!.attemptId,
+    });
+    assert.equal(fallbackPending.state, "pending");
+    assert.equal(fallbackPending.nextUnitIndex, 1);
+    assert.equal(fallbackPending.receipts.length, 0);
+    const reopened = reopenStore(harness);
+    const claimed = reopened.claimOutboundUnit({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+    });
+    const payload = JSON.parse(Buffer.from(claimed.payload).toString("utf8")) as {
+      units: Array<{ operationId: string }>;
+    };
+    assert.deepEqual(
+      payload.units.map((unit) => unit.operationId),
+      ["rich-primary", "fallback-text", "fallback-file"],
+    );
+    assert.equal(claimed.record.activeUnit?.unitIndex, 1);
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("outbound state parser accepts a Rich success that skips declared fallback units", () => {
+  const harness = createStoreHarness();
+  try {
+    const { inbound, outbound } = prepareOutbound(harness, {
+      intentId: "branch-success-intent",
+      units: [
+        {
+          kind: "rich-media",
+          operationId: "rich-success",
+          method: "sendRichMessage",
+          spoolRefIndex: 0,
+          fileName: "result.png",
+          mediaKind: "photo",
+          caption: "Result",
+          fallback: {
+            trigger: "known-failure",
+            operationIds: ["unused-text", "unused-file"],
+          },
+        },
+        {
+          kind: "final-text",
+          operationId: "unused-text",
+          method: "sendRichMessage",
+          content: "Result",
+          contentMode: "rich-markdown",
+        },
+        {
+          kind: "attachment",
+          operationId: "unused-file",
+          method: "sendPhoto",
+          spoolRefIndex: 0,
+          fileName: "result.png",
+          mediaKind: "photo",
+        },
+      ],
+      spool: [Buffer.from("image")],
+    });
+    harness.store.activateOutbound(outbound.recordId, {
+      identity: OLD_IDENTITY,
+    });
+    const claimed = harness.store.claimOutboundUnit({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+    });
+    const delivered = harness.store.recordOutboundReceipt({
+      recordId: outbound.recordId,
+      claim: { identity: OLD_IDENTITY },
+      attemptId: claimed.record.activeUnit!.attemptId,
+      operationId: "rich-success",
+      method: "sendRichMessage",
+      messageId: 99,
+    });
+    assert.equal(delivered.state, "delivered");
+    assert.equal(delivered.nextUnitIndex, 3);
+    assert.deepEqual(delivered.receipts.map((receipt) => receipt.unitIndex), [0]);
+    assert.equal(
+      readStoreSnapshot(harness.rootPath).inbound.find(
+        (entry) => entry.recordId === inbound.recordId,
+      )!.state,
+      "completed",
+    );
+    assert.doesNotThrow(() => reopenStore(harness));
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("outbound parser rejects invalid methods, modes, fields, and fallback graphs", () => {
+  const expectRejected = (
+    units: Parameters<RecoveryStore["planOutbound"]>[0]["units"],
+    pattern: RegExp,
+    options: { spool?: readonly Uint8Array[]; guest?: boolean } = {},
+  ): void => {
+    const harness = createStoreHarness();
+    try {
+      assert.throws(
+        () => prepareOutbound(harness, {
+          replyToMessageId: options.guest ? 0 : 77,
+          ...(options.guest ? { guestQueryId: "strict-guest" } : {}),
+          units,
+          spool: options.spool,
+        }),
+        pattern,
+      );
+      assert.equal(readStoreSnapshot(harness.rootPath).outbound.length, 0);
+    } finally {
+      removeHarness(harness);
+    }
+  };
+
+  expectRejected([{
+    kind: "final-text",
+    operationId: "wrong-text-method",
+    method: "sendMessage",
+    content: "Rich text",
+    contentMode: "rich-markdown",
+  }], /does not match final-text content mode/);
+  expectRejected([{
+    kind: "attachment",
+    operationId: "wrong-attachment-media",
+    method: "sendPhoto",
+    spoolRefIndex: 0,
+    fileName: "file.pdf",
+    mediaKind: "document",
+  }], /attachment method and media kind do not match/, {
+    spool: [Buffer.from("file")],
+  });
+  expectRejected([{
+    kind: "guest",
+    operationId: "guest-mixed-content",
+    method: "answerGuestQuery",
+    markdown: "text",
+    spoolRefIndex: 0,
+    fileName: "file.pdf",
+    mediaKind: "document",
+  }], /exactly one of markdown or attachment/, {
+    guest: true,
+    spool: [Buffer.from("file")],
+  });
+  expectRejected([
+    {
+      kind: "rich-media",
+      operationId: "unknown-root",
+      method: "sendRichMessage",
+      spoolRefIndex: 0,
+      fileName: "result.png",
+      mediaKind: "photo",
+      caption: "Result",
+      fallback: { trigger: "known-failure", operationIds: ["missing"] },
+    },
+  ], /references an unknown operation/, { spool: [Buffer.from("image")] });
+  expectRejected([
+    {
+      kind: "rich-media",
+      operationId: "ordered-root",
+      method: "sendRichMessage",
+      spoolRefIndex: 0,
+      fileName: "result.png",
+      mediaKind: "photo",
+      caption: "Result",
+      fallback: {
+        trigger: "known-failure",
+        operationIds: ["ordered-file", "ordered-text"],
+      },
+    },
+    {
+      kind: "final-text",
+      operationId: "ordered-text",
+      method: "sendRichMessage",
+      content: "Result",
+      contentMode: "rich-markdown",
+    },
+    {
+      kind: "attachment",
+      operationId: "ordered-file",
+      method: "sendPhoto",
+      spoolRefIndex: 0,
+      fileName: "result.png",
+      mediaKind: "photo",
+    },
+  ], /ordered contiguous trailing branch/, { spool: [Buffer.from("image")] });
+  expectRejected([
+    {
+      kind: "rich-media",
+      operationId: "cycle-a",
+      method: "sendRichMessage",
+      spoolRefIndex: 0,
+      fileName: "a.png",
+      mediaKind: "photo",
+      caption: "A",
+      fallback: { trigger: "known-failure", operationIds: ["cycle-b"] },
+    },
+    {
+      kind: "rich-media",
+      operationId: "cycle-b",
+      method: "sendRichMessage",
+      spoolRefIndex: 1,
+      fileName: "b.png",
+      mediaKind: "photo",
+      caption: "B",
+      fallback: { trigger: "known-failure", operationIds: ["cycle-a"] },
+    },
+  ], /must not form a cycle/, {
+    spool: [Buffer.from("a"), Buffer.from("b")],
+  });
 });
 
 test("outbound publication is quota-fenced and digest verification fails closed", () => {

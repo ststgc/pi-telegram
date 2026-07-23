@@ -25,6 +25,7 @@ import {
   createTelegramVoiceReplySender,
   handleTelegramButtonCallbackQuery,
   planTelegramButtonReply,
+  planTelegramDurableOutboundReply,
   planTelegramVoiceReply,
   registerTelegramVoiceSynthesisProvider,
   getTelegramVoiceSynthesisProviders,
@@ -549,6 +550,40 @@ test("Outbound reply planner strips voice and button markup without losing artif
   assert.deepEqual(plan.replyMarkup, {
     inline_keyboard: [[{ text: "Continue", callback_data: "btn:1" }]],
   });
+});
+
+test("Durable outbound reply planning preserves semantic buttons and automatic voice", () => {
+  const explicit = planTelegramDurableOutboundReply(
+    [
+      "Visible answer.",
+      "",
+      "<!-- telegram_voice: Spoken summary. -->",
+      "",
+      '<!-- telegram_button label=Continue prompt="Continue safely." -->',
+    ].join("\n"),
+    { automaticVoice: true },
+  );
+  assert.deepEqual(explicit, {
+    markdown: "Visible answer.",
+    buttons: [{ label: "Continue", prompt: "Continue safely." }],
+    voiceReplies: [{ text: "Spoken summary." }],
+    voiceText: "Spoken summary.",
+    automaticVoice: false,
+  });
+
+  assert.deepEqual(
+    planTelegramDurableOutboundReply(
+      "Speak the whole answer.\n\n<!-- telegram_button: Retry -->",
+      { automaticVoice: true },
+    ),
+    {
+      markdown: "",
+      buttons: [{ label: "Retry", prompt: "Retry" }],
+      voiceReplies: [{ text: "Speak the whole answer." }],
+      voiceText: "Speak the whole answer.",
+      automaticVoice: true,
+    },
+  );
 });
 
 test("Button reply planner supports colon label-only shortcut", () => {

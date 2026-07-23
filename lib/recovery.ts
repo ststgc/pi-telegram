@@ -24,7 +24,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 
 import { withTelegramFileTransaction } from "./locks.ts";
 import {
@@ -424,6 +424,11 @@ export interface RecoveryOutboundVoiceMetadata {
   automatic: boolean;
 }
 
+export interface RecoveryOutboundFallbackBranch {
+  trigger: "known-failure";
+  operationIds: string[];
+}
+
 export type RecoveryOutboundUnit =
   | {
       kind: "final-text";
@@ -433,7 +438,17 @@ export type RecoveryOutboundUnit =
       contentMode: "rich-markdown" | "html" | "plain";
     }
   | {
-      kind: "rich-media" | "attachment" | "voice";
+      kind: "rich-media";
+      operationId: string;
+      method: string;
+      spoolRefIndex: number;
+      fileName: string;
+      mediaKind: RecoveryOutboundMediaKind;
+      caption?: string;
+      fallback?: RecoveryOutboundFallbackBranch;
+    }
+  | {
+      kind: "attachment" | "voice";
       operationId: string;
       method: string;
       spoolRefIndex: number;
@@ -609,6 +624,8 @@ function readSafeFileName(value: unknown, path: string): string {
   if (
     fileName === "." ||
     fileName === ".." ||
+    isAbsolute(fileName) ||
+    /^[A-Za-z]:/.test(fileName) ||
     fileName.includes("/") ||
     fileName.includes("\\") ||
     basename(fileName) !== fileName
@@ -920,8 +937,8 @@ function readOutboundRecord(
   );
   for (let index = 0; index < receipts.length; index += 1) {
     const receipt = receipts[index]!;
-    if (receipt.unitIndex !== index) {
-      fail(`${path}.receipts[${index}].unitIndex`, "must be contiguous and ordered");
+    if (index > 0 && receipt.unitIndex <= receipts[index - 1]!.unitIndex) {
+      fail(`${path}.receipts[${index}].unitIndex`, "must be strictly ordered");
     }
     if (
       receipt.committedAtMs < base.createdAtMs ||
@@ -939,8 +956,8 @@ function readOutboundRecord(
     `${path}.nextUnitIndex`,
     { minimum: 0 },
   );
-  if (nextUnitIndex !== receipts.length) {
-    fail(`${path}.nextUnitIndex`, "must equal the confirmed receipt count");
+  if (receipts.some((receipt) => receipt.unitIndex >= nextUnitIndex)) {
+    fail(`${path}.nextUnitIndex`, "must follow every confirmed receipt");
   }
   const automaticAttemptCount = readSafeInteger(
     object.automaticAttemptCount,
@@ -1145,6 +1162,27 @@ function readOutboundVoiceMetadata(
   };
 }
 
+function readOutboundFallbackBranch(
+  value: unknown,
+  path: string,
+): RecoveryOutboundFallbackBranch {
+  const object = readObject(value, path);
+  assertKeys(object, path, ["trigger", "operationIds"]);
+  if (object.trigger !== "known-failure") {
+    fail(`${path}.trigger`, "expected known-failure");
+  }
+  const operationIds = readArray(
+    object.operationIds,
+    `${path}.operationIds`,
+    readStableString,
+  );
+  if (operationIds.length === 0) {
+    fail(`${path}.operationIds`, "must not be empty");
+  }
+  assertUniqueStrings(operationIds, `${path}.operationIds`);
+  return { trigger: "known-failure", operationIds };
+}
+
 function readOutboundUnit(value: unknown, path: string): RecoveryOutboundUnit {
   const object = readObject(value, path);
   const kind = readEnum(object.kind, `${path}.kind`, [
@@ -1162,12 +1200,9 @@ function readOutboundUnit(value: unknown, path: string): RecoveryOutboundUnit {
       "content",
       "contentMode",
     ]);
-    return {
+    const unit: Extract<RecoveryOutboundUnit, { kind: "final-text" }> = {
       kind,
-      operationId: readStableString(
-        object.operationId,
-        `${path}.operationId`,
-      ),
+      operationId: readStableString(object.operationId, `${path}.operationId`),
       method: readStableString(object.method, `${path}.method`),
       content: readText(object.content, `${path}.content`),
       contentMode: readEnum(object.contentMode, `${path}.contentMode`, [
@@ -1176,6 +1211,14 @@ function readOutboundUnit(value: unknown, path: string): RecoveryOutboundUnit {
         "plain",
       ] as const),
     };
+    if (!unit.content) fail(`${path}.content`, "must not be empty");
+    if (
+      (unit.contentMode === "rich-markdown" && unit.method !== "sendRichMessage") ||
+      (unit.contentMode !== "rich-markdown" && unit.method !== "sendMessage")
+    ) {
+      fail(`${path}.method`, "does not match final-text content mode");
+    }
+    return unit;
   }
   if (kind === "guest") {
     assertKeys(
@@ -1186,14 +1229,15 @@ function readOutboundUnit(value: unknown, path: string): RecoveryOutboundUnit {
     );
     const unit: Extract<RecoveryOutboundUnit, { kind: "guest" }> = {
       kind,
-      operationId: readStableString(
-        object.operationId,
-        `${path}.operationId`,
-      ),
+      operationId: readStableString(object.operationId, `${path}.operationId`),
       method: readStableString(object.method, `${path}.method`),
     };
+    if (unit.method !== "answerGuestQuery") {
+      fail(`${path}.method`, "guest units require answerGuestQuery");
+    }
     if (Object.hasOwn(object, "markdown")) {
       unit.markdown = readText(object.markdown, `${path}.markdown`);
+      if (!unit.markdown) fail(`${path}.markdown`, "must not be empty");
     }
     const attachmentKeys = ["spoolRefIndex", "fileName", "mediaKind"];
     const attachmentKeyCount = attachmentKeys.filter((key) =>
@@ -1219,9 +1263,15 @@ function readOutboundUnit(value: unknown, path: string): RecoveryOutboundUnit {
     }
     if (Object.hasOwn(object, "caption")) {
       unit.caption = readText(object.caption, `${path}.caption`);
+      if (Array.from(unit.caption).length > 1024) {
+        fail(`${path}.caption`, "must not exceed 1024 code points");
+      }
     }
-    if (unit.markdown === undefined && unit.spoolRefIndex === undefined) {
-      fail(path, "guest unit requires markdown or an attachment");
+    if ((unit.markdown === undefined) === (unit.spoolRefIndex === undefined)) {
+      fail(path, "guest unit requires exactly one of markdown or attachment");
+    }
+    if (unit.caption !== undefined && unit.spoolRefIndex === undefined) {
+      fail(`${path}.caption`, "is valid only for a Guest attachment");
     }
     return unit;
   }
@@ -1236,13 +1286,9 @@ function readOutboundUnit(value: unknown, path: string): RecoveryOutboundUnit {
       "fileName",
       "mediaKind",
     ],
-    ["caption"],
+    kind === "rich-media" ? ["caption", "fallback"] : ["caption"],
   );
-  const unit: Extract<
-    RecoveryOutboundUnit,
-    { kind: "rich-media" | "attachment" | "voice" }
-  > = {
-    kind,
+  const common = {
     operationId: readStableString(object.operationId, `${path}.operationId`),
     method: readStableString(object.method, `${path}.method`),
     spoolRefIndex: readSafeInteger(
@@ -1259,13 +1305,149 @@ function readOutboundUnit(value: unknown, path: string): RecoveryOutboundUnit {
       "voice",
     ] as const),
   };
-  if (Object.hasOwn(object, "caption")) {
-    unit.caption = readText(object.caption, `${path}.caption`);
+  const caption = Object.hasOwn(object, "caption")
+    ? readText(object.caption, `${path}.caption`)
+    : undefined;
+  if (kind === "rich-media") {
+    const unit: Extract<RecoveryOutboundUnit, { kind: "rich-media" }> = {
+      kind,
+      ...common,
+      ...(caption !== undefined ? { caption } : {}),
+      ...(Object.hasOwn(object, "fallback")
+        ? { fallback: readOutboundFallbackBranch(object.fallback, `${path}.fallback`) }
+        : {}),
+    };
+    if (
+      unit.method !== "sendRichMessage" ||
+      !["photo", "video", "audio"].includes(unit.mediaKind) ||
+      !unit.caption
+    ) {
+      fail(path, "rich-media requires sendRichMessage, supported media, and caption");
+    }
+    return unit;
   }
-  if (kind === "voice" && unit.mediaKind !== "voice") {
-    fail(`${path}.mediaKind`, "voice units require voice media");
+  const unit: Extract<RecoveryOutboundUnit, { kind: "attachment" | "voice" }> = {
+    kind,
+    ...common,
+    ...(caption !== undefined ? { caption } : {}),
+  };
+  if (kind === "voice") {
+    if (unit.method !== "sendVoice" || unit.mediaKind !== "voice") {
+      fail(path, "voice units require sendVoice and voice media");
+    }
+  } else if (
+    !(
+      (unit.method === "sendPhoto" && unit.mediaKind === "photo") ||
+      (unit.method === "sendDocument" && unit.mediaKind === "document")
+    )
+  ) {
+    fail(path, "attachment method and media kind do not match");
   }
   return unit;
+}
+
+function assertOutboundFallbackBranches(
+  units: readonly RecoveryOutboundUnit[],
+  path: string,
+): void {
+  const indexByOperationId = new Map(
+    units.map((unit, index) => [unit.operationId, index] as const),
+  );
+  const edges = new Map<number, number[]>();
+  for (const [index, unit] of units.entries()) {
+    if (unit.kind !== "rich-media" || !unit.fallback) continue;
+    const targets = unit.fallback.operationIds.map((operationId, targetIndex) => {
+      const resolved = indexByOperationId.get(operationId);
+      if (resolved === undefined) {
+        fail(
+          `${path}[${index}].fallback.operationIds[${targetIndex}]`,
+          "references an unknown operation",
+        );
+      }
+      return resolved;
+    });
+    edges.set(index, targets);
+  }
+  const visiting = new Set<number>();
+  const visited = new Set<number>();
+  const visit = (index: number): void => {
+    if (visiting.has(index)) fail(`${path}[${index}].fallback`, "must not form a cycle");
+    if (visited.has(index)) return;
+    visiting.add(index);
+    for (const target of edges.get(index) ?? []) visit(target);
+    visiting.delete(index);
+    visited.add(index);
+  };
+  for (const index of edges.keys()) visit(index);
+
+  const claimedTargets = new Set<number>();
+  for (const [index, targets] of edges) {
+    const expectedTargets = targets.map((_target, offset) => index + offset + 1);
+    if (
+      targets.length === 0 ||
+      targets.some((target, targetIndex) => target !== expectedTargets[targetIndex]) ||
+      targets.at(-1) !== units.length - 1
+    ) {
+      fail(`${path}[${index}].fallback.operationIds`, "must reference the ordered contiguous trailing branch");
+    }
+    if (targets.some((target) => claimedTargets.has(target))) {
+      fail(`${path}[${index}].fallback.operationIds`, "must not share fallback units");
+    }
+    targets.forEach((target) => claimedTargets.add(target));
+    const fallbackUnits = targets.map((target) => units[target]!);
+    const last = fallbackUnits.at(-1);
+    if (
+      fallbackUnits.length < 2 ||
+      fallbackUnits.slice(0, -1).some((unit) => unit.kind !== "final-text") ||
+      last?.kind !== "attachment"
+    ) {
+      fail(`${path}[${index}].fallback.operationIds`, "must reference final-text units followed by one attachment");
+    }
+    const source = units[index];
+    if (
+      source?.kind !== "rich-media" ||
+      last.spoolRefIndex !== source.spoolRefIndex ||
+      last.fileName !== source.fileName
+    ) {
+      fail(`${path}[${index}].fallback.operationIds`, "must reuse the Rich media source exactly");
+    }
+  }
+}
+
+function assertOutboundProgressPath(
+  record: RecoveryOutboundRecord,
+  payload: RecoveryOutboundPayloadV1,
+): void {
+  const branchRootIndex = payload.units.findIndex(
+    (unit) => unit.kind === "rich-media" && unit.fallback !== undefined,
+  );
+  const receiptIndices = record.receipts.map((receipt) => receipt.unitIndex);
+  let expectedReceiptIndices: number[];
+  if (branchRootIndex < 0 || record.nextUnitIndex <= branchRootIndex) {
+    expectedReceiptIndices = Array.from(
+      { length: record.nextUnitIndex },
+      (_value, index) => index,
+    );
+  } else if (receiptIndices.includes(branchRootIndex)) {
+    expectedReceiptIndices = Array.from(
+      { length: branchRootIndex + 1 },
+      (_value, index) => index,
+    );
+    if (record.nextUnitIndex !== payload.units.length) {
+      throw new Error("Recovery outbound successful branch must skip its fallback units");
+    }
+  } else {
+    expectedReceiptIndices = [
+      ...Array.from({ length: branchRootIndex }, (_value, index) => index),
+      ...Array.from(
+        { length: record.nextUnitIndex - branchRootIndex - 1 },
+        (_value, index) => branchRootIndex + index + 1,
+      ),
+    ];
+  }
+  if (JSON.stringify(receiptIndices) !== JSON.stringify(expectedReceiptIndices)) {
+    throw new Error("Recovery outbound receipts do not follow the delivery branch");
+  }
 }
 
 function readOutboundPayload(
@@ -1298,7 +1480,7 @@ function readOutboundPayload(
     replyToMessageId: readSafeInteger(
       object.replyToMessageId,
       `${path}.replyToMessageId`,
-      { minimum: 1 },
+      { minimum: 0 },
     ),
     renderingMode: readEnum(object.renderingMode, `${path}.renderingMode`, [
       "rich",
@@ -1327,6 +1509,7 @@ function readOutboundPayload(
     payload.units.map((unit) => unit.operationId),
     `${path}.units.operationId`,
   );
+  assertOutboundFallbackBranches(payload.units, `${path}.units`);
   for (let index = 0; index < payload.units.length; index += 1) {
     const unit = payload.units[index]!;
     if ("spoolRefIndex" in unit && unit.spoolRefIndex !== undefined) {
@@ -1340,6 +1523,24 @@ function readOutboundPayload(
     if (unit.kind === "guest" && payload.guestQueryId === undefined) {
       fail(`${path}.guestQueryId`, "is required by guest units");
     }
+    if (unit.kind !== "guest" && payload.guestQueryId !== undefined) {
+      fail(`${path}.units[${index}].kind`, "Guest plans require only guest units");
+    }
+    if (
+      payload.guestQueryId === undefined &&
+      ((payload.renderingMode === "rich" &&
+        unit.kind === "final-text" &&
+        unit.contentMode === "html") ||
+        (payload.renderingMode === "html" &&
+          unit.kind === "final-text" &&
+          unit.contentMode === "rich-markdown") ||
+        (unit.kind === "rich-media" && payload.renderingMode !== "rich"))
+    ) {
+      fail(`${path}.units[${index}]`, "does not match the payload rendering mode");
+    }
+  }
+  if (payload.guestQueryId === undefined && payload.replyToMessageId < 1) {
+    fail(`${path}.replyToMessageId`, "must be positive for non-Guest plans");
   }
   return payload;
 }
@@ -3225,6 +3426,7 @@ export class RecoveryStore {
     if (record.nextUnitIndex > payload.units.length) {
       throw new Error("Recovery outbound next unit exceeds the delivery plan");
     }
+    assertOutboundProgressPath(record, payload);
     if (record.state === "delivered" && record.nextUnitIndex !== payload.units.length) {
       throw new Error("Recovery delivered outbound record has incomplete units");
     }
@@ -3245,21 +3447,41 @@ export class RecoveryStore {
         throw new Error("Recovery outbound receipt does not match its delivery unit");
       }
     }
-    const usedSpoolIndices = payload.units.flatMap((unit) =>
-      "spoolRefIndex" in unit && unit.spoolRefIndex !== undefined
-        ? [unit.spoolRefIndex]
-        : [],
-    );
-    const sortedSpoolIndices = [...usedSpoolIndices].sort(
+    const spoolUnitIndices = new Map<number, number[]>();
+    for (const [unitIndex, unit] of payload.units.entries()) {
+      if (!("spoolRefIndex" in unit) || unit.spoolRefIndex === undefined) continue;
+      const references = spoolUnitIndices.get(unit.spoolRefIndex) ?? [];
+      references.push(unitIndex);
+      spoolUnitIndices.set(unit.spoolRefIndex, references);
+    }
+    for (const [spoolIndex, unitIndices] of spoolUnitIndices) {
+      if (unitIndices.length === 1) continue;
+      const [richIndex, attachmentIndex] = unitIndices;
+      const rich = richIndex === undefined ? undefined : payload.units[richIndex];
+      const attachment = attachmentIndex === undefined
+        ? undefined
+        : payload.units[attachmentIndex];
+      if (
+        unitIndices.length !== 2 ||
+        rich?.kind !== "rich-media" ||
+        attachment?.kind !== "attachment" ||
+        !rich.fallback?.operationIds.includes(attachment.operationId)
+      ) {
+        throw new Error("Recovery outbound spool references must be branch-exclusive");
+      }
+      if (rich.spoolRefIndex !== spoolIndex || attachment.spoolRefIndex !== spoolIndex) {
+        throw new Error("Recovery outbound branch spool reference mismatch");
+      }
+    }
+    const sortedSpoolIndices = [...spoolUnitIndices.keys()].sort(
       (left, right) => left - right,
     );
     if (
-      new Set(usedSpoolIndices).size !== usedSpoolIndices.length ||
       sortedSpoolIndices.some((value, index) => value !== index) ||
       (record.state !== "delivered" &&
-        usedSpoolIndices.length !== record.spoolRefs.length)
+        sortedSpoolIndices.length !== record.spoolRefs.length)
     ) {
-      throw new Error("Recovery outbound spool references must be used exactly once");
+      throw new Error("Recovery outbound spool references must cover each spool");
     }
     return { payload, bytes };
   }
@@ -4727,7 +4949,11 @@ export class RecoveryStore {
       const messageId = input.messageId === undefined
         ? undefined
         : readSafeInteger(input.messageId, "$receipt.messageId", { minimum: 1 });
-      finalReceipt = record.nextUnitIndex + 1 === payload.units.length;
+      const skipsKnownFailureFallback =
+        unit.kind === "rich-media" && unit.fallback !== undefined;
+      finalReceipt =
+        skipsKnownFailureFallback ||
+        record.nextUnitIndex + 1 === payload.units.length;
       if (finalReceipt) this.#fault?.("OUT-05");
       record.receipts.push({
         unitIndex: record.nextUnitIndex,
@@ -4736,7 +4962,9 @@ export class RecoveryStore {
         ...(messageId !== undefined ? { messageId } : {}),
         committedAtMs: nowMs,
       });
-      record.nextUnitIndex += 1;
+      record.nextUnitIndex = skipsKnownFailureFallback
+        ? payload.units.length
+        : record.nextUnitIndex + 1;
       delete record.activeUnit;
       record.automaticAttemptCount = 0;
       if (finalReceipt) {
@@ -4772,13 +5000,23 @@ export class RecoveryStore {
       const record = this.#getOutbound(snapshot, input.recordId);
       this.#assertOutboundClaim(snapshot, record, input.claim);
       this.#assertOutboundAttempt(record, input.attemptId);
-      record.state = "retryable-pending";
-      delete record.activeUnit;
-      if (record.automaticAttemptCount < RECOVERY_OUTBOUND_MAX_AUTOMATIC_STARTS) {
-        record.retryNotBeforeMs =
-          nowMs + RECOVERY_OUTBOUND_RETRY_DELAYS_MS[record.automaticAttemptCount - 1]!;
-      } else {
+      const { payload } = this.#readOutboundPayload(snapshot, record);
+      const unit = payload.units[record.nextUnitIndex];
+      if (unit?.kind === "rich-media" && unit.fallback !== undefined) {
+        record.nextUnitIndex += 1;
+        record.state = "pending";
+        record.automaticAttemptCount = 0;
+        delete record.activeUnit;
         delete record.retryNotBeforeMs;
+      } else {
+        record.state = "retryable-pending";
+        delete record.activeUnit;
+        if (record.automaticAttemptCount < RECOVERY_OUTBOUND_MAX_AUTOMATIC_STARTS) {
+          record.retryNotBeforeMs =
+            nowMs + RECOVERY_OUTBOUND_RETRY_DELAYS_MS[record.automaticAttemptCount - 1]!;
+        } else {
+          delete record.retryNotBeforeMs;
+        }
       }
       record.stateRevision = revision;
       record.updatedAtMs = nowMs;

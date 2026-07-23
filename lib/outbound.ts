@@ -765,6 +765,63 @@ export interface TelegramOutboundReplyPlan<TReplyMarkup = unknown> {
   rate?: string;
 }
 
+export interface TelegramDurableOutboundButton {
+  label: string;
+  prompt: string;
+}
+
+export interface TelegramDurableOutboundReplyPlan {
+  markdown: string;
+  buttons: TelegramDurableOutboundButton[];
+  voiceReplies: TelegramVoiceReplyItem[];
+  voiceText?: string;
+  lang?: string;
+  rate?: string;
+  automaticVoice: boolean;
+}
+
+/**
+ * Produce the semantic reply plan stored by durable outbound recovery. Unlike
+ * the live reply planner, this does not register ephemeral callback tokens.
+ */
+export function planTelegramDurableOutboundReply(
+  markdown: string,
+  options: { automaticVoice?: boolean } = {},
+): TelegramDurableOutboundReplyPlan {
+  const buttons: TelegramDurableOutboundButton[] = [];
+  const buttonReply = planTelegramButtonReply(markdown, {
+    registerAction: (action) => {
+      buttons.push({ label: action.text, prompt: action.prompt });
+      return `durable-button-${buttons.length}`;
+    },
+  });
+  const explicitVoice = planTelegramVoiceReply(buttonReply.markdown);
+  const explicitReplies = explicitVoice.voiceReplies ?? [];
+  const automaticText = explicitVoice.markdown.trim();
+  if (
+    options.automaticVoice === true &&
+    explicitReplies.length === 0 &&
+    automaticText
+  ) {
+    return {
+      markdown: "",
+      buttons,
+      voiceReplies: [{ text: automaticText }],
+      voiceText: automaticText,
+      automaticVoice: true,
+    };
+  }
+  return {
+    markdown: explicitVoice.markdown,
+    buttons,
+    voiceReplies: explicitReplies,
+    ...(explicitVoice.voiceText ? { voiceText: explicitVoice.voiceText } : {}),
+    ...(explicitVoice.lang ? { lang: explicitVoice.lang } : {}),
+    ...(explicitVoice.rate ? { rate: explicitVoice.rate } : {}),
+    automaticVoice: false,
+  };
+}
+
 // --- Voice Policy Re-Exports ---
 export {
   clearTelegramVoiceSynthesisProviders,

@@ -137,6 +137,27 @@ export interface TelegramRichOutboundAttachmentSenderDeps extends TelegramOutbou
   }) => void;
 }
 
+export type TelegramRichOutboundAttachmentMediaKind =
+  | "photo"
+  | "video"
+  | "audio";
+
+export function getTelegramRichOutboundAttachmentMediaKind(
+  path: string,
+): TelegramRichOutboundAttachmentMediaKind | undefined {
+  const normalized = path.toLowerCase();
+  if (
+    normalized.endsWith(".jpg") ||
+    normalized.endsWith(".jpeg") ||
+    normalized.endsWith(".png")
+  ) {
+    return "photo";
+  }
+  if (normalized.endsWith(".mp4")) return "video";
+  if (normalized.endsWith(".mp3")) return "audio";
+  return undefined;
+}
+
 export function planTelegramRichOutboundAttachment(options: {
   turn: TelegramQueuedOutboundAttachmentTurnView;
   markdown: string;
@@ -147,16 +168,7 @@ export function planTelegramRichOutboundAttachment(options: {
   if (!options.markdown.trim()) return undefined;
   if (options.turn.queuedAttachments.length !== 1) return undefined;
   const attachment = options.turn.queuedAttachments[0]!;
-  const normalizedPath = attachment.path.toLowerCase();
-  const mediaType = normalizedPath.endsWith(".jpg") ||
-      normalizedPath.endsWith(".jpeg") ||
-      normalizedPath.endsWith(".png")
-    ? "photo"
-    : normalizedPath.endsWith(".mp4")
-      ? "video"
-      : normalizedPath.endsWith(".mp3")
-        ? "audio"
-        : undefined;
+  const mediaType = getTelegramRichOutboundAttachmentMediaKind(attachment.path);
   if (!mediaType) return undefined;
   const mediaId = "artifact";
   const richMessage = {
@@ -282,7 +294,7 @@ interface TelegramGuestStagingMessage {
   voice?: { file_id?: string };
 }
 
-function isTelegramOutboundPhotoAttachmentPath(path: string): boolean {
+export function isTelegramOutboundPhotoAttachmentPath(path: string): boolean {
   const normalized = path.toLowerCase();
   return (
     normalized.endsWith(".jpg") ||
@@ -293,7 +305,7 @@ function isTelegramOutboundPhotoAttachmentPath(path: string): boolean {
   );
 }
 
-function getTelegramGuestAttachmentTransport(path: string): {
+export function getTelegramGuestAttachmentTransport(path: string): {
   method: "sendDocument" | "sendPhoto" | "sendAudio" | "sendVoice";
   fileField: "document" | "photo" | "audio" | "voice";
 } {

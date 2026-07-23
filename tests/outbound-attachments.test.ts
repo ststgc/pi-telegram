@@ -13,7 +13,10 @@ import {
   createTelegramQueuedOutboundAttachmentSender,
   createTelegramRichOutboundAttachmentSender,
   deliverTelegramGuestCachedAttachment,
+  getTelegramGuestAttachmentTransport,
   getTelegramOutboundAttachmentByteLimitFromEnv,
+  getTelegramRichOutboundAttachmentMediaKind,
+  isTelegramOutboundPhotoAttachmentPath,
   planTelegramRichOutboundAttachment,
   queueTelegramOutboundAttachments,
   registerTelegramOutboundAttachmentTool,
@@ -61,6 +64,22 @@ type RegisteredAnyTool = {
     params: Record<string, unknown>,
   ) => Promise<unknown>;
 };
+
+test("Outbound attachment classifiers preserve Rich, ordinary, and Guest transports", () => {
+  assert.equal(getTelegramRichOutboundAttachmentMediaKind("report.PNG"), "photo");
+  assert.equal(getTelegramRichOutboundAttachmentMediaKind("clip.mp4"), "video");
+  assert.equal(getTelegramRichOutboundAttachmentMediaKind("audio.mp3"), "audio");
+  assert.equal(getTelegramRichOutboundAttachmentMediaKind("notes.txt"), undefined);
+  assert.equal(isTelegramOutboundPhotoAttachmentPath("animation.GIF"), true);
+  assert.deepEqual(getTelegramGuestAttachmentTransport("voice.opus"), {
+    method: "sendVoice",
+    fileField: "voice",
+  });
+  assert.deepEqual(getTelegramGuestAttachmentTransport("archive.zip"), {
+    method: "sendDocument",
+    fileField: "document",
+  });
+});
 
 test("Rich outbound attachment planner builds one target-scoped media result", () => {
   const turn = {
