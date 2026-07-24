@@ -3207,7 +3207,17 @@ function listQuarantines(
 function fsyncPath(fs: RecoveryFileSystem, path: string): void {
   const descriptor = fs.open(path, "r");
   try {
-    fs.fsync(descriptor);
+    try {
+      fs.fsync(descriptor);
+    } catch (error) {
+      const windowsDirectoryFsyncUnsupported =
+        process.platform === "win32" &&
+        fs.lstat(path).isDirectory() &&
+        typeof error === "object" &&
+        error !== null &&
+        Reflect.get(error, "code") === "EPERM";
+      if (!windowsDirectoryFsyncUnsupported) throw error;
+    }
   } finally {
     fs.close(descriptor);
   }
