@@ -64,6 +64,7 @@ import {
   prioritizeTelegramQueuePromptRuntime,
   removeTelegramQueueItemsByMessageIds,
   removeTelegramQueueItemsByMessageIdsRuntime,
+  resolveTelegramQueueMessageThreadId,
   shouldDispatchAfterTelegramAgentEnd,
   shutdownTelegramSessionRuntime,
   startTelegramSessionRuntime,
@@ -4450,7 +4451,7 @@ test("Session lifecycle hooks bind start and shutdown runtime ports", async () =
 // the caller already confirmed the agent is ready via canDispatch.
 // Regression: followUp can queue idle prompts on some Pi-compatible runtimes.
 
-await test("executeTelegramQueueDispatchPlan sends ready prompts as normal user turns", async (t) => {
+test("executeTelegramQueueDispatchPlan sends ready prompts as normal user turns", async (t) => {
   await t.test(
     "sendUserMessage is called without followUp delivery option for prompt plan",
     () => {
@@ -4544,4 +4545,64 @@ await test("executeTelegramQueueDispatchPlan sends ready prompts as normal user 
       );
     },
   );
+});
+
+test("Queue message thread resolution distinguishes exact, threadless, and ambiguous evidence", () => {
+  const scope = {
+    profile: "work",
+    chatId: 7,
+    businessConnectionId: "business-a",
+  };
+  const threaded = createQueueTestPromptTurn({
+    sourceMessageIds: [99],
+    chatId: 7,
+    target: { chatId: 7, threadId: 3 },
+    transportStamp: { profile: "work", generation: "1" },
+    businessConnectionId: "business-a",
+  });
+  const threadless = createQueueTestPromptTurn({
+    ...threaded,
+    sourceMessageIds: [100],
+    target: { chatId: 7 },
+  });
+  assert.equal(
+    resolveTelegramQueueMessageThreadId([threaded], 99, scope),
+    3,
+  );
+  assert.equal(
+    resolveTelegramQueueMessageThreadId([threadless], 100, scope),
+    null,
+  );
+  assert.equal(
+    resolveTelegramQueueMessageThreadId(
+      [
+        threaded,
+        createQueueTestPromptTurn({ ...threaded, target: { chatId: 7, threadId: 4 } }),
+      ],
+      99,
+      scope,
+    ),
+    undefined,
+  );
+  assert.equal(resolveTelegramQueueMessageThreadId([], 99, scope), undefined);
+});
+
+test("Business deletion scopes preserve colliding ids across profile, chat, connection, and thread", () => {
+  const matching = createQueueTestPromptTurn({
+    sourceMessageIds: [99], chatId: 7, target: { chatId: 7, threadId: 3 },
+    transportStamp: { profile: "work", generation: "1" },
+    businessConnectionId: "business-a", statusSummary: "matching",
+  });
+  const collisions = [
+    createQueueTestPromptTurn({ ...matching, transportStamp: { profile: "other", generation: "1" }, statusSummary: "profile" }),
+    createQueueTestPromptTurn({ ...matching, chatId: 8, target: { chatId: 8, threadId: 3 }, statusSummary: "chat" }),
+    createQueueTestPromptTurn({ ...matching, businessConnectionId: "business-b", statusSummary: "business" }),
+    createQueueTestPromptTurn({ ...matching, target: { chatId: 7, threadId: 4 }, statusSummary: "thread" }),
+  ];
+  const result = removeTelegramQueueItemsByMessageIds(
+    [matching, ...collisions], [99],
+    { profile: "work", chatId: 7, businessConnectionId: "business-a", exactThreadId: 3 },
+  );
+  assert.equal(result.removedCount, 1);
+  assert.deepEqual(result.items.map((item) => item.statusSummary), ["profile", "chat", "business", "thread"]);
 });

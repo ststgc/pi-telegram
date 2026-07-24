@@ -15,7 +15,7 @@ import {
   type CommandTemplateConfig,
   type CommandTemplateObjectConfig,
 } from "./command-templates.ts";
-import { getTelegramVoiceTranscriptionProviders } from "./voice.ts";
+import { getTelegramVoiceTranscriptionProviderEntries } from "./voice.ts";
 
 const DEFAULT_INBOUND_HANDLER_TIMEOUT_MS = 120_000;
 const INBOUND_HANDLER_REGISTRY_KEY = "__piTelegramInboundHandlers__";
@@ -111,8 +111,14 @@ export type TelegramInboundProgrammaticHandler = (
   options?: { cwd?: string },
 ) => Promise<TelegramInboundProgrammaticHandlerResult>;
 
+interface TelegramInboundProgrammaticHandlerEntry {
+  id: string;
+  handler: TelegramInboundProgrammaticHandler;
+}
+
 export interface TelegramInboundHandlerRegistry {
-  handlers: Map<string, TelegramInboundProgrammaticHandler[]>;
+  handlers: Map<string, TelegramInboundProgrammaticHandlerEntry[]>;
+  nextId: number;
 }
 
 interface InboundHandlerInvocation {
@@ -133,10 +139,13 @@ function getOrCreateInboundHandlerRegistry(): TelegramInboundHandlerRegistry {
     "handlers" in existing &&
     existing.handlers instanceof Map
   ) {
-    return existing as TelegramInboundHandlerRegistry;
+    const registry = existing as TelegramInboundHandlerRegistry;
+    if (!Number.isSafeInteger(registry.nextId)) registry.nextId = 0;
+    return registry;
   }
   const registry: TelegramInboundHandlerRegistry = {
     handlers: new Map(),
+    nextId: 0,
   };
   (globalThis as Record<string, unknown>)[INBOUND_HANDLER_REGISTRY_KEY] =
     registry;
@@ -150,11 +159,15 @@ export function registerTelegramInboundHandler(
   const normalizedKind = kind.trim() || "*";
   const registry = getOrCreateInboundHandlerRegistry();
   const list = registry.handlers.get(normalizedKind) ?? [];
-  list.push(handler);
+  const entry = {
+    id: `inbound-${normalizedKind}-${registry.nextId++}`,
+    handler,
+  };
+  list.push(entry);
   registry.handlers.set(normalizedKind, list);
   return () => {
     const updated = registry.handlers.get(normalizedKind) ?? [];
-    const index = updated.indexOf(handler);
+    const index = updated.indexOf(entry);
     if (index !== -1) {
       updated.splice(index, 1);
       registry.handlers.set(normalizedKind, updated);
@@ -169,7 +182,28 @@ export function getTelegramInboundProgrammaticHandlers(
   return [
     ...(registry.handlers.get(kind) ?? []),
     ...(kind === "*" ? [] : (registry.handlers.get("*") ?? [])),
+  ].map((entry) => entry.handler);
+}
+
+function getTelegramInboundProgrammaticHandlerEntries(
+  kind: string,
+): TelegramInboundProgrammaticHandlerEntry[] {
+  const registry = getOrCreateInboundHandlerRegistry();
+  return [
+    ...(registry.handlers.get(kind) ?? []),
+    ...(kind === "*" ? [] : (registry.handlers.get("*") ?? [])),
   ];
+}
+
+function recordPublicHandlerFailure(
+  recordRuntimeEvent: TelegramInboundHandlerRuntimeDeps<unknown>["recordRuntimeEvent"],
+  handlerId: string,
+  handlerCategory: string,
+): void {
+  recordRuntimeEvent?.("public-handler", new Error("Public handler failed"), {
+    handlerId,
+    handlerCategory,
+  });
 }
 
 export function clearTelegramInboundHandlers(): void {
@@ -581,19 +615,21 @@ async function processTelegramTextHandlers(options: {
       });
     }
   }
-  for (const handler of getTelegramInboundProgrammaticHandlers("text")) {
+  for (const entry of getTelegramInboundProgrammaticHandlerEntries("text")) {
     try {
       const output = normalizeInboundProgrammaticHandlerText(
-        await handler(
+        await entry.handler(
           { kind: "text", text, mimeType: "text/plain" },
           { cwd: options.cwd },
         ),
       );
       if (output) text = output;
-    } catch (error) {
-      options.recordRuntimeEvent?.("inbound-programmatic-handler", error, {
-        kind: "text",
-      });
+    } catch {
+      recordPublicHandlerFailure(
+        options.recordRuntimeEvent,
+        entry.id,
+        "inbound:text",
+      );
     }
   }
   return text;
@@ -615,10 +651,10 @@ async function processTelegramFileWithProgrammaticHandlers(
   },
 ): Promise<string | undefined> {
   const kind = file.kind || "*";
-  for (const handler of getTelegramInboundProgrammaticHandlers(kind)) {
+  for (const entry of getTelegramInboundProgrammaticHandlerEntries(kind)) {
     try {
       const output = normalizeInboundProgrammaticHandlerText(
-        await handler(
+        await entry.handler(
           {
             kind,
             file,
@@ -628,11 +664,12 @@ async function processTelegramFileWithProgrammaticHandlers(
         ),
       );
       if (output) return output;
-    } catch (error) {
-      options.recordRuntimeEvent?.("inbound-programmatic-handler", error, {
-        fileName: file.fileName || basename(file.path),
-        kind,
-      });
+    } catch {
+      recordPublicHandlerFailure(
+        options.recordRuntimeEvent,
+        entry.id,
+        `inbound:${kind}`,
+      );
     }
   }
   return undefined;
@@ -645,15 +682,17 @@ async function transcribeTelegramVoiceFileWithProviders(
   },
 ): Promise<string | undefined> {
   if (!isTelegramVoiceLikeFile(file)) return undefined;
-  for (const provider of getTelegramVoiceTranscriptionProviders()) {
+  for (const entry of getTelegramVoiceTranscriptionProviderEntries()) {
     try {
-      const result = await provider(file, {});
+      const result = await entry.provider(file, {});
       const text = typeof result === "string" ? result : result?.text;
       if (text?.trim()) return truncateTelegramInboundOutput(text.trim());
-    } catch (error) {
-      options.recordRuntimeEvent?.("voice-transcription-provider", error, {
-        fileName: file.fileName || basename(file.path),
-      });
+    } catch {
+      recordPublicHandlerFailure(
+        options.recordRuntimeEvent,
+        entry.id,
+        "voice:transcription",
+      );
     }
   }
   return undefined;

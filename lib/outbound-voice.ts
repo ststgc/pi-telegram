@@ -4,16 +4,18 @@
  * Owns native Telegram voice upload orchestration across configured voice handlers, programmatic outbound voice handlers, and registered synthesis providers
  */
 
-import { unlink } from "node:fs/promises";
 import { basename, extname } from "node:path";
 
 import { assertTelegramInlineKeyboardCallbackData } from "./keyboard.ts";
-import { buildTelegramMultipartReplyParameters } from "./replies.ts";
+import {
+  reserveTelegramReplyParameters,
+  type TelegramReplyParametersReservation,
+} from "./replies.ts";
 import {
   getTelegramTargetThreadParams,
   type TelegramTarget,
 } from "./target.ts";
-import { getTelegramVoiceSynthesisProviders } from "./voice.ts";
+import { getTelegramVoiceSynthesisProviderEntries } from "./voice.ts";
 
 export interface TelegramVoiceReplyTurnView {
   chatId: number;
@@ -74,19 +76,29 @@ export interface TelegramVoiceReplySenderPorts<THandler = unknown> {
       cwd?: string;
       execCommand: TelegramVoiceReplySenderDeps["execCommand"];
     },
-  ) => Promise<string | undefined>;
+  ) => Promise<
+    | string
+    | { path: string; cleanup?: () => void | Promise<void> }
+    | undefined
+  >;
   getProgrammaticVoiceHandlers?: () => TelegramOutboundProgrammaticVoiceHandler[];
+  getProgrammaticVoiceHandlerEntries?: () => Array<{
+    id: string;
+    handler: TelegramOutboundProgrammaticVoiceHandler;
+  }>;
 }
 
-function buildVoiceReplyParameters(
+function reserveVoiceReplyParameters(
   chatId: number,
   replyToPrompt: boolean | undefined,
   replyToMessageId: number | undefined,
   target?: TelegramTarget,
-): string | undefined {
-  if (replyToPrompt === false || replyToMessageId === undefined)
-    return undefined;
-  return buildTelegramMultipartReplyParameters(chatId, replyToMessageId, target);
+): TelegramReplyParametersReservation {
+  return reserveTelegramReplyParameters(
+    chatId,
+    replyToPrompt === false ? undefined : replyToMessageId,
+    target,
+  );
 }
 
 async function ensureTelegramVoiceFileFormat(
@@ -138,38 +150,46 @@ export function createTelegramVoiceReplySender<THandler = unknown>(
     const voiceFilePath = await ensureTelegramVoiceFileFormat(filePath);
     assertTelegramInlineKeyboardCallbackData(options?.replyMarkup);
     await sendVoiceChatAction(deps, turn.chatId);
-    const replyParameters = buildVoiceReplyParameters(
+    const reservation = reserveVoiceReplyParameters(
       turn.chatId,
       options?.replyToPrompt,
       turn.replyToMessageId,
       turn.target,
     );
-    await deps.sendMultipart(
-      "sendVoice",
-      {
-        chat_id: String(turn.chatId),
-        ...(options?.transcriptText ? { caption: options.transcriptText } : {}),
-        ...(replyParameters ? { reply_parameters: replyParameters } : {}),
-        ...(turn.target
-          ? Object.fromEntries(
-              Object.entries(getTelegramTargetThreadParams(turn.target)).map(
-                ([key, value]) => [key, String(value)],
-              ),
-            )
-          : {}),
-        ...(options?.replyMarkup !== undefined && options.replyMarkup !== null
-          ? {
-              reply_markup:
-                typeof options.replyMarkup === "string"
-                  ? options.replyMarkup
-                  : JSON.stringify(options.replyMarkup),
-            }
-          : {}),
-      },
-      "voice",
-      voiceFilePath,
-      basename(voiceFilePath),
-    );
+    try {
+      await deps.sendMultipart(
+        "sendVoice",
+        {
+          chat_id: String(turn.chatId),
+          ...(options?.transcriptText ? { caption: options.transcriptText } : {}),
+          ...(reservation.multipartParameters
+            ? { reply_parameters: reservation.multipartParameters }
+            : {}),
+          ...(turn.target
+            ? Object.fromEntries(
+                Object.entries(getTelegramTargetThreadParams(turn.target)).map(
+                  ([key, value]) => [key, String(value)],
+                ),
+              )
+            : {}),
+          ...(options?.replyMarkup !== undefined && options.replyMarkup !== null
+            ? {
+                reply_markup:
+                  typeof options.replyMarkup === "string"
+                    ? options.replyMarkup
+                    : JSON.stringify(options.replyMarkup),
+              }
+            : {}),
+        },
+        "voice",
+        voiceFilePath,
+        basename(voiceFilePath),
+      );
+      reservation.confirm();
+    } catch (error) {
+      reservation.releaseKnownFailure(error);
+      throw error;
+    }
   };
 
   return async (
@@ -185,7 +205,7 @@ export function createTelegramVoiceReplySender<THandler = unknown>(
     for (const handler of ports.findVoiceHandlers?.(deps.getHandlers?.()) ??
       []) {
       try {
-        const filePath = await ports.generateVoiceFile?.(text, {
+        const generated = await ports.generateVoiceFile?.(text, {
           lang: options?.lang,
           rate: options?.rate,
           handler,
@@ -193,12 +213,17 @@ export function createTelegramVoiceReplySender<THandler = unknown>(
           cwd: deps.cwd,
           execCommand: deps.execCommand,
         });
-        if (!filePath) continue;
-        await uploadVoiceFile(turn, filePath, {
-          replyToPrompt: options?.replyToPrompt,
-          replyMarkup: options?.replyMarkup,
-        });
-        return;
+        if (!generated) continue;
+        const filePath = typeof generated === "string" ? generated : generated.path;
+        try {
+          await uploadVoiceFile(turn, filePath, {
+            replyToPrompt: options?.replyToPrompt,
+            replyMarkup: options?.replyMarkup,
+          });
+          return;
+        } finally {
+          if (typeof generated !== "string") await generated.cleanup?.();
+        }
       } catch (error) {
         deps.recordRuntimeEvent?.("voice", error, {
           phase: "template-handler-send",
@@ -206,9 +231,15 @@ export function createTelegramVoiceReplySender<THandler = unknown>(
       }
     }
 
-    for (const handler of ports.getProgrammaticVoiceHandlers?.() ?? []) {
+    const programmaticEntries =
+      ports.getProgrammaticVoiceHandlerEntries?.() ??
+      (ports.getProgrammaticVoiceHandlers?.() ?? []).map((handler, index) => ({
+        id: `outbound-voice-${index}`,
+        handler,
+      }));
+    for (const entry of programmaticEntries) {
       try {
-        const filePath = await handler(text, {
+        const filePath = await entry.handler(text, {
           lang: options?.lang,
           rate: options?.rate,
         });
@@ -218,18 +249,23 @@ export function createTelegramVoiceReplySender<THandler = unknown>(
           replyMarkup: options?.replyMarkup,
         });
         return;
-      } catch (error) {
-        deps.recordRuntimeEvent?.("voice", error, {
-          phase: "programmatic-handler-send",
-        });
+      } catch {
+        deps.recordRuntimeEvent?.(
+          "public-handler",
+          new Error("Public handler failed"),
+          {
+            handlerId: entry.id,
+            handlerCategory: "outbound:voice",
+          },
+        );
       }
     }
 
-    const providers = getTelegramVoiceSynthesisProviders();
+    const providers = getTelegramVoiceSynthesisProviderEntries();
 
-    for (const provider of providers) {
-      let voiceFilePath: string | undefined;
-      let originalFilePath: string | undefined;
+    for (const entry of providers) {
+      const provider = entry.provider;
+      let providerCleanup: (() => void | Promise<void>) | undefined;
 
       try {
         if (typeof provider !== "function") {
@@ -258,19 +294,35 @@ export function createTelegramVoiceReplySender<THandler = unknown>(
         }
 
         const { filePath, transcriptText } = extractVoiceResult(providerResult);
-        voiceFilePath = filePath;
-        originalFilePath = filePath;
+        providerCleanup =
+          typeof providerResult === "string" ? undefined : providerResult.cleanup;
         await uploadVoiceFile(turn, filePath, {
           replyToPrompt: options?.replyToPrompt,
           replyMarkup: options?.replyMarkup,
           transcriptText,
         });
         return;
-      } catch (error) {
-        deps.recordRuntimeEvent?.("voice", error, { phase: "send" });
+      } catch {
+        deps.recordRuntimeEvent?.(
+          "public-handler",
+          new Error("Public handler failed"),
+          {
+            handlerId: entry.id,
+            handlerCategory: "voice:synthesis",
+          },
+        );
       } finally {
-        if (voiceFilePath && voiceFilePath !== originalFilePath) {
-          await unlink(voiceFilePath).catch(() => {});
+        try {
+          await providerCleanup?.();
+        } catch {
+          deps.recordRuntimeEvent?.(
+            "public-handler",
+            new Error("Public handler cleanup failed"),
+            {
+              handlerId: entry.id,
+              handlerCategory: "voice:synthesis-cleanup",
+            },
+          );
         }
       }
     }

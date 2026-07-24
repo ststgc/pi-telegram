@@ -85,6 +85,7 @@ export interface TelegramQueueItemBase {
   chatId: number;
   target?: TelegramQueueTarget;
   transportStamp?: TelegramTransportStamp;
+  businessConnectionId?: string;
   replyToMessageId: number;
   guestQueryId?: string;
   queueOrder: number;
@@ -398,8 +399,44 @@ export function compareTelegramQueueItems<TContext = unknown>(
 }
 
 export interface TelegramQueueMessageScope {
+  profile?: string;
   chatId?: number;
   threadId?: number;
+  exactThreadId?: number | null;
+  businessConnectionId?: string;
+}
+
+/**
+ * Resolves the one thread represented by matching queue/active turn state.
+ * `null` means an explicitly threadless turn; `undefined` means absent or
+ * ambiguous evidence and must not be converted into an exact threadless scope.
+ */
+export function resolveTelegramQueueMessageThreadId<TContext = unknown>(
+  items: readonly TelegramQueueItem<TContext>[],
+  messageId: number,
+  scope: Pick<
+    TelegramQueueMessageScope,
+    "profile" | "chatId" | "businessConnectionId"
+  >,
+): number | null | undefined {
+  const representedThreads = new Set<number | null>();
+  for (const item of items) {
+    if (
+      !isPendingTelegramTurn(item) ||
+      !item.sourceMessageIds.includes(messageId) ||
+      (scope.profile !== undefined &&
+        item.transportStamp?.profile !== scope.profile) ||
+      (scope.chatId !== undefined && item.chatId !== scope.chatId) ||
+      (scope.businessConnectionId !== undefined &&
+        item.businessConnectionId !== scope.businessConnectionId)
+    ) {
+      continue;
+    }
+    representedThreads.add(item.target?.threadId ?? null);
+  }
+  return representedThreads.size === 1
+    ? representedThreads.values().next().value
+    : undefined;
 }
 
 function isTelegramQueueItemInMessageScope<TContext = unknown>(
@@ -407,8 +444,25 @@ function isTelegramQueueItemInMessageScope<TContext = unknown>(
   scope: TelegramQueueMessageScope | undefined,
 ): boolean {
   if (!scope) return true;
+  if (
+    scope.profile !== undefined &&
+    item.transportStamp?.profile !== scope.profile
+  ) {
+    return false;
+  }
   if (typeof scope.chatId === "number" && item.chatId !== scope.chatId) {
     return false;
+  }
+  if (
+    scope.businessConnectionId !== undefined &&
+    item.businessConnectionId !== scope.businessConnectionId
+  ) {
+    return false;
+  }
+  if (scope.exactThreadId !== undefined) {
+    return scope.exactThreadId === null
+      ? item.target?.threadId === undefined
+      : item.target?.threadId === scope.exactThreadId;
   }
   if (typeof scope.threadId === "number") {
     return item.target?.threadId === scope.threadId;

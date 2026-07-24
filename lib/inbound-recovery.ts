@@ -12,6 +12,10 @@ import {
   isTelegramFollowerDurableAdmissionAckV1,
   type TelegramFollowerDurableAdmissionAckV1,
 } from "./bus.ts";
+import {
+  getTelegramOperationOwnedFiles,
+  setTelegramOperationOwnedFiles,
+} from "./operation-files.ts";
 import type {
   TelegramDurableInboundAdmission,
   TelegramPollingConfig,
@@ -46,6 +50,7 @@ import {
 interface TelegramInboundRecoveryMessage {
   message_id?: number;
   message_thread_id?: number;
+  business_connection_id?: string;
   date?: number;
   chat?: { id?: number; type?: string };
   from?: { id?: number; is_bot?: boolean };
@@ -257,7 +262,15 @@ export interface InboundRecoveryRuntime<
     messages: readonly TelegramInboundRecoveryMessage[],
     error: unknown,
   ): void;
-  terminalizeDeletedMessageIds(messageIds: readonly number[]): void;
+  terminalizeDeletedMessageIds(
+    messageIds: readonly number[],
+    scope?: {
+      profile?: string;
+      chatId?: number;
+      exactThreadId?: number | null;
+      businessConnectionId?: string;
+    },
+  ): void;
   publishSessionHandoffs(toSessionGeneration: number): number;
   rehydrateOutbound(
     ctx: TContext,
@@ -456,6 +469,7 @@ function validateRecoveryTurn(value: unknown): PendingTelegramTurn {
     [
       "target",
       "transportStamp",
+      "businessConnectionId",
       "guestQueryId",
       "priorityEmoji",
       "voiceReplyPreferred",
@@ -466,6 +480,8 @@ function validateRecoveryTurn(value: unknown): PendingTelegramTurn {
   if (
     value.kind !== "prompt" ||
     typeof value.chatId !== "number" ||
+    (value.businessConnectionId !== undefined &&
+      typeof value.businessConnectionId !== "string") ||
     typeof value.replyToMessageId !== "number" ||
     !Array.isArray(value.sourceMessageIds) ||
     !value.sourceMessageIds.every((id) => Number.isSafeInteger(id)) ||
@@ -671,7 +687,7 @@ export function createInboundRecoveryRuntime<
   let store: RecoveryStore | undefined;
   let storeProfile: string | undefined;
   const admittedByUpdate = new Map<number, AdmittedUpdate>();
-  const recordsByMessageId = new Map<number, AdmittedUpdate>();
+  const recordsByMessageId = new Map<number, Map<string, AdmittedUpdate>>();
   const identityByRecordId = new Map<string, RecoveryIdentity>();
   const followerProofByUpdate = new Map<
     number,
@@ -814,10 +830,9 @@ export function createInboundRecoveryRuntime<
     admittedByUpdate.set(update.update_id, admitted);
     identityByRecordId.set(admitted.record.recordId, admitted.identity);
     for (const messageId of getSourceMessageIds(update)) {
-      const current = recordsByMessageId.get(messageId);
-      if (!current || current.record.recordId === admitted.record.recordId) {
-        recordsByMessageId.set(messageId, admitted);
-      }
+      const matches = recordsByMessageId.get(messageId) ?? new Map();
+      matches.set(admitted.record.recordId, admitted);
+      recordsByMessageId.set(messageId, matches);
     }
   };
 
@@ -834,8 +849,14 @@ export function createInboundRecoveryRuntime<
     for (const message of messages) {
       if (typeof message.message_id !== "number") continue;
       const admitted = recordsByMessageId.get(message.message_id);
-      if (admitted?.admission.kind === "admitted") {
-        matches.set(admitted.record.recordId, admitted);
+      for (const candidate of admitted?.values() ?? []) {
+        if (
+          candidate.admission.kind === "admitted" &&
+          (candidate.record.state === "admitted" ||
+            candidate.record.state === "pre-dispatch")
+        ) {
+          matches.set(candidate.record.recordId, candidate);
+        }
       }
     }
     return [...matches.values()];
@@ -1338,41 +1359,73 @@ export function createInboundRecoveryRuntime<
     },
 
     decorateTurn(messages, turn) {
-      return runGatedOperationSync(() => {
-      const records = matchesForMessages(messages);
-      if (records.length === 0) return turn;
-      const recovery = {
-        recordIds: records.map(({ record }) => record.recordId),
-        turnId: records[0]!.record.turnId,
-      };
-      const decorated = { ...turn, recovery } as typeof turn;
-      const spool = readTurnSpool(decorated);
-      const payload = encodeEnvelope({
-        version: 1,
-        kind: "turn",
-        turn: decorated,
-        spool: spool.mapping,
-      });
-      const materialized = getStore().materializeInboundGroup(
-        records.map((admitted) => ({
-          recordId: admitted.record.recordId,
-          claim: { identity: admitted.identity },
-          turnId: recovery.turnId,
-          payload,
-          spool: spool.bytes,
-          ...(admitted.sourcePayload
-            ? { previousPayload: admitted.sourcePayload }
-            : {}),
-        })),
-      );
-      for (let index = 0; index < records.length; index += 1) {
-        const admitted = records[index]!;
-        admitted.record = materialized[index]!;
-        admitted.sourcePayload = undefined;
-        identityByRecordId.set(admitted.record.recordId, admitted.identity);
+      const operationFiles = getTelegramOperationOwnedFiles(turn);
+      try {
+        return runGatedOperationSync(() => {
+          const records = matchesForMessages(messages);
+          if (records.length === 0) return turn;
+          const recovery = {
+            recordIds: records.map(({ record }) => record.recordId),
+            turnId: records[0]!.record.turnId,
+          };
+          const decorated = { ...turn, recovery } as typeof turn;
+          setTelegramOperationOwnedFiles(decorated, operationFiles);
+          const spool = readTurnSpool(decorated);
+          const payload = encodeEnvelope({
+            version: 1,
+            kind: "turn",
+            turn: decorated,
+            spool: spool.mapping,
+          });
+          const recoveryStore = getStore();
+          const materialized = recoveryStore.materializeInboundGroup(
+            records.map((admitted) => ({
+              recordId: admitted.record.recordId,
+              claim: { identity: admitted.identity },
+              turnId: recovery.turnId,
+              payload,
+              spool: spool.bytes,
+              ...(admitted.sourcePayload
+                ? { previousPayload: admitted.sourcePayload }
+                : {}),
+            })),
+          );
+          for (let index = 0; index < records.length; index += 1) {
+            const admitted = records[index]!;
+            admitted.record = materialized[index]!;
+            admitted.sourcePayload = undefined;
+            identityByRecordId.set(admitted.record.recordId, admitted.identity);
+          }
+          const primary = records[0]!;
+          const restoredPaths = recoveryStore.restoreInboundSpool(
+            primary.record.recordId,
+            { identity: primary.identity },
+            spool.mapping.map((entry) => entry.fileName),
+          );
+          const restored = rewriteTurnPaths(
+            decorated,
+            spool.mapping,
+            restoredPaths,
+          );
+          for (const file of operationFiles) {
+            try {
+              file.cleanupSync();
+            } catch {
+              // Durable paths are already authoritative; cleanup is fail-soft.
+            }
+          }
+          return restored as typeof turn;
+        });
+      } catch (error) {
+        for (const file of operationFiles) {
+          try {
+            file.cleanupSync();
+          } catch {
+            // Preserve the materialization error; cleanup is fail-soft.
+          }
+        }
+        throw error;
       }
-      return decorated;
-      });
     },
 
     claimTurnDispatch(turn) {
@@ -1506,23 +1559,58 @@ export function createInboundRecoveryRuntime<
       });
     },
 
-    terminalizeDeletedMessageIds(messageIds) {
+    terminalizeDeletedMessageIds(messageIds, scope) {
       runGatedOperationSync(() => {
-      const matches = new Map<string, AdmittedUpdate>();
-      for (const messageId of messageIds) {
-        const admitted = recordsByMessageId.get(messageId);
-        if (
-          admitted &&
-          (admitted.record.state === "admitted" ||
-            admitted.record.state === "pre-dispatch")
-        ) {
-          matches.set(admitted.record.recordId, admitted);
+        const matches = new Map<string, AdmittedUpdate>();
+        for (const messageId of messageIds) {
+          for (const admitted of recordsByMessageId.get(messageId)?.values() ?? []) {
+            if (
+              admitted.record.state !== "admitted" &&
+              admitted.record.state !== "pre-dispatch"
+            ) {
+              continue;
+            }
+            if (
+              scope?.profile !== undefined &&
+              admitted.identity.profile !== scope.profile
+            ) {
+              continue;
+            }
+            if (
+              scope?.chatId !== undefined &&
+              admitted.identity.target.chatId !== scope.chatId
+            ) {
+              continue;
+            }
+            if (
+              scope?.exactThreadId !== undefined &&
+              (admitted.identity.target.threadId ?? null) !==
+                scope.exactThreadId
+            ) {
+              continue;
+            }
+            if (scope?.businessConnectionId !== undefined) {
+              const envelope = admitted.sourcePayload
+                ? decodeEnvelope(admitted.sourcePayload)
+                : undefined;
+              const sourceMessage =
+                envelope?.kind === "update"
+                  ? getUpdateMessage(envelope.update)
+                  : undefined;
+              if (
+                sourceMessage?.business_connection_id !==
+                scope.businessConnectionId
+              ) {
+                continue;
+              }
+            }
+            matches.set(admitted.record.recordId, admitted);
+          }
         }
-      }
-      settleMatches([...matches.values()], {
-        kind: "completed",
-        reason: "deleted",
-      });
+        settleMatches([...matches.values()], {
+          kind: "completed",
+          reason: "deleted",
+        });
       });
     },
 

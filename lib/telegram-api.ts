@@ -13,6 +13,7 @@ import type { ClientRequest, IncomingMessage } from "node:http";
 import { request as requestHttps, type RequestOptions } from "node:https";
 import { join } from "node:path";
 import { resolveTelegramTempDir } from "./paths.ts";
+import { isValidTelegramBotIdentity as isValidTelegramSetupBotIdentity } from "./setup.ts";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
@@ -101,6 +102,12 @@ export interface TelegramUser {
   is_bot: boolean;
   first_name: string;
   username?: string;
+}
+
+export function isValidTelegramBotIdentity(
+  value: unknown,
+): value is TelegramUser {
+  return isValidTelegramSetupBotIdentity(value);
 }
 
 export interface TelegramChat {
@@ -231,7 +238,11 @@ export interface TelegramUpdate {
   callback_query?: TelegramCallbackQuery;
   message_reaction?: TelegramMessageReactionUpdated;
   guest_message?: TelegramGuestMessage;
-  deleted_business_messages?: { message_ids?: unknown };
+  deleted_business_messages?: {
+    business_connection_id?: string;
+    chat?: { id?: number };
+    message_ids?: unknown;
+  };
 }
 
 export interface TelegramSentMessage {
@@ -1345,8 +1356,9 @@ export async function prepareTelegramTempDir(
 function assertTelegramBotTokenConfigured(
   botToken: string | undefined,
 ): string {
-  if (!botToken) throw new Error("Telegram bot token is not configured");
-  return botToken;
+  const configured = botToken?.trim();
+  if (!configured) throw new Error("Telegram bot token is not configured");
+  return configured;
 }
 
 export async function callTelegram<TResponse>(
@@ -1383,7 +1395,8 @@ export async function fetchTelegramBotIdentity(
   botToken: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<TelegramBotIdentityResponse> {
-  const url = `${TELEGRAM_API_BASE}/bot${botToken}/getMe`;
+  const configuredBotToken = assertTelegramBotTokenConfigured(botToken);
+  const url = `${TELEGRAM_API_BASE}/bot${configuredBotToken}/getMe`;
   return runTelegramApiAttempt(
     "getMe",
     getTelegramApiAttemptDeadlineMs("getMe"),
@@ -1394,7 +1407,31 @@ export async function fetchTelegramBotIdentity(
           ? telegramFetch(url, { signal }, family)
           : fetchImpl(url, { signal }),
       );
-      return response.json() as Promise<TelegramBotIdentityResponse>;
+      if (!response.ok) {
+        throw new TelegramApiHttpError(
+          `Telegram API getMe failed with HTTP ${response.status}`,
+          response.status,
+          undefined,
+        );
+      }
+      const value: unknown = await response.json();
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new Error("Telegram API getMe returned an invalid response");
+      }
+      const envelope = value as Record<string, unknown>;
+      const result = envelope.result;
+      if (
+        envelope.ok !== true ||
+        typeof result !== "object" ||
+        result === null ||
+        Array.isArray(result)
+      ) {
+        throw new Error("Telegram API getMe returned an invalid response");
+      }
+      if (!isValidTelegramBotIdentity(result)) {
+        throw new Error("Telegram API getMe returned an invalid bot identity");
+      }
+      return { ok: true, result };
     },
   );
 }

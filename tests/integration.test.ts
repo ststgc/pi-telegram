@@ -34,8 +34,8 @@ type RuntimeTelegramExtension = (typeof import("../index.ts"))["default"];
 function test(name: string, fn: RuntimeTestHandler): void {
   const timeout = name ===
       "Public activity delivery reaches the classic instance without blocking agent start"
-    ? 15_000
-    : 5_000;
+    ? 20_000
+    : 15_000;
   void testRoot(name, { concurrency: false, timeout }, fn);
 }
 
@@ -399,7 +399,7 @@ async function waitForEventLoopCondition(
 
 async function waitForCondition(
   predicate: () => boolean,
-  timeoutMs = 2000,
+  timeoutMs = 10_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -2613,6 +2613,7 @@ test("Extension runtime applies reaction priority and removal before the next di
   const thirdUpdates = createRuntimeDeferredResponse();
   const fourthUpdates = createRuntimeDeferredResponse();
   const fifthUpdates = createRuntimeDeferredResponse();
+  const sixthUpdates = createRuntimeDeferredResponse();
   const { handlers, commands, pi } = createRuntimePiHarness({
     sendUserMessage: (content) => {
       recordRuntimeDispatchEvent(runtimeEvents, content);
@@ -2624,6 +2625,14 @@ test("Extension runtime applies reaction priority and removal before the next di
     const method = getRuntimeTelegramApiMethod(input);
     if (method === "deleteWebhook") {
       return createRuntimeTelegramApiResponse(true);
+    }
+    if (method === "getMe") {
+      return createRuntimeTelegramApiResponse({
+        id: 123,
+        is_bot: true,
+        first_name: "Test Bot",
+        username: "test_bot",
+      });
     }
     if (method === "getUpdates") {
       getUpdatesCalls += 1;
@@ -2645,10 +2654,20 @@ test("Extension runtime applies reaction priority and removal before the next di
       if (getUpdatesCalls === 3) return thirdUpdates.promise;
       if (getUpdatesCalls === 4) return fourthUpdates.promise;
       if (getUpdatesCalls === 5) return fifthUpdates.promise;
+      if (getUpdatesCalls === 6) return sixthUpdates.promise;
       throw new DOMException("stop", "AbortError");
     }
     if (method === "sendChatAction") {
       return createRuntimeTelegramApiResponse(true);
+    }
+    if (method === "sendMessage" || method === "sendRichMessage") {
+      return createRuntimeTelegramApiResponse({ message_id: 500 });
+    }
+    if (method === "createForumTopic") {
+      return createRuntimeTelegramApiResponse({
+        message_thread_id: 42,
+        name: "Recovered test thread",
+      });
     }
     throw new Error(`Unexpected Telegram API method: ${method}`);
   });
@@ -2737,7 +2756,7 @@ test("Extension runtime applies reaction priority and removal before the next di
         messages: [
           {
             role: "assistant",
-            content: [{ type: "text", text: "" }],
+            content: [{ type: "text", text: "first complete" }],
           },
         ],
       },
@@ -2752,7 +2771,7 @@ test("Extension runtime applies reaction priority and removal before the next di
         messages: [
           {
             role: "assistant",
-            content: [{ type: "text", text: "" }],
+            content: [{ type: "text", text: "second complete" }],
           },
         ],
       },

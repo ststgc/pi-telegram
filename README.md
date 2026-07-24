@@ -106,7 +106,7 @@ The code expires after 10 minutes and is single-use. The bridge stores only a st
 | Threaded Mode | Run one leader plus visible follower Pi instances through named private-chat threads. | One bot can host a local multi-instance Pi organism without hidden process spawning. |
 | Reroute and restore | Preserve unknown threads and offer explicit target choices. | Telegram client state can be repaired without silently deleting or hijacking prompts. |
 | Extension sections | Add menu sections, commands, status rows, settings, callbacks, and delivery helpers from companion extensions. | `pi-telegram` becomes a platform surface for other Pi extensions. |
-| Runtime diagnostics | Use `/telegram-status`, the Recovery submenu, and recent runtime events for connection, role, queue, transport, durable-work controls, and failure evidence. Pending delivery is a metadata-only aggregate; delivery-uncertain and bus-uncertain work expose only an opaque handle, family, state, and required action. | Debugging and confirmed recovery actions live in the operator surface instead of hidden logs only. |
+| Runtime diagnostics | Use `/telegram-status`, the Recovery submenu, recent runtime events, and append-only profile/instance diagnostic segments for connection, role, queue, transport, durable-work controls, and failure evidence. Pending delivery is a metadata-only aggregate; delivery-uncertain and bus-uncertain work expose only an opaque handle, family, state, and required action. | Debugging and confirmed recovery actions live in the operator surface instead of hidden logs only. |
 | Safety and ownership | Pair one owner, lock transport, scope targets, and reject fake terminal behavior. | Remote access remains explicit, bounded, and understandable. |
 
 ## Core Loop
@@ -165,7 +165,7 @@ Messages sent while Pi is busy become queued turns. Priority lanes support contr
 
 ### Native Rich Markdown
 
-Rich Markdown is the default model-answer membrane. Complete assistant and guest model replies use Telegram's native Rich Message APIs, while tool-call rows, reasoning/thinking blocks, menus, status rows, queue controls, settings, diagnostics, and other harness-owned surfaces use explicit Telegram HTML/plain rendering. This keeps meaningful model-authored answers visually distinct from bridge-owned operational UI. Two Settings controls keep the layers separate: `Draft previews` toggles live `sendRichMessageDraft` frames, while `Assistant rendering` chooses final-answer delivery (`rich` Native Rich Markdown or `html` legacy Markdown-to-HTML).
+Rich Markdown is the default model-answer membrane. Complete assistant and guest model replies use Telegram's native Rich Message APIs, while tool-call rows, reasoning/thinking blocks, menus, status rows, queue controls, settings, diagnostics, and other harness-owned surfaces use explicit Telegram HTML/plain rendering. This keeps meaningful model-authored answers visually distinct from bridge-owned operational UI. Two Settings controls keep the layers separate: `Draft previews` toggles live `sendRichMessageDraft` frames, while `Assistant rendering` chooses final-answer delivery (`rich` Native Rich Markdown or `html` legacy Markdown-to-HTML). A text-only Guest answer that exceeds one inline Rich result is delivered as a complete `full-response.md` document captioned `Full response attached.` instead of truncating the first chunk.
 
 ### Files And Artifacts
 
@@ -237,7 +237,7 @@ Stable public entrypoints are documented in [Public API](./docs/public-api.md), 
 - Replace Pi session lifecycle without an official Pi API.
 - Let non-owner Telegram users control the bridge.
 
-Telegram is a companion surface around a live Pi runtime, not a second runtime. It can compact the current session, but it cannot create, resume, fork, browse, or switch sessions until Pi exposes safe public extension APIs for those operations.
+Telegram is a companion surface around a live Pi runtime, not a second runtime. It can compact the current session, but it cannot create, resume, fork, browse, or switch sessions until Pi exposes safe public extension APIs for those operations. In particular, Telegram `/new` is intentionally unavailable in `0.25.0`; no hidden process, synthetic input, unsafe cast, or raw TTY fallback is used.
 
 A Telegram prompt is a normal model turn in the active Pi session and therefore inherits that session's active post-compaction context; the bridge does not make token cost proportional only to the new mobile message. Current releases keep per-turn guidance small and transient, with detailed bridge instructions available on demand through `telegram_help` instead of persisted in every user turn. Pi session JSONL contains model history; profile-scoped pi-telegram `logs*.jsonl` contains redacted operational events and is never model context.
 

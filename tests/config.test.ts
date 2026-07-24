@@ -1121,7 +1121,7 @@ test("Setup runtime prompts, validates token, persists config, and starts pollin
     },
     getMe: async (botToken) => {
       events.push(`getMe:${botToken}`);
-      return { ok: true, result: { id: 42, username: "demo_bot" } };
+      return { ok: true, result: { id: 42, is_bot: true, first_name: "Demo", username: "demo_bot" } };
     },
     persistConfig: async (config) => {
       events.push(`persist:${config.botToken}:${config.botUsername}`);
@@ -1206,7 +1206,7 @@ test("Setup prompt runtime guards concurrent setup and stores successful config"
     },
     getMe: async (botToken) => {
       events.push(`getMe:${botToken}`);
-      return { ok: true, result: { id: 42, username: "demo_bot" } };
+      return { ok: true, result: { id: 42, is_bot: true, first_name: "Demo", username: "demo_bot" } };
     },
     persistConfig: async (nextConfig) => {
       events.push(`persist:${nextConfig.botToken}`);

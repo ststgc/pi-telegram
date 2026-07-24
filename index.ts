@@ -674,12 +674,12 @@ export default function (pi: Pi.ExtensionAPI) {
   const activityRuntime = Activity.createTelegramActivityBridgeRuntime({
     generation: deliveryGenerationSeed,
     observeEvent: assistantOutputBindingRuntime.observeEvent,
-    recordFailure(handlerId, event, error) {
-      recordRuntimeEvent("activity", error, {
-        handlerId,
-        eventType: event.type,
-        activityId: event.activityId,
-      });
+    recordFailure(handlerId) {
+      recordRuntimeEvent(
+        "public-handler",
+        new Error("Public handler failed"),
+        { handlerId, handlerCategory: "activity" },
+      );
     },
   });
   const dispatchNextQueuedTelegramTurn =
@@ -799,6 +799,13 @@ export default function (pi: Pi.ExtensionAPI) {
       },
       deleteMessage: deleteTelegramMessage,
     });
+  const durableOutboundOperationFiles =
+    OutboundRecovery.createTelegramDurableOutboundOperationFileRuntime({
+      operationTempDir: Paths.resolveTelegramTempDir(),
+      recordCleanupFailure(details) {
+        recordRuntimeEvent("delivery", "operation cleanup failed", details);
+      },
+    });
   const durableOutboundWorker =
     OutboundRecovery.createTelegramDurableOutboundWorker({
       getStore: inboundRecoveryRuntime.getOutboundStore,
@@ -826,7 +833,8 @@ export default function (pi: Pi.ExtensionAPI) {
           target: identity.target,
         });
       },
-      onTerminal() {
+      async onTerminal({ record }) {
+        await durableOutboundOperationFiles.resolveTerminal(record.turnId);
         const ctx = telegramSessionContextStore.get();
         if (!ctx || !telegramSessionContextStore.isCurrent(ctx)) return;
         updateStatus(ctx);
@@ -902,20 +910,33 @@ export default function (pi: Pi.ExtensionAPI) {
       };
       const store = inboundRecoveryRuntime.getOutboundStore();
       let item: Recovery.RecoveryOutboundDrainItem;
+      let operationOwnedFiles: readonly OutboundRecovery.TelegramOperationOwnedPrivateFile[] = [];
       try {
-        item = await OutboundRecovery.commitTelegramDurableOutbound(options, {
-          store,
-          transformReply(text) {
-            return Outbound.transformTelegramOutboundText(text, {
-              handlers: configStore.getOutboundHandlers(),
-              execCommand: CommandTemplates.execCommandTemplate,
-              recordRuntimeEvent,
-            });
+        const committed = await OutboundRecovery.commitTelegramDurableOutbound(
+          options,
+          {
+            store,
+            operationTempDir: Paths.resolveTelegramTempDir(),
+            transformReply(text) {
+              return Outbound.transformTelegramOutboundText(text, {
+                handlers: configStore.getOutboundHandlers(),
+                execCommand: CommandTemplates.execCommandTemplate,
+                recordRuntimeEvent,
+              });
+            },
+            recordCleanupFailure(details) {
+              recordRuntimeEvent(
+                "delivery",
+                "transferred source cleanup failed",
+                details,
+              );
+            },
           },
-        });
+        );
+        operationOwnedFiles = committed.operationOwnedFiles;
         item = {
-          ...item,
-          record: store.activateOutbound(item.record.recordId, claim),
+          ...committed,
+          record: store.activateOutbound(committed.record.recordId, claim),
         };
       } catch (error) {
         const recovered = store.listClaimableOutboundRecords(claim).find(
@@ -931,6 +952,12 @@ export default function (pi: Pi.ExtensionAPI) {
             ? store.activateOutbound(recovered.record.recordId, claim)
             : recovered.record,
         };
+      }
+      if (operationOwnedFiles.length > 0) {
+        durableOutboundOperationFiles.track(
+          item.record.turnId,
+          operationOwnedFiles,
+        );
       }
       durableOutboundWorker.register(item.record, claim);
       inboundRecoveryRuntime.releaseTurnAfterOutboundHandoff(turn);
@@ -1083,6 +1110,7 @@ export default function (pi: Pi.ExtensionAPI) {
     });
   const inboundRouteRuntime = Routing.createTelegramInboundRouteRuntime({
     configStore,
+    getEffectiveProfile: getActiveTelegramThreadProfile,
     callApi: callTelegramApi,
     getCurrentInstanceId() {
       return telegramInstanceId;
@@ -1164,6 +1192,7 @@ export default function (pi: Pi.ExtensionAPI) {
   });
   const telegramUpdateHandle = Updates.createTelegramUpdateHandle({
     defaultHandle: inboundRouteRuntime.handleUpdate,
+    recordRuntimeEvent,
     pairingGate: {
       getAllowedUserId: configStore.getAllowedUserId,
       claim: pairingRuntime.claim,
@@ -1279,7 +1308,7 @@ export default function (pi: Pi.ExtensionAPI) {
         scheduleDurableOutboundRecovery,
       );
     },
-    discard(actionId, ctx) {
+    async discard(actionId, ctx) {
       const item = MenuRecovery.findTelegramRecoveryStatusItem(
         inboundRecoveryRuntime.getRecoveryStatus(),
         actionId,
@@ -1288,10 +1317,12 @@ export default function (pi: Pi.ExtensionAPI) {
         inboundRecoveryRuntime.getOutboundStore().discardBusAction(actionId);
         return;
       }
+      let discardedTurnId: string | undefined;
       inboundRecoveryRuntime.discardForOperator(
         actionId,
         ctx,
         function (turnId) {
+          discardedTurnId = turnId;
           const current = telegramQueueStore.getQueuedItems();
           const remaining = current.filter(
             function (item) {
@@ -1301,11 +1332,14 @@ export default function (pi: Pi.ExtensionAPI) {
           if (remaining.length !== current.length) {
             telegramQueueStore.setQueuedItems(remaining);
           }
-          updateStatus(ctx);
-          deferredQueueDispatchRuntime.request(
-            dispatchNextQueuedTelegramTurn,
-          );
         },
+      );
+      if (discardedTurnId) {
+        await durableOutboundOperationFiles.resolveTerminal(discardedTurnId);
+      }
+      updateStatus(ctx);
+      deferredQueueDispatchRuntime.request(
+        dispatchNextQueuedTelegramTurn,
       );
     },
     async reassign(actionId, ctx) {
@@ -1760,7 +1794,11 @@ export default function (pi: Pi.ExtensionAPI) {
         );
       }
       await durableOutboundWorker.suspend();
-      await baseSessionLifecycleRuntime.onSessionShutdown(event, ctx);
+      try {
+        await baseSessionLifecycleRuntime.onSessionShutdown(event, ctx);
+      } finally {
+        await runtimeDiagnostics.onSessionShutdown();
+      }
     },
     async onSessionStart(event: Pi.SessionStartEvent, ctx: Pi.ExtensionContext) {
       const previousContext = telegramSessionContextStore.get();
@@ -1774,7 +1812,13 @@ export default function (pi: Pi.ExtensionAPI) {
           telegramSessionContextStore.getGeneration() + 1,
         );
       }
-      await baseSessionLifecycleRuntime.onSessionStart(event, ctx);
+      await runtimeDiagnostics.onSessionStart();
+      try {
+        await baseSessionLifecycleRuntime.onSessionStart(event, ctx);
+      } catch (error) {
+        await runtimeDiagnostics.onSessionShutdown();
+        throw error;
+      }
       dispatchNextQueuedTelegramTurn(ctx);
     },
   };

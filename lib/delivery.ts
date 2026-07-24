@@ -10,8 +10,8 @@ import {
   type TelegramInlineKeyboardMarkup,
 } from "./keyboard.ts";
 import {
-  buildTelegramReplyParameters,
   renderTelegramMessage,
+  reserveTelegramReplyParameters,
 } from "./replies.ts";
 import {
   getTelegramTargetThreadParams,
@@ -733,7 +733,7 @@ export function createTelegramBridgeDeliveryRuntime(
     },
     async sendChunk(target, chunk, options) {
       assertTransportActive();
-      const replyParameters = buildTelegramReplyParameters(
+      const reservation = reserveTelegramReplyParameters(
         target.chatId,
         options.replyToMessageId,
         target,
@@ -743,25 +743,36 @@ export function createTelegramBridgeDeliveryRuntime(
         text: chunk.text,
         ...(chunk.parseMode === "html" ? { parse_mode: "HTML" as const } : {}),
         ...getTelegramTargetThreadParams(target),
-        ...(replyParameters ? { reply_parameters: replyParameters } : {}),
+        ...(reservation.parameters
+          ? { reply_parameters: reservation.parameters }
+          : {}),
         ...(options.replyMarkup ? { reply_markup: options.replyMarkup } : {}),
       };
-      const sent = await deps.api.sendMessage(
-        target.threadId === undefined
-          ? markTelegramBusAggregateDelivery(body)
-          : body,
-      );
-      assertTransportActive(true);
       try {
-        deps.recordOwnership({
-          chatId: target.chatId,
-          messageId: sent.message_id,
-          target,
-        });
+        const sent = await deps.api.sendMessage(
+          target.threadId === undefined
+            ? markTelegramBusAggregateDelivery(body)
+            : body,
+        );
+        assertTransportActive(true);
+        if (!Number.isSafeInteger(sent.message_id) || sent.message_id <= 0) {
+          throw new Error("Telegram sendMessage returned an invalid message_id");
+        }
+        reservation.confirm();
+        try {
+          deps.recordOwnership({
+            chatId: target.chatId,
+            messageId: sent.message_id,
+            target,
+          });
+        } catch (error) {
+          deps.recordFailure?.("send", error, target);
+        }
+        return sent.message_id;
       } catch (error) {
-        deps.recordFailure?.("send", error, target);
+        reservation.releaseKnownFailure(error);
+        throw error;
       }
-      return sent.message_id;
     },
     async editChunk(target, messageId, chunk, options) {
       assertTransportActive();

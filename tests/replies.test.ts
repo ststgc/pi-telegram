@@ -24,6 +24,7 @@ import {
   getAgentMessageText,
   isAssistantAgentMessage,
   normalizeTelegramNativeMarkdown,
+  reserveTelegramReplyParameters,
   resetTransportReplyDedup,
   sendTelegramGuestMarkdownReplyUnit,
   sendTelegramNativeMarkdownReply,
@@ -38,6 +39,10 @@ import {
 } from "../lib/replies.ts";
 import { createDedupAgentStartHook } from "../lib/lifecycle.ts";
 import { createTelegramThreadTarget } from "../lib/target.ts";
+import {
+  TelegramApiCommitUnknownError,
+  TelegramApiHttpError,
+} from "../lib/telegram-api.ts";
 
 test("Reply helpers extract assistant message text and metadata", () => {
   const messages = [
@@ -1013,6 +1018,36 @@ test("Reply dedup tracks first reply per prompt message id and resets", () => {
   assert.equal(dedup.shouldReply(99), true);
   dedup.reset();
   assert.equal(dedup.shouldReply(42), true);
+});
+
+test("Transport reply dedup confirms only after receipt and releases only known failure", () => {
+  const pending = reserveTelegramReplyParameters(1, 42);
+  assert.deepEqual(pending.parameters, {
+    message_id: 42,
+    allow_sending_without_reply: true,
+  });
+  assert.equal(reserveTelegramReplyParameters(1, 42).parameters, undefined);
+  pending.confirm();
+  assert.equal(reserveTelegramReplyParameters(1, 42).parameters, undefined);
+
+  const knownFailure = reserveTelegramReplyParameters(1, 99);
+  knownFailure.releaseKnownFailure(
+    new TelegramApiHttpError("rejected", 400, undefined),
+  );
+  assert.deepEqual(reserveTelegramReplyParameters(1, 99).parameters, {
+    message_id: 99,
+    allow_sending_without_reply: true,
+  });
+
+  const uncertain = reserveTelegramReplyParameters(1, 100);
+  uncertain.releaseKnownFailure(
+    new TelegramApiCommitUnknownError(
+      "sendMessage",
+      new Error("response lost"),
+      "response-lost",
+    ),
+  );
+  assert.equal(reserveTelegramReplyParameters(1, 100).parameters, undefined);
 });
 
 test("Dedup wrapper suppresses reply_to_message_id after the first message in a turn", async () => {

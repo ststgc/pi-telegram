@@ -550,6 +550,7 @@ export interface TelegramInboundRouteRuntimeDeps<
     TelegramConfigStore,
     "get" | "getAllowedUserId" | "persist"
   > & { set?: TelegramConfigStore["set"] };
+  getEffectiveProfile?: () => string | undefined;
   callApi?: <TResponse>(
     method: string,
     body: Record<string, unknown>,
@@ -608,7 +609,15 @@ export interface TelegramInboundRouteRuntimeDeps<
     messages: readonly TMessage[],
     error: unknown,
   ) => void | Promise<void>;
-  terminalizeDeletedRecoveryMessages?: (messageIds: readonly number[]) => void;
+  terminalizeDeletedRecoveryMessages?: (
+    messageIds: readonly number[],
+    scope?: {
+      profile?: string;
+      chatId?: number;
+      exactThreadId?: number | null;
+      businessConnectionId?: string;
+    },
+  ) => void;
   modelMenuRuntime: Menu.TelegramModelMenuRuntime<TModel>;
   currentModelRuntime: Model.CurrentModelRuntime<TContext, TModel>;
   modelSwitchController: Model.TelegramModelSwitchController<
@@ -1546,6 +1555,13 @@ export function createTelegramInboundRouteRuntime<
   >({
     allocateQueueOrder: deps.bridgeRuntime.queue.allocateItemOrder,
     downloadFile: deps.downloadFile,
+    recordCleanupFailure(evidence) {
+      deps.recordRuntimeEvent?.(
+        "media",
+        new Error("Telegram operation-owned file cleanup failed"),
+        { phase: evidence.phase, failedCount: evidence.failedCount },
+      );
+    },
     processAttachments: deps.inboundHandlerRuntime.process,
     resolveTimeLine: deps.resolveTimeLine,
     getAllowedUserId: deps.configStore.getAllowedUserId,
@@ -2126,6 +2142,9 @@ export function createTelegramInboundRouteRuntime<
   });
   return Updates.createTelegramPairedUpdateRuntime<TContext, TUpdate>({
     getAllowedUserId: deps.configStore.getAllowedUserId,
+    getEffectiveProfile: deps.getEffectiveProfile
+      ? () => deps.getEffectiveProfile?.() ?? "default"
+      : undefined,
     getCurrentInstanceId: deps.getCurrentInstanceId,
     getMessageOwnership: deps.getMessageOwnership,
     getTargetOwnership: deps.getTargetOwnership,
@@ -2135,16 +2154,32 @@ export function createTelegramInboundRouteRuntime<
       return { kind: "completed", reason: "topic-lifecycle" };
     },
     foreignOwnedUpdateForwarder: deps.foreignOwnedUpdateForwarder,
-    removePendingMediaGroupMessages: (messageIds) => {
+    removePendingMediaGroupMessages: (
+      messageIds: number[],
+      scope?: { chatId?: number; threadId?: number },
+    ) => {
       const removedMediaMessageIds =
-        deps.mediaGroupRuntime.removeMessages(messageIds);
+        deps.mediaGroupRuntime.removeMessages(messageIds, scope);
       deps.terminalizeDeletedRecoveryMessages?.([
         ...new Set([...messageIds, ...removedMediaMessageIds]),
       ]);
-      deps.textGroupRuntime.removeMessages(messageIds);
+      deps.textGroupRuntime.removeMessages(messageIds, scope);
     },
-    removeQueuedTelegramTurnsByMessageIds:
-      deps.queueMutationRuntime.removeByMessageIds,
+    removeQueuedTelegramTurnsByMessageIds(messageIds, ctx, scope) {
+      deps.terminalizeDeletedRecoveryMessages?.(messageIds, scope);
+      return deps.queueMutationRuntime.removeByMessageIds(messageIds, ctx, scope);
+    },
+    resolveQueuedTelegramMessageThreadId(messageId, scope) {
+      const activeTurn = deps.activeTurnRuntime.get();
+      return Queue.resolveTelegramQueueMessageThreadId(
+        [
+          ...deps.telegramQueueStore.getQueuedItems(),
+          ...(activeTurn ? [activeTurn] : []),
+        ],
+        messageId,
+        scope,
+      );
+    },
     clearQueuedTelegramTurnPriorityByMessageId:
       deps.queueMutationRuntime.clearPriorityByMessageId,
     prioritizeQueuedTelegramTurnByMessageId:
