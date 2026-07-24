@@ -25,8 +25,10 @@ import {
   type RecoveryDowngradePreflight,
   type RecoveryIdentity,
   type RecoveryInboundRecord,
+  type RecoveryIdentityClaim,
   type RecoveryMetadataStatus,
   type RecoveryOrphanReassignmentCandidate,
+  type RecoveryOutboundDrainItem,
   type RecoveryReassignmentActionResult,
   type RecoveryReassignmentBindingValidation,
   type RecoverySameProcessHandoff,
@@ -242,6 +244,9 @@ export interface InboundRecoveryRuntime<
     turn: TTurn,
   ): TTurn;
   claimTurnDispatch(turn: PendingTelegramTurn): boolean;
+  getTurnOutboundClaim(turn: PendingTelegramTurn): RecoveryIdentityClaim;
+  getOutboundStore(): RecoveryStore;
+  releaseTurnAfterOutboundHandoff(turn: PendingTelegramTurn): void;
   markTurnDispatchFailed(turn: PendingTelegramTurn): void;
   completeTurn(turn: PendingTelegramTurn): void;
   settleDeferredMessages(
@@ -254,6 +259,13 @@ export interface InboundRecoveryRuntime<
   ): void;
   terminalizeDeletedMessageIds(messageIds: readonly number[]): void;
   publishSessionHandoffs(toSessionGeneration: number): number;
+  rehydrateOutbound(
+    ctx: TContext,
+    schedule: (
+      item: RecoveryOutboundDrainItem,
+      claim: RecoveryIdentityClaim,
+    ) => void | Promise<void>,
+  ): Promise<void>;
   rehydrate(
     ctx: TContext,
     handle: (update: TUpdate, ctx: TContext) => Promise<unknown>,
@@ -948,11 +960,11 @@ export function createInboundRecoveryRuntime<
     };
   };
 
-  const getOperatorIdentity = (ctx: TContext): RecoveryIdentity => {
+  const resolveOperatorIdentity = (
+    ctx: TContext,
+  ): RecoveryIdentity | undefined => {
     const generation = deps.getSessionGeneration();
-    if (!deps.isSessionActive(ctx, generation)) {
-      throw new Error("Stale session cannot operate recovery work");
-    }
+    if (!deps.isSessionActive(ctx, generation)) return undefined;
     const identity = deps.resolveOperatorIdentity?.(ctx);
     if (
       !identity ||
@@ -960,9 +972,17 @@ export function createInboundRecoveryRuntime<
       identity.sessionGeneration !== generation ||
       !isIdentityAuthenticated(identity)
     ) {
-      throw new Error("Recovery operator identity is not currently authenticated");
+      return undefined;
     }
     return structuredClone(identity);
+  };
+
+  const getOperatorIdentity = (ctx: TContext): RecoveryIdentity => {
+    const identity = resolveOperatorIdentity(ctx);
+    if (!identity) {
+      throw new Error("Recovery operator identity is not currently authenticated");
+    }
+    return identity;
   };
 
   const replayRetriedEnvelope = async (
@@ -1018,6 +1038,42 @@ export function createInboundRecoveryRuntime<
     settleMatches([admittedByUpdate.get(envelope.update.update_id)!], outcome);
     operatorReplayedTurnIds.add(record.turnId);
     return { appended: true, duplicationWarning: true };
+  };
+
+  const consumePublishedHandoffs = (ctx: TContext): void => {
+    const recoveryStore = getStore();
+    const currentGeneration = deps.getSessionGeneration();
+    const registry = getHandoffRegistry();
+    const published = registry.get(recoveryStore.rootPath) ?? [];
+    const remaining: RecoverySameProcessHandoff[] = [];
+    for (const handoff of published) {
+      if (
+        handoff.toSessionGeneration !== currentGeneration ||
+        handoff.expiresAtMs < now()
+      ) {
+        continue;
+      }
+      try {
+        const currentIdentity = createIdentity(handoff.target, ctx);
+        if (
+          handoff.profile !== currentIdentity.profile ||
+          !areRecoveryOwnersEqual(handoff.owner, currentIdentity.owner)
+        ) {
+          remaining.push(handoff);
+          continue;
+        }
+        const consumed = recoveryStore.consumeSameProcessHandoff(
+          handoff,
+          currentIdentity,
+        );
+        for (const recordId of consumed.claimedRecordIds) {
+          identityByRecordId.set(recordId, currentIdentity);
+        }
+      } catch {
+        remaining.push(handoff);
+      }
+    }
+    registry.set(recoveryStore.rootPath, remaining);
   };
 
   const runtime: InboundRecoveryRuntime<TUpdate, TContext> = {
@@ -1282,10 +1338,56 @@ export function createInboundRecoveryRuntime<
       }
     },
 
+    getTurnOutboundClaim(turn) {
+      const recovery = turn.recovery;
+      if (!recovery || recovery.recordIds.length === 0) {
+        throw new Error("Telegram turn has no durable inbound identity");
+      }
+      if (!dispatchLeasesByTurnId.has(recovery.turnId)) {
+        throw new Error("Telegram turn has no active durable dispatch lease");
+      }
+      const claim = claimForRecord(recovery.recordIds[0]!);
+      for (const recordId of recovery.recordIds.slice(1)) {
+        const candidate = claimForRecord(recordId);
+        if (
+          candidate.identity.profile !== claim.identity.profile ||
+          !areRecoveryTargetsEqual(
+            candidate.identity.target,
+            claim.identity.target,
+          ) ||
+          !areRecoveryOwnersEqual(
+            candidate.identity.owner,
+            claim.identity.owner,
+          ) ||
+          candidate.identity.sessionGeneration !==
+            claim.identity.sessionGeneration
+        ) {
+          throw new Error("Telegram turn recovery group identity mismatch");
+        }
+      }
+      return { identity: structuredClone(claim.identity) };
+    },
+
+    getOutboundStore() {
+      return getStore();
+    },
+
+    releaseTurnAfterOutboundHandoff(turn) {
+      const recovery = turn.recovery;
+      if (!recovery) {
+        throw new Error("Telegram turn has no durable inbound relationship");
+      }
+      const lease = dispatchLeasesByTurnId.get(recovery.turnId);
+      if (!lease) {
+        throw new Error("Telegram turn durable dispatch lease is absent");
+      }
+      dispatchLeasesByTurnId.delete(recovery.turnId);
+      lease.release();
+    },
+
     markTurnDispatchFailed(turn) {
       const recovery = turn.recovery;
       if (!recovery) return;
-      const lease = dispatchLeasesByTurnId.get(recovery.turnId);
       try {
         getStore().markExecutionUncertainGroup(
           recovery.recordIds.map((recordId) => ({
@@ -1298,16 +1400,16 @@ export function createInboundRecoveryRuntime<
           phase: "dispatch-failure",
           recordCount: recovery.recordIds.length,
         });
-      } finally {
-        dispatchLeasesByTurnId.delete(recovery.turnId);
-        lease?.release();
+        throw error;
       }
+      const lease = dispatchLeasesByTurnId.get(recovery.turnId);
+      dispatchLeasesByTurnId.delete(recovery.turnId);
+      lease?.release();
     },
 
     completeTurn(turn) {
       const recovery = turn.recovery;
       if (!recovery) return;
-      const lease = dispatchLeasesByTurnId.get(recovery.turnId);
       try {
         getStore().markCompletedGroup(
           recovery.recordIds.map((recordId) => ({
@@ -1320,10 +1422,11 @@ export function createInboundRecoveryRuntime<
           phase: "complete",
           recordCount: recovery.recordIds.length,
         });
-      } finally {
-        dispatchLeasesByTurnId.delete(recovery.turnId);
-        lease?.release();
+        throw error;
       }
+      const lease = dispatchLeasesByTurnId.get(recovery.turnId);
+      dispatchLeasesByTurnId.delete(recovery.turnId);
+      lease?.release();
     },
 
     settleDeferredMessages(messages, outcome) {
@@ -1371,21 +1474,21 @@ export function createInboundRecoveryRuntime<
       const issuedAtMs = now();
       const handoffs: RecoverySameProcessHandoff[] = [];
       const seen = new Set<string>();
-      for (const record of recoveryStore.listReplayableInboundRecords()) {
-        if (!isIdentityAuthenticated(record.identity)) continue;
+      for (const identity of recoveryStore.listUnresolvedIdentities()) {
+        if (!isIdentityAuthenticated(identity)) continue;
         const key = JSON.stringify([
-          record.identity.target.chatId,
-          record.identity.target.threadId ?? null,
-          record.identity.owner,
-          record.identity.sessionGeneration,
+          identity.target.chatId,
+          identity.target.threadId ?? null,
+          identity.owner,
+          identity.sessionGeneration,
         ]);
         if (seen.has(key)) continue;
         seen.add(key);
         handoffs.push({
           handoffId: randomUUID(),
-          profile: record.identity.profile,
-          target: structuredClone(record.identity.target),
-          owner: structuredClone(record.identity.owner),
+          profile: identity.profile,
+          target: structuredClone(identity.target),
+          owner: structuredClone(identity.owner),
           fromSessionGeneration,
           toSessionGeneration,
           createdAtMs: issuedAtMs,
@@ -1398,36 +1501,28 @@ export function createInboundRecoveryRuntime<
       return handoffs.length;
     },
 
+    async rehydrateOutbound(ctx, schedule) {
+      return runGatedOperation(async () => {
+        consumePublishedHandoffs(ctx);
+        const identity = resolveOperatorIdentity(ctx);
+        if (!identity) return;
+        const recoveryStore = getStore();
+        const claim = { identity };
+        recoveryStore.reconcileOutboundTerminalSources(claim);
+        const claimable = recoveryStore.listRehydratableOutboundRecords(claim);
+        for (const item of claimable) {
+          const record = item.record.state === "planned"
+            ? recoveryStore.activateOutbound(item.record.recordId, claim)
+            : item.record;
+          await schedule({ ...item, record }, claim);
+        }
+      });
+    },
+
     async rehydrate(ctx, handle, appendTurn) {
       return runGatedOperation(async () => {
       const recoveryStore = getStore();
-      const currentGeneration = deps.getSessionGeneration();
-      const registry = getHandoffRegistry();
-      const published = registry.get(recoveryStore.rootPath) ?? [];
-      const remaining: RecoverySameProcessHandoff[] = [];
-      for (const handoff of published) {
-        if (
-          handoff.toSessionGeneration !== currentGeneration ||
-          handoff.expiresAtMs < now()
-        ) {
-          continue;
-        }
-        try {
-          const currentIdentity = createIdentity(handoff.target, ctx);
-          if (
-            handoff.profile !== currentIdentity.profile ||
-            !areRecoveryOwnersEqual(handoff.owner, currentIdentity.owner)
-          ) {
-            remaining.push(handoff);
-            continue;
-          }
-          recoveryStore.consumeSameProcessHandoff(handoff, currentIdentity);
-        } catch {
-          remaining.push(handoff);
-        }
-      }
-      registry.set(recoveryStore.rootPath, remaining);
-
+      consumePublishedHandoffs(ctx);
       const replayableRecords = recoveryStore.listReplayableInboundRecords();
       const restoredTurnRecordIds = new Set<string>();
       for (const record of replayableRecords) {

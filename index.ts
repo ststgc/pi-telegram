@@ -27,6 +27,7 @@ import * as MenuSettings from "./lib/menu-settings.ts";
 import * as Menu from "./lib/menu.ts";
 import * as Model from "./lib/model.ts";
 import * as Outbound from "./lib/outbound.ts";
+import * as OutboundRecovery from "./lib/outbound-recovery.ts";
 import * as Ownership from "./lib/ownership.ts";
 import * as Pairing from "./lib/pairing.ts";
 import * as Paths from "./lib/paths.ts";
@@ -163,15 +164,24 @@ export default function (pi: Pi.ExtensionAPI) {
       contextStore: telegramSessionContextStore,
     });
   const activeTurnRuntime = Queue.createTelegramActiveTurnStore();
+  const getAssignedTelegramTarget = function () {
+    return (
+      telegramBusFollowerRegistrationState.getTarget() ??
+      telegramBusLeaderState.getTarget()
+    );
+  };
   const proactivePushTargetGetter =
     Config.createTelegramProactivePushTargetGetter({
       getActiveTurnTarget: activeTurnRuntime.getTarget,
-      getAssignedTarget() {
-        return (
-          telegramBusFollowerRegistrationState.getTarget() ??
-          telegramBusLeaderState.getTarget()
-        );
+      getAssignedTarget: getAssignedTelegramTarget,
+      getAllowedUserId: configStore.getAllowedUserId,
+    });
+  const pairedProactivePushTargetGetter =
+    Config.createTelegramProactivePushTargetGetter({
+      getActiveTurnTarget() {
+        return undefined;
       },
+      getAssignedTarget: getAssignedTelegramTarget,
       getAllowedUserId: configStore.getAllowedUserId,
     });
   const proactivePushChatIdGetter =
@@ -374,8 +384,6 @@ export default function (pi: Pi.ExtensionAPI) {
     getUpdates,
     setMyCommands,
     sendTypingAction,
-    sendChatAction,
-    sendRecordVoiceAction,
     sendMessageDraft,
     sendMessage,
     sendRichMessage,
@@ -389,10 +397,6 @@ export default function (pi: Pi.ExtensionAPI) {
   } = telegramApiRuntime;
 
   // --- Message Delivery ---
-
-  const sendGuestReply = Replies.createGuestMarkdownReplySender({
-    answerGuestQuery,
-  });
 
   const promptDispatchRuntime = Runtime.createTelegramPromptDispatchRuntime({
     lifecycle,
@@ -694,13 +698,212 @@ export default function (pi: Pi.ExtensionAPI) {
     recordRuntimeEvent,
     ...replyTransport,
   });
-  const { finalizeMarkdownPreview } =
-    Outbound.createTelegramOutboundTextPreviewRuntime({
-      finalizeMarkdownPreview: previewRuntime.finalizeMarkdown,
-      execCommand: CommandTemplates.execCommandTemplate,
-      getHandlers: configStore.getOutboundHandlers,
-      recordRuntimeEvent,
+  const runPreviewOrderedMutation = async function <TResult>(
+    mutation: { (): Promise<TResult> },
+  ): Promise<TResult> {
+    const finalize = Preview.createTelegramNativeMarkdownPreviewReceiptFinalizer({
+      getState: previewRuntime.getState,
+      discard() {
+        previewRuntime.setState(undefined);
+      },
+      async sendUnit() {
+        return { value: await mutation() };
+      },
     });
+    const receipt = await finalize();
+    if (!receipt) {
+      throw new Error("Telegram preview generation changed before outbox send");
+    }
+    return receipt.value;
+  };
+  const sendDurableMultipartBytes =
+    OutboundRecovery.createTelegramDurableOutboundMultipartBytesSender({
+      tempDir: Paths.resolveTelegramTempDir(),
+      callMultipart,
+    });
+  const durableOutboundAdapter =
+    OutboundRecovery.createTelegramDurableOutboundUnitAdapter({
+      gate: {
+        canStart(identity) {
+          return (
+            inboundRecoveryRuntime.operationGate.getState(identity.profile)
+              .phase === "active" &&
+            isRecoveryIdentityAuthenticated(identity)
+          );
+        },
+        isActive(identity) {
+          return (
+            inboundRecoveryRuntime.operationGate.getState(identity.profile)
+              .phase === "active" &&
+            isRecoveryIdentityAuthenticated(identity)
+          );
+        },
+      },
+      sendMessage(body) {
+        return runPreviewOrderedMutation(function () {
+          return sendMessage(body);
+        });
+      },
+      sendRichMessage(body) {
+        return runPreviewOrderedMutation(function () {
+          return sendRichMessage(body);
+        });
+      },
+      sendMultipartBytes(method, fields, fileField, bytes, fileName) {
+        return runPreviewOrderedMutation(function () {
+          return sendDurableMultipartBytes(
+            method,
+            fields,
+            fileField,
+            bytes,
+            fileName,
+          );
+        });
+      },
+      answerGuestQuery(guestQueryId, text, options) {
+        return runPreviewOrderedMutation(function () {
+          return answerGuestQuery(guestQueryId, text, options);
+        });
+      },
+      deleteMessage: deleteTelegramMessage,
+    });
+  const durableOutboundWorker =
+    OutboundRecovery.createTelegramDurableOutboundWorker({
+      getStore: inboundRecoveryRuntime.getOutboundStore,
+      operationGate: inboundRecoveryRuntime.operationGate,
+      adapter: durableOutboundAdapter,
+      createReplyMarkup(buttons) {
+        return {
+          inline_keyboard: buttons.map(function (button) {
+            return [
+              {
+                text: button.label,
+                callback_data: buttonActionStore.register({
+                  text: button.label,
+                  prompt: button.prompt,
+                }),
+              },
+            ];
+          }),
+        };
+      },
+      recordOwnership({ identity, messageId }) {
+        messageOwnershipRuntime.recordLocal({
+          chatId: identity.target.chatId,
+          messageId,
+          target: identity.target,
+        });
+      },
+      onTerminal() {
+        const ctx = telegramSessionContextStore.get();
+        if (!ctx || !telegramSessionContextStore.isCurrent(ctx)) return;
+        updateStatus(ctx);
+        deferredQueueDispatchRuntime.request(
+          dispatchNextQueuedTelegramTurn,
+        );
+      },
+      recordRuntimeEvent,
+      startSuspended: true,
+    });
+  const durableOutboundLifecycle = {
+    async handoffActiveTurn(
+      turn: Queue.PendingTelegramTurn,
+      assistant: Queue.TelegramAgentEndAssistantResult,
+    ): Promise<Queue.TelegramDurableAgentEndHandoff> {
+      const recovery = turn.recovery;
+      if (!recovery) {
+        throw new Error("Active Telegram turn has no durable inbound record");
+      }
+      const claim = inboundRecoveryRuntime.getTurnOutboundClaim(turn);
+      const automaticVoice = Voice.isVoiceTurn(turn);
+      const semanticReply = Outbound.planTelegramDurableOutboundReply(
+        assistant.text ?? "",
+        { automaticVoice },
+      );
+      if (semanticReply.markdown) {
+        previewRuntime.setPendingText(semanticReply.markdown);
+      }
+      let generatedVoice: Outbound.TelegramDurableGeneratedVoiceSource[] = [];
+      let voiceFallbackToText = false;
+      if (semanticReply.voiceReplies.length > 0) {
+        try {
+          generatedVoice = await Outbound.generateTelegramDurableVoiceSources(
+            semanticReply,
+            {
+              execCommand: CommandTemplates.execCommandTemplate,
+              getHandlers: configStore.getOutboundHandlers,
+              recordRuntimeEvent,
+            },
+          );
+        } catch (error) {
+          voiceFallbackToText = true;
+          recordRuntimeEvent("voice", error, {
+            phase: "durable-generation-fallback",
+          });
+        }
+      }
+      const options: OutboundRecovery.TelegramDurableOutboundPlanOptions = {
+        intentId: `final-v1:${recovery.turnId}`,
+        turnId: recovery.turnId,
+        sourceInboundRecordIds: recovery.recordIds,
+        claim,
+        replyToMessageId: turn.replyToMessageId,
+        renderingMode: configControls.getAssistantRenderingMode(),
+        finalMarkdown: assistant.text ?? "",
+        queuedAttachments: turn.queuedAttachments,
+        generatedVoice,
+        automaticVoice,
+        voiceFallbackToText,
+        ...(turn.guestQueryId
+          ? {
+              guestQueryId: turn.guestQueryId,
+              guestStagingTarget: pairedProactivePushTargetGetter(),
+            }
+          : {}),
+      };
+      const store = inboundRecoveryRuntime.getOutboundStore();
+      let item: Recovery.RecoveryOutboundDrainItem;
+      try {
+        item = await OutboundRecovery.commitTelegramDurableOutbound(options, {
+          store,
+          transformReply(text) {
+            return Outbound.transformTelegramOutboundText(text, {
+              handlers: configStore.getOutboundHandlers(),
+              execCommand: CommandTemplates.execCommandTemplate,
+              recordRuntimeEvent,
+            });
+          },
+        });
+        item = {
+          ...item,
+          record: store.activateOutbound(item.record.recordId, claim),
+        };
+      } catch (error) {
+        const recovered = store.listClaimableOutboundRecords(claim).find(
+          function (candidate) {
+            return candidate.record.turnId === recovery.turnId &&
+              candidate.record.intentId === options.intentId;
+          },
+        );
+        if (!recovered) throw error;
+        item = {
+          ...recovered,
+          record: recovered.record.state === "planned"
+            ? store.activateOutbound(recovered.record.recordId, claim)
+            : recovered.record,
+        };
+      }
+      durableOutboundWorker.register(item.record, claim);
+      inboundRecoveryRuntime.releaseTurnAfterOutboundHandoff(turn);
+      return {
+        startDelivery() {
+          durableOutboundWorker.schedule(item.record.recordId);
+        },
+      };
+    },
+    completeTurnWithoutDelivery: inboundRecoveryRuntime.completeTurn,
+    markTurnExecutionUncertain: inboundRecoveryRuntime.markTurnDispatchFailed,
+  };
 
   // --- Model And Menu Setup ---
 
@@ -1082,17 +1285,19 @@ export default function (pi: Pi.ExtensionAPI) {
               resumeRuntime,
             );
           },
-          suspendRuntime() {
+          async suspendRuntime() {
             mediaGroupRuntime.suspend();
             textGroupRuntime.suspend();
             queueDispatchWatchdogRuntime.stop();
             deferredQueueDispatchRuntime.unbind();
+            await durableOutboundWorker.suspend();
           },
-          resumeRuntime(ctx) {
+          async resumeRuntime(ctx) {
             deferredQueueDispatchRuntime.bind(ctx);
             mediaGroupRuntime.resume(ctx);
             textGroupRuntime.resume(ctx);
             queueDispatchWatchdogRuntime.start(ctx);
+            await durableOutboundWorker.resume();
             dispatchNextQueuedTelegramTurn(ctx);
           },
         },
@@ -1310,18 +1515,20 @@ export default function (pi: Pi.ExtensionAPI) {
       quarantineStore: inboundRecoveryRuntime.quarantineForDowngrade,
       cancelStoreExclusive: inboundRecoveryRuntime.cancelDowngradeExclusive,
       stopPolling: pollingRuntime.stop,
-      suspendRuntime() {
+      async suspendRuntime() {
         telegramThreadCapabilityMonitor.stop();
         mediaGroupRuntime.suspend();
         textGroupRuntime.suspend();
         queueDispatchWatchdogRuntime.stop();
         deferredQueueDispatchRuntime.unbind();
+        await durableOutboundWorker.suspend();
       },
       async resumeRuntime(ctx) {
         deferredQueueDispatchRuntime.bind(ctx);
         mediaGroupRuntime.resume(ctx);
         textGroupRuntime.resume(ctx);
         queueDispatchWatchdogRuntime.start(ctx);
+        await durableOutboundWorker.resume();
         await pollingRuntime.restartAfterStop(ctx);
         telegramThreadCapabilityMonitor.start(ctx);
         dispatchNextQueuedTelegramTurn(ctx);
@@ -1388,6 +1595,42 @@ export default function (pi: Pi.ExtensionAPI) {
         recordRuntimeEvent,
       },
       services: {
+        recovery: {
+          async onSessionStart(_event, ctx) {
+            if (
+              !lockRuntime.owns(ctx) &&
+              !telegramBusFollowerRegistrationState.isRegistered()
+            ) {
+              return;
+            }
+            await inboundRecoveryRuntime.rehydrateOutbound(
+              ctx,
+              function (item, claim) {
+                durableOutboundWorker.register(item.record, claim);
+                durableOutboundWorker.schedule(item.record.recordId);
+              },
+            );
+            await durableOutboundWorker.resume();
+            await inboundRecoveryRuntime.rehydrate(
+              ctx,
+              function (update, recoveryCtx) {
+                return telegramUpdateHandle(
+                  update as TelegramApi.TelegramUpdate,
+                  recoveryCtx,
+                );
+              },
+              function (turn) {
+                const result = Queue.appendTelegramPromptTurnOnce(
+                  telegramQueueStore.getQueuedItems(),
+                  turn,
+                );
+                if (result.appended) {
+                  telegramQueueStore.setQueuedItems(result.items);
+                }
+              },
+            );
+          },
+        },
         resumeGroupedInput(ctx) {
           mediaGroupRuntime.resume(ctx);
           textGroupRuntime.resume(ctx);
@@ -1413,6 +1656,7 @@ export default function (pi: Pi.ExtensionAPI) {
           telegramSessionContextStore.getGeneration() + 2,
         );
       }
+      await durableOutboundWorker.suspend();
       await baseSessionLifecycleRuntime.onSessionShutdown(event, ctx);
     },
     async onSessionStart(event: Pi.SessionStartEvent, ctx: Pi.ExtensionContext) {
@@ -1428,28 +1672,6 @@ export default function (pi: Pi.ExtensionAPI) {
         );
       }
       await baseSessionLifecycleRuntime.onSessionStart(event, ctx);
-      if (
-        !lockRuntime.owns(ctx) &&
-        !telegramBusFollowerRegistrationState.isRegistered()
-      ) {
-        return;
-      }
-      await inboundRecoveryRuntime.rehydrate(
-        ctx,
-        function (update, recoveryCtx) {
-          return telegramUpdateHandle(
-            update as TelegramApi.TelegramUpdate,
-            recoveryCtx,
-          );
-        },
-        function (turn) {
-          const result = Queue.appendTelegramPromptTurnOnce(
-            telegramQueueStore.getQueuedItems(),
-            turn,
-          );
-          if (result.appended) telegramQueueStore.setQueuedItems(result.items);
-        },
-      );
       dispatchNextQueuedTelegramTurn(ctx);
     },
   };
@@ -1464,6 +1686,7 @@ export default function (pi: Pi.ExtensionAPI) {
     setup,
     activeTurnRuntime,
     lockedPollingRuntime,
+    resumeDurableOutboundWorker: durableOutboundWorker.resume,
     stopPolling: disconnectTelegramAndDeleteCurrentThread,
     getDisconnectThreadName() {
       const record = findCurrentThreadRecord();
@@ -1508,21 +1731,10 @@ export default function (pi: Pi.ExtensionAPI) {
     promptDispatchRuntime,
     deferredQueueDispatchRuntime,
     lockOwnershipGuard,
-    buttonActionStore,
-    callMultipart,
-    sendChatAction,
-    sendRecordVoiceAction,
-    sendMarkdownReply,
-    sendTextReply,
     dispatchNextQueuedTelegramTurn,
-    answerGuestQuery,
-    deleteMessage: deleteTelegramMessage,
-    sendGuestReply,
-    finalizeMarkdownPreview,
+    durableOutbound: durableOutboundLifecycle,
     proactivePushTargetGetter,
     isProactivePushEnabled: configControls.isProactivePushEnabled,
-    getAssistantRenderingMode: configControls.getAssistantRenderingMode,
-    recordMessageOwnership: messageOwnershipRuntime.recordLocal,
     canSendAgentActivity(ctx) {
       return (
         lockOwnershipGuard.ownsContext(ctx) ||
@@ -1532,14 +1744,6 @@ export default function (pi: Pi.ExtensionAPI) {
     isSessionContextActive(ctx) {
       return telegramSessionContextStore.isCurrent(ctx);
     },
-    isTurnTransportActive(turn) {
-      return (
-        telegramTransportStampRuntime.isActive(turn.transportStamp) &&
-        (lockRuntime.owns() ||
-          telegramBusFollowerRegistrationState.isRegistered())
-      );
-    },
-    onTurnSettled: inboundRecoveryRuntime.completeTurn,
     updateStatus,
     recordRuntimeEvent,
   });

@@ -519,6 +519,7 @@ export interface RecoveryOutboundPlanInput {
   buttons?: readonly RecoveryOutboundButton[];
   voice?: RecoveryOutboundVoiceMetadata;
   guestQueryId?: string;
+  guestStagingTarget?: TelegramTarget;
   spool?: readonly Uint8Array[];
 }
 
@@ -534,6 +535,7 @@ interface RecoveryOutboundPayloadV1 {
   buttons: RecoveryOutboundButton[];
   voice?: RecoveryOutboundVoiceMetadata;
   guestQueryId?: string;
+  guestStagingTarget?: TelegramTarget;
 }
 
 export interface RecoveryBusRecord extends RecoveryRecordBase {
@@ -1795,7 +1797,7 @@ function readOutboundPayload(
       "units",
       "buttons",
     ],
-    ["voice", "guestQueryId"],
+    ["voice", "guestQueryId", "guestStagingTarget"],
   );
   if (object.version !== 1) fail(`${path}.version`, "expected 1");
   const payload: RecoveryOutboundPayloadV1 = {
@@ -1829,6 +1831,16 @@ function readOutboundPayload(
       `${path}.guestQueryId`,
     );
   }
+  if (Object.hasOwn(object, "guestStagingTarget")) {
+    const target = readTarget(
+      object.guestStagingTarget,
+      `${path}.guestStagingTarget`,
+    );
+    if (target.chatId < 1) {
+      fail(`${path}.guestStagingTarget.chatId`, "must identify a private chat");
+    }
+    payload.guestStagingTarget = target;
+  }
   if (payload.units.length === 0) fail(`${path}.units`, "must not be empty");
   assertUniqueStrings(
     payload.units.map((unit) => unit.operationId),
@@ -1849,6 +1861,9 @@ function readOutboundPayload(
     if (isGuestUnit && payload.guestQueryId === undefined) {
       fail(`${path}.guestQueryId`, "is required by guest units");
     }
+    if (isGuestUnit && payload.guestStagingTarget === undefined) {
+      fail(`${path}.guestStagingTarget`, "is required by guest units");
+    }
     if (!isGuestUnit && payload.guestQueryId !== undefined) {
       fail(`${path}.units[${index}].kind`, "Guest plans require only guest units");
     }
@@ -1864,6 +1879,9 @@ function readOutboundPayload(
     ) {
       fail(`${path}.units[${index}]`, "does not match the payload rendering mode");
     }
+  }
+  if (payload.guestQueryId === undefined && payload.guestStagingTarget !== undefined) {
+    fail(`${path}.guestStagingTarget`, "is valid only for Guest plans");
   }
   if (payload.guestQueryId === undefined && payload.replyToMessageId < 1) {
     fail(`${path}.replyToMessageId`, "must be positive for non-Guest plans");
@@ -2652,6 +2670,7 @@ export interface RecoveryOutboundExecutionContext {
   isFirstExecutedUnit: boolean;
   acceptsFinalButtons: boolean;
   guestQueryId?: string;
+  guestStagingTarget?: TelegramTarget;
 }
 
 export interface RecoveryOutboundDrainItem {
@@ -5021,6 +5040,29 @@ export class RecoveryStore {
     );
   }
 
+  /**
+   * Lists identity tuples that still own durable work. This is used only to
+   * mint process-local session handoffs; it does not grant access by itself.
+   */
+  listUnresolvedIdentities(): RecoveryIdentity[] {
+    return withTelegramFileTransaction(`${this.rootPath}.transaction`, () => {
+      const snapshot = this.#readSnapshotLocked();
+      const identities = new Map<string, RecoveryIdentity>();
+      for (const record of [
+        ...snapshot.inbound,
+        ...snapshot.outbound,
+        ...snapshot.bus,
+      ]) {
+        if (!isUnresolvedRecord(record)) continue;
+        const key = JSON.stringify(record.identity);
+        if (!identities.has(key)) {
+          identities.set(key, structuredClone(record.identity));
+        }
+      }
+      return [...identities.values()];
+    });
+  }
+
   drainSafeInbound(claim: RecoveryIdentityClaim): RecoveryInboundDrainItem[] {
     return this.#commit((snapshot, revision, nowMs) => {
       this.#assertActive(snapshot);
@@ -5086,6 +5128,9 @@ export class RecoveryStore {
         buttons: structuredClone(input.buttons ?? []),
         ...(input.voice ? { voice: structuredClone(input.voice) } : {}),
         ...(input.guestQueryId ? { guestQueryId: input.guestQueryId } : {}),
+        ...(input.guestStagingTarget
+          ? { guestStagingTarget: structuredClone(input.guestStagingTarget) }
+          : {}),
       },
       "$plan.payload",
       spool.length,
@@ -5588,6 +5633,79 @@ export class RecoveryStore {
     });
   }
 
+  /** Repairs terminal outbound/source relationships before queue rehydration. */
+  reconcileOutboundTerminalSources(claim: RecoveryIdentityClaim): number {
+    return this.#commit((snapshot, revision, nowMs, deleteAfterCommit) => {
+      this.#assertActive(snapshot);
+      this.#authenticate(claim.identity);
+      let repaired = 0;
+      for (const outbound of snapshot.outbound) {
+        if (
+          outbound.state !== "delivered" &&
+          outbound.state !== "delivery-uncertain" &&
+          outbound.state !== "explicitly-discarded"
+        ) {
+          continue;
+        }
+        try {
+          this.#assertOutboundClaim(snapshot, outbound, claim);
+        } catch {
+          continue;
+        }
+        for (const recordId of outbound.sourceInboundRecordIds) {
+          const inbound = this.#getInbound(snapshot, recordId);
+          if (inbound.state === "completed") continue;
+          this.#assertClaim(snapshot, inbound, claim);
+          if (inbound.state !== "dispatching") {
+            throw new Error(
+              "Terminal recovery outbound source is not dispatching or completed",
+            );
+          }
+          for (const spool of inbound.spoolRefs) {
+            deleteAfterCommit.push(
+              makeBinaryPath(this.spoolDirectory, spool.spoolId),
+            );
+          }
+          deleteAfterCommit.push(
+            join(this.materializedDirectory, inbound.recordId),
+          );
+          inbound.spoolRefs = [];
+          inbound.state = "completed";
+          inbound.stateRevision = revision;
+          inbound.updatedAtMs = nowMs;
+          repaired += 1;
+        }
+      }
+      return repaired;
+    });
+  }
+
+  listRehydratableOutboundRecords(
+    claim: RecoveryIdentityClaim,
+  ): RecoveryOutboundDrainItem[] {
+    return withTelegramFileTransaction(`${this.rootPath}.transaction`, () => {
+      const snapshot = this.#readSnapshotForMutationLocked();
+      this.#assertActive(snapshot);
+      this.#authenticate(claim.identity);
+      const result: RecoveryOutboundDrainItem[] = [];
+      for (const record of snapshot.outbound) {
+        const rehydratable = record.state === "planned" ||
+          record.state === "pending" ||
+          (record.state === "retryable-pending" &&
+            record.automaticAttemptCount < RECOVERY_OUTBOUND_MAX_AUTOMATIC_STARTS &&
+            record.retryNotBeforeMs !== undefined);
+        if (!rehydratable) continue;
+        try {
+          this.#assertOutboundClaim(snapshot, record, claim);
+        } catch {
+          continue;
+        }
+        result.push(this.#readOutboundDrainItem(snapshot, record));
+      }
+      return result;
+    });
+  }
+
   listClaimableOutboundRecords(
     claim: RecoveryIdentityClaim,
   ): RecoveryOutboundDrainItem[] {
@@ -5722,6 +5840,9 @@ export class RecoveryStore {
             record.nextUnitIndex === finalApplicableTextIndex),
         ...(payload.guestQueryId
           ? { guestQueryId: payload.guestQueryId }
+          : {}),
+        ...(payload.guestStagingTarget
+          ? { guestStagingTarget: structuredClone(payload.guestStagingTarget) }
           : {}),
       },
     };

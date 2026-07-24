@@ -139,6 +139,69 @@ test("Profile-wide recovery downgrade fences follower and leader before quaranti
   }
 });
 
+test("Recovery downgrade suspends and drains outbound scheduling before failure resume", async () => {
+  const gate = new Recovery.RecoveryProfileOperationGate();
+  const inFlight = gate.enter("default");
+  assert.ok(inFlight);
+  const events: string[] = [];
+  let releaseDrain: (() => void) | undefined;
+  const drained = new Promise<void>((resolve) => {
+    releaseDrain = resolve;
+  });
+  const downgrade = BusLeader.createTelegramRecoveryDowngradeCoordinator<string>({
+    canCoordinate: () => true,
+    getCoordinationGeneration: () => "leader-epoch-drain",
+    getProfile: () => "default",
+    getFollowers: () => [],
+    getAuthSecret: () => "secret",
+    createRequestId: () => "leader:fence:drain",
+    gate,
+    preflight: () => ({ safe: true, blockerCount: 0 }),
+    beginStoreExclusive() {
+      events.push("store:exclusive");
+      throw new Error("exclusive failed");
+    },
+    quarantineStore() {
+      assert.fail("failed exclusive must not quarantine");
+    },
+    cancelStoreExclusive() {},
+    stopPolling() {
+      events.push("polling:stop");
+    },
+    async suspendRuntime() {
+      events.push("scheduler:suspend");
+      await drained;
+      events.push("scheduler:drained");
+    },
+    resumeRuntime() {
+      events.push("scheduler:resume");
+    },
+    createFenceGeneration: () => "fence-drain",
+  });
+
+  const attempt = downgrade("ctx");
+  for (
+    let index = 0;
+    index < 100 && !events.includes("scheduler:suspend");
+    index += 1
+  ) {
+    await waitForTimeout(1);
+  }
+  assert.deepEqual(events, ["polling:stop", "scheduler:suspend"]);
+  inFlight.release();
+  releaseDrain?.();
+  await assert.rejects(attempt, /exclusive failed/);
+  assert.deepEqual(events, [
+    "polling:stop",
+    "scheduler:suspend",
+    "scheduler:drained",
+    "store:exclusive",
+    "scheduler:resume",
+  ]);
+  assert.equal(gate.getState("default").phase, "active");
+  assert.ok(gate.enter("default"));
+});
+
 test("Poll supervisor terminal failure stops bus transport and releases the exact lease", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-poll-terminal-"));
   const socketPath = join(dir, "bus.sock");

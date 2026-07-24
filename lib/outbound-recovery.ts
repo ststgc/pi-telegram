@@ -5,10 +5,10 @@
  * one-unit Telegram execution; it does not own agent lifecycle or entrypoint wiring.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
-import { open } from "node:fs/promises";
-import { basename, isAbsolute } from "node:path";
+import { mkdir, open, unlink, writeFile } from "node:fs/promises";
+import { basename, isAbsolute, join } from "node:path";
 
 import {
   getTelegramGuestAttachmentTransport,
@@ -56,6 +56,7 @@ import {
   type TelegramSendRichMessageBody,
   type TelegramSentMessage,
 } from "./telegram-api.ts";
+import type { TelegramTarget } from "./target.ts";
 
 export interface TelegramDurableOutboundSourceDescriptor {
   path: string;
@@ -74,7 +75,9 @@ export interface TelegramDurableOutboundPlanOptions {
   queuedAttachments: readonly TelegramDurableOutboundSourceDescriptor[];
   generatedVoice?: readonly TelegramDurableOutboundSourceDescriptor[];
   automaticVoice?: boolean;
+  voiceFallbackToText?: boolean;
   guestQueryId?: string;
+  guestStagingTarget?: TelegramTarget;
 }
 
 export interface TelegramDurableOutboundPlannedIntent {
@@ -223,6 +226,9 @@ function planTelegramDurableOutboundFromReply(
   const textChunks = getTextChunks(reply.markdown, options.renderingMode);
 
   if (options.guestQueryId) {
+    if (!options.guestStagingTarget || options.guestStagingTarget.chatId < 1) {
+      throw new Error("Durable Guest outbound requires a private staging target");
+    }
     if (attachments.length > 1) {
       throw new Error("Durable Guest outbound supports one attachment");
     }
@@ -351,6 +357,7 @@ function planTelegramDurableOutboundFromReply(
             }
           : {}),
         guestQueryId: options.guestQueryId,
+        guestStagingTarget: options.guestStagingTarget,
       },
       spoolSources,
     };
@@ -675,9 +682,21 @@ export async function commitTelegramDurableOutbound(
   options: TelegramDurableOutboundPlanOptions,
   deps: TelegramDurableOutboundCommitDeps,
 ): Promise<RecoveryOutboundDrainItem> {
-  const semanticReply = planTelegramDurableOutboundReply(options.finalMarkdown, {
+  let semanticReply = planTelegramDurableOutboundReply(options.finalMarkdown, {
     automaticVoice: options.automaticVoice,
   });
+  if (options.voiceFallbackToText && semanticReply.voiceReplies.length > 0) {
+    const fallbackMarkdown = [
+      semanticReply.markdown,
+      ...semanticReply.voiceReplies.map((reply) => reply.text),
+    ].filter((part) => part.trim().length > 0).join("\n\n");
+    semanticReply = {
+      markdown: fallbackMarkdown,
+      buttons: semanticReply.buttons,
+      voiceReplies: [],
+      automaticVoice: false,
+    };
+  }
   const transformedReply = await transformTelegramDurableOutboundReply(
     semanticReply,
     deps.transformReply,
@@ -729,6 +748,7 @@ export interface TelegramDurableOutboundAdapterInput {
   replyToMessageId?: number;
   replyMarkup?: unknown;
   guestQueryId?: string;
+  guestStagingTarget?: TelegramTarget;
 }
 
 export interface TelegramDurableOutboundUnitAdapter {
@@ -1027,6 +1047,9 @@ export function createTelegramDurableOutboundUnitAdapter(
             unitDeps,
           );
         } else if (unit.kind === "guest-stage") {
+          if (!input.guestStagingTarget) {
+            throw new Error("Durable Guest staging target is missing");
+          }
           const fileField = unit.mediaKind === "photo"
             ? "photo"
             : unit.mediaKind === "audio"
@@ -1037,8 +1060,8 @@ export function createTelegramDurableOutboundUnitAdapter(
           const result = await unitDeps.sendMultipartBytes(
             unit.method,
             {
-              chat_id: String(input.identity.target.chatId),
-              ...getTelegramMultipartTargetFields(input.identity.target),
+              chat_id: String(input.guestStagingTarget.chatId),
+              ...getTelegramMultipartTargetFields(input.guestStagingTarget),
             },
             fileField,
             getSpoolBytes(input, unit.spoolRefIndex),
@@ -1077,13 +1100,16 @@ export function createTelegramDurableOutboundUnitAdapter(
             result: { kind: "guest-answer" },
           };
         } else if (unit.kind === "guest-cleanup") {
+          if (!input.guestStagingTarget) {
+            throw new Error("Durable Guest staging target is missing");
+          }
           const staging = findGuestStagingReceipt(
             input,
             unit.stageOperationId,
           );
           startMutation();
           await deps.deleteMessage(
-            input.identity.target.chatId,
+            input.guestStagingTarget.chatId,
             staging.stagingMessageId,
           );
           receipt = {
@@ -1159,6 +1185,9 @@ function buildTelegramDurableOutboundAdapterInput(
       : {}),
     ...(execution.guestQueryId
       ? { guestQueryId: execution.guestQueryId }
+      : {}),
+    ...(execution.guestStagingTarget
+      ? { guestStagingTarget: execution.guestStagingTarget }
       : {}),
   };
 }
@@ -1287,4 +1316,229 @@ export async function executeNextTelegramDurableOutboundUnit(
       ? deps.store.releaseOutboundUnitNotStarted(failureInput)
       : deps.store.recordOutboundSafeFailure(failureInput);
   return { record, outcome };
+}
+
+export interface TelegramDurableOutboundMultipartBytesSenderDeps {
+  tempDir: string;
+  callMultipart: (
+    method: string,
+    fields: Record<string, string>,
+    fileField: string,
+    filePath: string,
+    fileName: string,
+  ) => Promise<unknown>;
+}
+
+/** Materializes verified spool bytes only for the duration of the live upload. */
+export function createTelegramDurableOutboundMultipartBytesSender(
+  deps: TelegramDurableOutboundMultipartBytesSenderDeps,
+): TelegramOutboundBinaryReplyUnitDeps["sendMultipartBytes"] {
+  return async (method, fields, fileField, bytes, fileName) => {
+    await mkdir(deps.tempDir, { recursive: true, mode: 0o700 });
+    const path = join(
+      deps.tempDir,
+      `.outbox-${process.pid}-${randomUUID()}-${normalizePersistedFileName(fileName)}`,
+    );
+    await writeFile(path, bytes, { mode: 0o600, flag: "wx" });
+    try {
+      return await deps.callMultipart(
+        method,
+        fields,
+        fileField,
+        path,
+        fileName,
+      );
+    } finally {
+      await unlink(path).catch(() => {});
+    }
+  };
+}
+
+export interface TelegramDurableOutboundWorkerDeps {
+  getStore: () => TelegramDurableOutboundExecutorDeps["store"];
+  operationGate: {
+    enter(profile: string): { release(): void } | undefined;
+  };
+  adapter: TelegramDurableOutboundUnitAdapter;
+  createReplyMarkup?: TelegramDurableOutboundExecutorDeps["createReplyMarkup"];
+  recordOwnership?: TelegramDurableOutboundExecutorDeps["recordOwnership"];
+  onTerminal: (input: {
+    record: RecoveryOutboundRecord;
+    claim: RecoveryIdentityClaim;
+  }) => void | Promise<void>;
+  recordRuntimeEvent?: TelegramDurableOutboundExecutorDeps["recordRuntimeEvent"];
+  setTimer?: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
+  clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+  retryAfterFailureMs?: number;
+  startSuspended?: boolean;
+}
+
+export interface TelegramDurableOutboundWorker {
+  register(record: RecoveryOutboundRecord, claim: RecoveryIdentityClaim): void;
+  schedule(recordId: string): void;
+  suspend(): Promise<void>;
+  resume(): Promise<void>;
+  isIdle(): boolean;
+}
+
+interface TelegramDurableOutboundWorkerEntry {
+  record: RecoveryOutboundRecord;
+  claim: RecoveryIdentityClaim;
+  timer?: ReturnType<typeof setTimeout>;
+  running?: Promise<void>;
+}
+
+function isTelegramDurableOutboundTerminal(
+  state: RecoveryOutboundRecord["state"],
+): boolean {
+  return state === "delivered" ||
+    state === "delivery-uncertain" ||
+    state === "explicitly-discarded";
+}
+
+/**
+ * Serializes each record's one-unit claims, retains exact identity authority,
+ * and notifies queue ownership only after a durable terminal disposition.
+ */
+export function createTelegramDurableOutboundWorker(
+  deps: TelegramDurableOutboundWorkerDeps,
+): TelegramDurableOutboundWorker {
+  const entries = new Map<string, TelegramDurableOutboundWorkerEntry>();
+  const terminalTurnIds = new Set<string>();
+  const setTimer = deps.setTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
+  const clearTimer = deps.clearTimer ?? clearTimeout;
+  const retryAfterFailureMs = deps.retryAfterFailureMs ?? 1000;
+  let suspended = deps.startSuspended ?? false;
+  let schedulerGeneration = 0;
+
+  const notifyTerminal = async (
+    entry: TelegramDurableOutboundWorkerEntry,
+  ): Promise<void> => {
+    if (!isTelegramDurableOutboundTerminal(entry.record.state)) return;
+    if (terminalTurnIds.has(entry.record.turnId)) {
+      entries.delete(entry.record.recordId);
+      return;
+    }
+    await deps.onTerminal({ record: entry.record, claim: entry.claim });
+    terminalTurnIds.add(entry.record.turnId);
+    entries.delete(entry.record.recordId);
+  };
+
+  const scheduleEntry = (
+    entry: TelegramDurableOutboundWorkerEntry,
+    delayMs: number,
+  ): void => {
+    if (suspended || entry.running || entry.timer) return;
+    const generation = schedulerGeneration;
+    entry.timer = setTimer(() => {
+      entry.timer = undefined;
+      if (suspended || generation !== schedulerGeneration) return;
+      const lease = deps.operationGate.enter(entry.claim.identity.profile);
+      if (!lease) return;
+      let nextDelayMs: number | undefined;
+      const running = (async () => {
+        try {
+          if (isTelegramDurableOutboundTerminal(entry.record.state)) {
+            await notifyTerminal(entry);
+            return;
+          }
+          const result = await executeNextTelegramDurableOutboundUnit(
+            entry.record.recordId,
+            {
+              store: deps.getStore(),
+              claim: entry.claim,
+              adapter: deps.adapter,
+              createReplyMarkup: deps.createReplyMarkup,
+              recordOwnership: deps.recordOwnership,
+              recordRuntimeEvent: deps.recordRuntimeEvent,
+            },
+          );
+          entry.record = result.record;
+          if (isTelegramDurableOutboundTerminal(entry.record.state)) {
+            await notifyTerminal(entry);
+            return;
+          }
+          if (entry.record.state === "pending") {
+            nextDelayMs = 0;
+            return;
+          }
+          if (
+            entry.record.state === "retryable-pending" &&
+            entry.record.retryNotBeforeMs !== undefined
+          ) {
+            nextDelayMs = Math.max(
+              0,
+              entry.record.retryNotBeforeMs - Date.now(),
+            );
+          }
+        } catch (error) {
+          deps.recordRuntimeEvent?.("delivery", error, {
+            phase: "durable-outbox-worker",
+            recordId: entry.record.recordId,
+          });
+          nextDelayMs = retryAfterFailureMs;
+        } finally {
+          lease.release();
+        }
+      })();
+      entry.running = running.finally(() => {
+        entry.running = undefined;
+        if (nextDelayMs !== undefined) scheduleEntry(entry, nextDelayMs);
+      });
+    }, delayMs);
+    entry.timer.unref?.();
+  };
+
+  const runtime: TelegramDurableOutboundWorker = {
+    register(record, claim) {
+      const current = entries.get(record.recordId);
+      if (current) {
+        current.record = structuredClone(record);
+        current.claim = structuredClone(claim);
+        return;
+      }
+      entries.set(record.recordId, {
+        record: structuredClone(record),
+        claim: structuredClone(claim),
+      });
+    },
+    schedule(recordId) {
+      const entry = entries.get(recordId);
+      if (!entry) throw new Error("Unknown durable outbound worker record");
+      if (isTelegramDurableOutboundTerminal(entry.record.state)) {
+        scheduleEntry(entry, 0);
+        return;
+      }
+      const delayMs = entry.record.state === "retryable-pending" &&
+          entry.record.retryNotBeforeMs !== undefined
+        ? Math.max(0, entry.record.retryNotBeforeMs - Date.now())
+        : 0;
+      scheduleEntry(entry, delayMs);
+    },
+    async suspend() {
+      suspended = true;
+      schedulerGeneration += 1;
+      for (const entry of entries.values()) {
+        if (entry.timer) {
+          clearTimer(entry.timer);
+          entry.timer = undefined;
+        }
+      }
+      await Promise.all(
+        [...entries.values()].map((entry) => entry.running).filter(
+          (running): running is Promise<void> => running !== undefined,
+        ),
+      );
+    },
+    async resume() {
+      if (!suspended) return;
+      suspended = false;
+      schedulerGeneration += 1;
+      for (const entry of entries.values()) runtime.schedule(entry.record.recordId);
+    },
+    isIdle() {
+      return [...entries.values()].every((entry) => !entry.timer && !entry.running);
+    },
+  };
+  return runtime;
 }

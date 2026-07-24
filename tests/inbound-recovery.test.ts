@@ -36,6 +36,7 @@ import {
   type TelegramInboundRecoveryUpdate,
 } from "../lib/inbound-recovery.ts";
 import { createTelegramMediaGroupController } from "../lib/media.ts";
+import { commitTelegramDurableOutbound } from "../lib/outbound-recovery.ts";
 import { runTelegramPollLoop } from "../lib/polling.ts";
 import {
   openRecoveryStore,
@@ -255,6 +256,19 @@ function createHarness(
       return {
         profile: "default",
         target,
+        owner: {
+          kind: "leader",
+          ownerId: "instance-a",
+          leaderEpoch: "epoch-a",
+        },
+        sessionGeneration: generation,
+      };
+    },
+    resolveOperatorIdentity() {
+      if (!owns) return undefined;
+      return {
+        profile: "default",
+        target: { chatId: 7 },
         owner: {
           kind: "leader",
           ownerId: "instance-a",
@@ -539,7 +553,10 @@ test(
     );
     assert.equal(harness.runtime.claimTurnDispatch(durableTurn), true);
     harness.loseOwnership();
-    harness.runtime.completeTurn(durableTurn);
+    assert.throws(
+      () => harness.runtime.completeTurn(durableTurn),
+      /not currently authenticated/,
+    );
     const record = harness.inspect().getStatus().items[0];
     assert.ok(record);
     assert.notEqual(record.state, "completed");
@@ -1086,6 +1103,277 @@ test(
     } finally {
       rmSync(unclaimedDir, { force: true, recursive: true });
     }
+  }),
+);
+
+async function seedPendingOutbound(
+  runtime: ReturnType<typeof createHarness>["runtime"],
+  identity: RecoveryIdentity,
+  updateId: number,
+) {
+  const store = runtime.getOutboundStore();
+  const inbound = store.observeInbound(updateId, identity);
+  store.admitInbound({
+    recordId: inbound.recordId,
+    payload: Buffer.from(`outbound source ${updateId}`),
+  });
+  store.markPreDispatch(inbound.recordId, { identity });
+  store.markDispatching(inbound.recordId, { identity });
+  const item = await commitTelegramDurableOutbound({
+    intentId: `intent-${updateId}`,
+    turnId: inbound.turnId,
+    sourceInboundRecordIds: [inbound.recordId],
+    claim: { identity },
+    replyToMessageId: 10,
+    renderingMode: "rich",
+    finalMarkdown: `final ${updateId}`,
+    queuedAttachments: [],
+  }, {
+    store,
+    transformReply: async (text) => text,
+  });
+  return {
+    store,
+    inbound,
+    record: store.activateOutbound(item.record.recordId, { identity }),
+  };
+}
+
+test(
+  "outbound rehydrate claims exact leader and follower handoffs while full follower restart stays unclaimed",
+  withTempAgentDir(async (agentDir) => {
+    for (const owner of [
+      {
+        kind: "leader" as const,
+        ownerId: "instance-a",
+        leaderEpoch: "epoch-a",
+      },
+      {
+        kind: "manual-follower" as const,
+        ownerId: "manual-a",
+        registrationGeneration: "registration-a",
+      },
+    ]) {
+      const isolatedDir = mkdtempSync(join(agentDir, `${owner.kind}-`));
+      let generation = 1;
+      const ctx: TestContext = { generation };
+      const currentIdentity = (): RecoveryIdentity => ({
+        profile: "default",
+        target: { chatId: 7, threadId: owner.kind === "leader" ? 70 : 71 },
+        owner,
+        sessionGeneration: generation,
+      });
+      const runtime = createInboundRecoveryRuntime<
+        TelegramInboundRecoveryUpdate,
+        TestContext
+      >({
+        agentDir: isolatedDir,
+        getProfile: () => "default",
+        getAllowedUserId: () => 7,
+        getCurrentInstanceId: () => owner.ownerId,
+        getSessionGeneration: () => generation,
+        isSessionActive: (candidate, expected) =>
+          candidate === ctx && expected === generation,
+        resolveCurrentIdentity: (target) =>
+          target.chatId === 7 &&
+              target.threadId === currentIdentity().target.threadId
+            ? currentIdentity()
+            : undefined,
+        resolveOperatorIdentity: () => currentIdentity(),
+        isIdentityAuthenticated: (candidate) =>
+          JSON.stringify(candidate) === JSON.stringify(currentIdentity()),
+      });
+      const seeded = await seedPendingOutbound(
+        runtime,
+        currentIdentity(),
+        owner.kind === "leader" ? 201 : 202,
+      );
+      assert.equal(runtime.publishSessionHandoffs(2), 1);
+      generation = 2;
+      ctx.generation = 2;
+      const scheduled: Array<{ state: string; identity: RecoveryIdentity }> = [];
+      await runtime.rehydrateOutbound(ctx, (item, claim) => {
+        scheduled.push({ state: item.record.state, identity: claim.identity });
+      });
+      assert.deepEqual(scheduled, [{
+        state: "pending",
+        identity: currentIdentity(),
+      }]);
+      assert.equal(
+        seeded.store.listClaimableOutboundRecords({ identity: currentIdentity() })
+          .length,
+        1,
+      );
+    }
+
+    const restartDir = mkdtempSync(join(agentDir, "follower-restart-"));
+    const oldIdentity: RecoveryIdentity = {
+      profile: "default",
+      target: { chatId: 7, threadId: 72 },
+      owner: {
+        kind: "manual-follower",
+        ownerId: "manual-restart",
+        registrationGeneration: "registration-old",
+      },
+      sessionGeneration: 1,
+    };
+    const seedRuntime = createInboundRecoveryRuntime<
+      TelegramInboundRecoveryUpdate,
+      TestContext
+    >({
+      agentDir: restartDir,
+      getProfile: () => "default",
+      getAllowedUserId: () => 7,
+      getSessionGeneration: () => 1,
+      isSessionActive: () => true,
+      resolveCurrentIdentity: () => oldIdentity,
+      resolveOperatorIdentity: () => oldIdentity,
+      isIdentityAuthenticated: (candidate) =>
+        JSON.stringify(candidate) === JSON.stringify(oldIdentity),
+    });
+    const seeded = await seedPendingOutbound(seedRuntime, oldIdentity, 203);
+    const restartedIdentity: RecoveryIdentity = {
+      ...oldIdentity,
+      owner: {
+        kind: "manual-follower",
+        ownerId: "manual-restart",
+        registrationGeneration: "registration-new",
+      },
+    };
+    const restartedCtx: TestContext = { generation: 1 };
+    const restarted = createInboundRecoveryRuntime<
+      TelegramInboundRecoveryUpdate,
+      TestContext
+    >({
+      agentDir: restartDir,
+      getProfile: () => "default",
+      getAllowedUserId: () => 7,
+      getSessionGeneration: () => 1,
+      isSessionActive: (candidate) => candidate === restartedCtx,
+      resolveCurrentIdentity: () => restartedIdentity,
+      resolveOperatorIdentity: () => restartedIdentity,
+      isIdentityAuthenticated: (candidate) =>
+        JSON.stringify(candidate) === JSON.stringify(restartedIdentity),
+    });
+    let restartSchedules = 0;
+    await restarted.rehydrateOutbound(restartedCtx, () => {
+      restartSchedules += 1;
+    });
+    assert.equal(restartSchedules, 0);
+    assert.equal(
+      seeded.store.listClaimableOutboundRecords({ identity: oldIdentity }).length,
+      1,
+    );
+  }),
+);
+
+test(
+  "startup outbound rehydrate resumes pending, skips confirmed resend, and leaves reopened sending uncertain",
+  withTempAgentDir(async (agentDir) => {
+    const pendingHarness = createHarness(mkdtempSync(join(agentDir, "pending-")));
+    const pending = await seedPendingOutbound(
+      pendingHarness.runtime,
+      pendingHarness.identity,
+      211,
+    );
+    const startupEvents: string[] = [];
+    await pendingHarness.runtime.rehydrateOutbound(
+      pendingHarness.ctx,
+      (item) => {
+        startupEvents.push(`outbound:${item.record.state}`);
+      },
+    );
+    await pendingHarness.runtime.rehydrate(
+      pendingHarness.ctx,
+      async () => {
+        startupEvents.push("inbound");
+        return { kind: "completed", reason: "ignored" };
+      },
+      () => startupEvents.push("queue"),
+    );
+    assert.deepEqual(startupEvents, ["outbound:pending"]);
+
+    const future = await seedPendingOutbound(
+      pendingHarness.runtime,
+      pendingHarness.identity,
+      213,
+    );
+    const futureClaim = future.store.claimOutboundUnit({
+      recordId: future.record.recordId,
+      claim: { identity: pendingHarness.identity },
+    });
+    future.store.recordOutboundSafeFailure({
+      recordId: future.record.recordId,
+      claim: { identity: pendingHarness.identity },
+      attemptId: futureClaim.record.activeUnit!.attemptId,
+    });
+    const futureSchedules: string[] = [];
+    await pendingHarness.runtime.rehydrateOutbound(pendingHarness.ctx, (item) => {
+      if (item.record.recordId === future.record.recordId) {
+        futureSchedules.push(item.record.state);
+      }
+    });
+    assert.deepEqual(futureSchedules, ["retryable-pending"]);
+
+    const confirmed = pending.store.claimOutboundUnit({
+      recordId: pending.record.recordId,
+      claim: { identity: pendingHarness.identity },
+    });
+    pending.store.recordOutboundReceipt({
+      recordId: confirmed.record.recordId,
+      claim: { identity: pendingHarness.identity },
+      attemptId: confirmed.record.activeUnit!.attemptId,
+      operationId: "outbound-unit-0000",
+      method: "sendRichMessage",
+      messageId: 700,
+    });
+    let confirmedSchedules = 0;
+    await pendingHarness.runtime.rehydrateOutbound(pendingHarness.ctx, (item) => {
+      if (item.record.recordId === confirmed.record.recordId) {
+        confirmedSchedules += 1;
+      }
+    });
+    assert.equal(confirmedSchedules, 0);
+
+    const sendingAgentDir = mkdtempSync(join(agentDir, "sending-"));
+    const sendingHarness = createHarness(sendingAgentDir);
+    const sending = await seedPendingOutbound(
+      sendingHarness.runtime,
+      sendingHarness.identity,
+      212,
+    );
+    sending.store.claimOutboundUnit({
+      recordId: sending.record.recordId,
+      claim: { identity: sendingHarness.identity },
+    });
+    const reopenedRuntime = createInboundRecoveryRuntime<
+      TelegramInboundRecoveryUpdate,
+      TestContext
+    >({
+      agentDir: sendingAgentDir,
+      getProfile: () => "default",
+      getAllowedUserId: () => 7,
+      getSessionGeneration: () => 1,
+      isSessionActive: (candidate) => candidate === sendingHarness.ctx,
+      resolveCurrentIdentity: () => sendingHarness.identity,
+      resolveOperatorIdentity: () => sendingHarness.identity,
+      isIdentityAuthenticated: (candidate) =>
+        JSON.stringify(candidate) === JSON.stringify(sendingHarness.identity),
+    });
+    let sendingSchedules = 0;
+    await reopenedRuntime.rehydrateOutbound(sendingHarness.ctx, () => {
+      sendingSchedules += 1;
+    });
+    assert.equal(sendingSchedules, 0);
+    const status = reopenedRuntime.getOutboundStore().getStatus();
+    assert.equal(
+      status.items.filter(
+        (item) =>
+          item.family === "outbound" && item.state === "delivery-uncertain",
+      ).length,
+      1,
+    );
+    assert.equal(status.counts.completed, 1);
   }),
 );
 

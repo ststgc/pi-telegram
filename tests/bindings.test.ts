@@ -119,6 +119,7 @@ test("Command binding does not expose a thread rename tool", () => {
       start: async () => ({ ok: true }),
       stop: async () => undefined,
     },
+    resumeDurableOutboundWorker: async () => {},
     getStatusLines: () => [],
     buttonActionStore: { register: () => "button-action" },
     sendMarkdownReply: async () => 1,
@@ -178,6 +179,7 @@ test("Command binding rejects a missing profile without stopping active polling"
       events.push("status");
     },
     recordRuntimeEvent: () => {},
+    resumeDurableOutboundWorker: async () => {},
   } as unknown as Parameters<typeof registerTelegramCommandsAndTools>[0]);
   const connect = harness.commands.get("telegram-connect") as {
     handler: (args: string, ctx: ExtensionContext) => Promise<void>;
@@ -238,6 +240,9 @@ test("Named profile connect completes old teardown before activating new identit
         stopCompleted = true;
       },
     },
+    resumeDurableOutboundWorker: async () => {
+      events.push("worker:resume");
+    },
     getStatusLines: () => [],
     buttonActionStore: { register: () => "button-action" },
     sendMarkdownReply: async () => 1,
@@ -262,6 +267,7 @@ test("Named profile connect completes old teardown before activating new identit
     "stop:active",
     "activate:work",
     "start:work",
+    "worker:resume",
     "status",
   ]);
 });
@@ -323,6 +329,7 @@ test("Named profile setup cancellation preserves the active runtime", async () =
       events.push("status");
     },
     recordRuntimeEvent: () => {},
+    resumeDurableOutboundWorker: async () => {},
   } as unknown as Parameters<typeof registerTelegramCommandsAndTools>[0]);
   const setupCommand = harness.commands.get("telegram-setup") as {
     handler: (args: string, ctx: ExtensionContext) => Promise<void>;
@@ -347,7 +354,8 @@ test("Named profile setup cancellation preserves the active runtime", async () =
 test("Lifecycle binding delegates shutdown to composed session runtime", async () => {
   const events: string[] = [];
   const harness = createBindingApiHarness();
-  const deps = {
+  const runtime = Runtime.createTelegramBridgeRuntime();
+  const deps: Parameters<typeof registerTelegramLifecycleRuntimeHooks>[0] = {
     pi: harness.api,
     activityRuntime: {
       recordInputSource: () => {},
@@ -375,68 +383,82 @@ test("Lifecycle binding delegates shutdown to composed session runtime", async (
         events.push("model-select");
       },
     },
-    configStore: { get: () => ({}), getOutboundHandlers: () => [] },
-    abort: { setHandler: () => {}, clearHandler: () => {} },
-    typing: { stop: () => {}, waitForIdle: async () => {} },
-    progress: {
-      start: () => ({ active: true, chatId: 1, text: "", updatedAtMs: 0 }),
-      update: () => undefined,
-      stop: () => undefined,
-      get: () => undefined,
+    configStore: {
+      get: () => ({}),
+      getOutboundHandlers: () => [],
+      hasBotToken: () => false,
+      load: async () => {},
     },
-    lifecycle: {
-      resetActiveToolExecutions: () => {},
-      clearDispatchPending: () => {},
-      hasDispatchPending: () => false,
-      setFoldQueuedPromptsIntoHistory: () => {},
-      shouldFoldQueuedPromptsIntoHistory: () => false,
-      getActiveToolExecutions: () => 0,
-      setActiveToolExecutions: () => {},
-      setCompactionInProgress: () => {},
-    },
+    abort: runtime.abort,
+    typing: runtime.typing,
+    lifecycle: runtime.lifecycle,
     activeTurnRuntime: {
       clear: () => {},
       has: () => false,
       set: () => {},
       get: () => undefined,
+      getChatId: () => undefined,
+      getTarget: () => undefined,
+      getReplyToMessageId: () => undefined,
+      getGuestQueryId: () => undefined,
+      getSourceMessageIds: () => undefined,
     },
     telegramQueueStore: {
       getQueuedItems: () => [],
       setQueuedItems: () => {},
     },
     modelSwitchController: {
+      canOfferInFlightSwitch: () => false,
+      stagePendingSwitch: () => {},
       clearPendingSwitch: () => {},
-      triggerPendingAbort: () => {},
+      queueContinuation: () => {},
+      triggerPendingAbort: () => false,
+      restartInterruptedTurn: () => false,
     },
     previewRuntime: {
-      resetState: () => undefined,
-      clear: () => {},
+      getState: () => undefined,
+      setState: () => {},
       setPendingText: () => {},
+      createState: () => ({ mode: "draft", pendingText: "", lastSentText: "" }),
+      resetState: () => {},
+      invalidate: () => {},
+      clear: async () => {},
+      flush: async () => {},
+      scheduleFlush: () => {},
+      finalize: async () => true,
+      finalizeMarkdown: async () => true,
       onMessageStart: async () => {},
       onMessageUpdate: async () => {},
     },
     promptDispatchRuntime: {
-      startTypingLoop: () => events.push("typing:start"),
+      startTypingLoop: () => {
+        events.push("typing:start");
+      },
+      onPromptDispatchStart: () => {},
+      onPromptDispatchFailure: () => {},
     },
-    deferredQueueDispatchRuntime: { request: () => {} },
+    deferredQueueDispatchRuntime: {
+      bind: () => {},
+      unbind: () => {},
+      isBound: () => true,
+      getGeneration: () => 1,
+      isGenerationActive: () => true,
+      request: () => {},
+    },
     lockOwnershipGuard: { ownsContext: () => false },
-    buttonActionStore: { register: () => "button-action" },
-    callMultipart: async () => ({ ok: true }),
-    sendChatAction: async () => ({ ok: true }),
-    sendRecordVoiceAction: async () => ({ ok: true }),
-    sendMarkdownReply: async () => ({ ok: true }),
-    sendTextReply: async () => ({ ok: true }),
-    editInteractiveMessage: async () => undefined,
-    deleteMessage: async () => undefined,
     dispatchNextQueuedTelegramTurn: () => {},
-    answerGuestQuery: async () => ({ ok: true }),
-    sendGuestReply: async () => ({ ok: true }),
-    finalizeMarkdownPreview: async () => undefined,
+    durableOutbound: {
+      handoffActiveTurn: async () => ({ startDelivery: () => {} }),
+      completeTurnWithoutDelivery: () => {},
+      markTurnExecutionUncertain: () => {},
+    },
+    proactivePushTargetGetter: () => undefined,
     isProactivePushEnabled: () => false,
     canSendAgentActivity: () => false,
+    isSessionContextActive: () => true,
     updateStatus: () => {},
     recordRuntimeEvent: () => {},
-  } as unknown as Parameters<typeof registerTelegramLifecycleRuntimeHooks>[0];
+  };
 
   registerTelegramLifecycleRuntimeHooks(deps);
   await getRequiredBindingHandler(harness.handlers, "session_before_compact")(
@@ -456,7 +478,7 @@ test("Lifecycle binding routes native typing, previews, and normalized activity"
   const harness = createBindingApiHarness();
   const runtime = Runtime.createTelegramBridgeRuntime();
   let activeTurn = false;
-  const deps = {
+  const deps: Parameters<typeof registerTelegramLifecycleRuntimeHooks>[0] = {
     pi: harness.api,
     activityRuntime: {
       recordInputSource: (source: string) =>
@@ -496,6 +518,7 @@ test("Lifecycle binding routes native typing, previews, and normalized activity"
       get: () => ({}),
       getOutboundHandlers: () => [],
       hasBotToken: () => true,
+      load: async () => {},
     },
     abort: runtime.abort,
     typing: runtime.typing,
@@ -506,58 +529,90 @@ test("Lifecycle binding routes native typing, previews, and normalized activity"
       set: () => {},
       get: () =>
         activeTurn
-          ? { chatId: 42, target: { chatId: 42, threadId: 9 } }
+          ? {
+              kind: "prompt",
+              chatId: 42,
+              target: { chatId: 42, threadId: 9 },
+              replyToMessageId: 8,
+              sourceMessageIds: [8],
+              queueOrder: 1,
+              queueLane: "default",
+              laneOrder: 1,
+              queuedAttachments: [],
+              content: [{ type: "text", text: "prompt" }],
+              historyText: "prompt",
+              statusSummary: "prompt",
+            }
           : undefined,
+      getChatId: () => activeTurn ? 42 : undefined,
+      getTarget: () => activeTurn ? { chatId: 42, threadId: 9 } : undefined,
+      getReplyToMessageId: () => activeTurn ? 8 : undefined,
+      getGuestQueryId: () => undefined,
+      getSourceMessageIds: () => activeTurn ? [8] : undefined,
     },
     telegramQueueStore: { getQueuedItems: () => [], setQueuedItems: () => {} },
     modelSwitchController: {
+      canOfferInFlightSwitch: () => false,
+      stagePendingSwitch: () => {},
       clearPendingSwitch: () => {},
-      triggerPendingAbort: () => {},
+      queueContinuation: () => {},
+      triggerPendingAbort: () => false,
+      restartInterruptedTurn: () => false,
     },
     previewRuntime: {
-      resetState: () => undefined,
-      clear: () => {},
+      getState: () => undefined,
+      setState: () => {},
       setPendingText: () => {},
-      onMessageStart: async () => events.push("preview:start"),
-      onMessageUpdate: async () => events.push("preview:update"),
+      createState: () => ({ mode: "draft", pendingText: "", lastSentText: "" }),
+      resetState: () => {},
+      invalidate: () => {},
+      clear: async () => {},
+      flush: async () => {},
+      scheduleFlush: () => {},
+      finalize: async () => true,
+      finalizeMarkdown: async () => true,
+      onMessageStart: async () => {
+        events.push("preview:start");
+      },
+      onMessageUpdate: async () => {
+        events.push("preview:update");
+      },
     },
     promptDispatchRuntime: {
       startTypingLoop: (
         _ctx: ExtensionContext,
         chatId?: number,
         options?: { target?: { threadId?: number } },
-      ) =>
+      ) => {
         events.push(
           `typing:${chatId ?? "none"}:${options?.target?.threadId ?? "all"}`,
-        ),
+        );
+      },
+      onPromptDispatchStart: () => {},
+      onPromptDispatchFailure: () => {},
     },
-    deferredQueueDispatchRuntime: { request: () => {} },
+    deferredQueueDispatchRuntime: {
+      bind: () => {},
+      unbind: () => {},
+      isBound: () => true,
+      getGeneration: () => 1,
+      isGenerationActive: () => true,
+      request: () => {},
+    },
     lockOwnershipGuard: { ownsContext: () => false },
-    buttonActionStore: { register: () => "button-action" },
-    callMultipart: async () => ({ ok: true }),
-    sendChatAction: async () => ({ ok: true }),
-    sendRecordVoiceAction: async () => ({ ok: true }),
-    sendMarkdownReply: async (
-      _chatId: number,
-      _replyTo: number | undefined,
-      text: string,
-    ) => {
-      events.push(`send:${text}`);
-      return 77;
-    },
-    sendTextReply: async () => ({ ok: true }),
-    editInteractiveMessage: async () => events.push("edit"),
-    deleteMessage: async () => undefined,
     dispatchNextQueuedTelegramTurn: () => {},
-    answerGuestQuery: async () => ({ ok: true }),
-    sendGuestReply: async () => ({ ok: true }),
-    finalizeMarkdownPreview: async () => undefined,
+    durableOutbound: {
+      handoffActiveTurn: async () => ({ startDelivery: () => {} }),
+      completeTurnWithoutDelivery: () => {},
+      markTurnExecutionUncertain: () => {},
+    },
     proactivePushTargetGetter: () => ({ chatId: 42, threadId: 8 }),
     isProactivePushEnabled: () => false,
     canSendAgentActivity: () => true,
+    isSessionContextActive: () => true,
     updateStatus: () => {},
     recordRuntimeEvent: () => {},
-  } as unknown as Parameters<typeof registerTelegramLifecycleRuntimeHooks>[0];
+  };
   registerTelegramLifecycleRuntimeHooks(deps);
 
   await getRequiredBindingHandler(harness.handlers, "agent_start")(

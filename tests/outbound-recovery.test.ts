@@ -15,6 +15,7 @@ import test from "node:test";
 import {
   commitTelegramDurableOutbound,
   createTelegramDurableOutboundUnitAdapter,
+  createTelegramDurableOutboundWorker,
   executeNextTelegramDurableOutboundUnit,
   planTelegramDurableOutbound,
   readTelegramDurableOutboundSource,
@@ -24,6 +25,7 @@ import {
 } from "../lib/outbound-recovery.ts";
 import {
   openRecoveryStore,
+  RecoveryProfileOperationGate,
   RecoveryQuotaExceededError,
   type RecoveryIdentity,
   type RecoveryOutboundUnit,
@@ -267,11 +269,23 @@ test("durable outbound planner preserves generated voice and Guest precedence", 
   const guestAttachment = planTelegramDurableOutbound(baseOptions(harnessView, {
     replyToMessageId: 0,
     guestQueryId: "guest-query-1",
+    guestStagingTarget: { chatId: 840585 },
     finalMarkdown: "Guest caption.",
     queuedAttachments: [
       { path: "/private/source/guest.mp3", fileName: "guest.mp3" },
     ],
   }));
+  assert.deepEqual(guestAttachment.recoveryPlan.guestStagingTarget, {
+    chatId: 840585,
+  });
+  assert.throws(
+    () => planTelegramDurableOutbound(baseOptions(harnessView, {
+      replyToMessageId: 0,
+      guestQueryId: "guest-query-without-private-stage",
+      finalMarkdown: "Guest answer.",
+    })),
+    /private staging target/,
+  );
   assert.deepEqual(
     guestAttachment.recoveryPlan.units.map((unit) => [unit.kind, unit.method]),
     [
@@ -297,6 +311,7 @@ test("durable outbound planner preserves generated voice and Guest precedence", 
   const guestAttachmentWins = planTelegramDurableOutbound(baseOptions(harnessView, {
     replyToMessageId: 0,
     guestQueryId: "guest-query-attachment-wins",
+    guestStagingTarget: { chatId: 840585 },
     finalMarkdown: "Guest caption.\n\n<!-- telegram_voice: Ignored voice. -->",
     queuedAttachments: [
       { path: "/private/source/guest.pdf", fileName: "guest.pdf" },
@@ -308,6 +323,7 @@ test("durable outbound planner preserves generated voice and Guest precedence", 
   const guestVoice = planTelegramDurableOutbound(baseOptions(harnessView, {
     replyToMessageId: 0,
     guestQueryId: "guest-query-2",
+    guestStagingTarget: { chatId: 840585 },
     finalMarkdown: "Speak automatically.",
     automaticVoice: true,
     generatedVoice: [
@@ -345,6 +361,7 @@ test("durable planner rejects path-like filenames and caps Guest captions by cod
   const guest = planTelegramDurableOutbound(baseOptions(harnessView, {
     replyToMessageId: 0,
     guestQueryId: "guest-caption-limit",
+    guestStagingTarget: { chatId: 840585 },
     finalMarkdown: caption,
     queuedAttachments: [{ path: "/private/source/file.pdf", fileName: "file.pdf" }],
   }));
@@ -737,14 +754,17 @@ test("one-unit adapter executes attachment, voice, and Guest branches exactly on
       operationId: "guest-text",
       method: "answerGuestQuery",
       markdown: "Guest answer",
-    }, { guestQueryId: "guest-query" })),
+    }, {
+      guestQueryId: "guest-query",
+      guestStagingTarget: { chatId: 840585 },
+    })),
     { kind: "committed", method: "answerGuestQuery" },
   );
   assert.deepEqual(guestText.calls, ["answerGuestQuery"]);
 
   const guestStage = createUnitAdapterHarness({
-    sendMultipartBytes: async (method) => {
-      guestStage.calls.push(method);
+    sendMultipartBytes: async (method, fields) => {
+      guestStage.calls.push(`${method}:${fields.chat_id}`);
       return { message_id: 110, voice: { file_id: "voice-file" } };
     },
   });
@@ -756,7 +776,10 @@ test("one-unit adapter executes attachment, voice, and Guest branches exactly on
       spoolRefIndex: 0,
       fileName: "guest.ogg",
       mediaKind: "voice",
-    }, { spool: [Buffer.from("guest voice")] })),
+    }, {
+      spool: [Buffer.from("guest voice")],
+      guestStagingTarget: { chatId: 840585 },
+    })),
     {
       kind: "committed",
       method: "sendVoice",
@@ -769,7 +792,7 @@ test("one-unit adapter executes attachment, voice, and Guest branches exactly on
       },
     },
   );
-  assert.deepEqual(guestStage.calls, ["sendVoice"]);
+  assert.deepEqual(guestStage.calls, ["sendVoice:840585"]);
 
   const stageReceipt = {
     unitIndex: 0,
@@ -793,7 +816,11 @@ test("one-unit adapter executes attachment, voice, and Guest branches exactly on
       stageOperationId: "guest-stage",
       fileName: "guest.ogg",
       mediaKind: "voice",
-    }, { guestQueryId: "guest-query", receipts: [stageReceipt] })),
+    }, {
+      guestQueryId: "guest-query",
+      guestStagingTarget: { chatId: 840585 },
+      receipts: [stageReceipt],
+    })),
     {
       kind: "committed",
       method: "answerGuestQuery",
@@ -809,7 +836,10 @@ test("one-unit adapter executes attachment, voice, and Guest branches exactly on
       operationId: "guest-cleanup",
       method: "deleteMessage",
       stageOperationId: "guest-stage",
-    }, { receipts: [stageReceipt] })),
+    }, {
+      guestStagingTarget: { chatId: 840585 },
+      receipts: [stageReceipt],
+    })),
     {
       kind: "committed",
       method: "deleteMessage",
@@ -1450,6 +1480,7 @@ test("Guest media persists staged file ids across answer and cleanup reopen boun
       baseOptions(harness, {
         replyToMessageId: 0,
         guestQueryId: "guest-query",
+        guestStagingTarget: { chatId: 840585 },
         finalMarkdown: "Guest answer.",
         queuedAttachments: [{ path: sourcePath, fileName: "guest.pdf" }],
       }),
@@ -1514,7 +1545,7 @@ test("Guest media persists staged file ids across answer and cleanup reopen boun
           caption: "Guest answer.",
         },
       },
-      { phase: "cleanup", chatId: 100, messageId: 701 },
+      { phase: "cleanup", chatId: 840585, messageId: 701 },
     ]);
     assert.deepEqual(third.record.unitProgress.map((progress) => [
       progress.unitIndex,
@@ -1539,6 +1570,7 @@ test("Guest media faults are phase-exact across reopen and ambiguity never selec
       baseOptions(harness, {
         replyToMessageId: 0,
         guestQueryId: "guest-query",
+        guestStagingTarget: { chatId: 840585 },
         finalMarkdown: "Guest fallback.",
         queuedAttachments: [{ path: sourcePath, fileName: "guest.pdf" }],
       }),
@@ -1752,5 +1784,154 @@ test("Guest media faults are phase-exact across reopen and ambiguity never selec
     } finally {
       await removeHarness(harness);
     }
+  }
+});
+
+
+test("durable worker advances terminal disposition once and never advances registered pending or sending", async () => {
+  const harness = await createHarness();
+  try {
+    const committed = await commitTelegramDurableOutbound(
+      baseOptions(harness),
+      { store: harness.store, transformReply: identityTransform },
+    );
+    const terminalCallbacks: string[] = [];
+    const worker = createTelegramDurableOutboundWorker({
+      getStore: () => harness.store,
+      operationGate: new RecoveryProfileOperationGate(),
+      adapter: createUnitAdapterHarness().adapter,
+      onTerminal: ({ record }) => {
+        terminalCallbacks.push(record.recordId);
+      },
+      startSuspended: false,
+    });
+    const pending = harness.store.activateOutbound(
+      committed.record.recordId,
+      { identity: IDENTITY },
+    );
+    worker.register(pending, { identity: IDENTITY });
+    worker.register({
+      ...pending,
+      recordId: "synthetic-sending",
+      state: "sending",
+      activeUnit: {
+        unitIndex: pending.nextUnitIndex,
+        attemptId: "attempt-sending",
+        startedAtMs: pending.updatedAtMs,
+      },
+      automaticAttemptCount: 1,
+    }, { identity: IDENTITY });
+    assert.deepEqual(terminalCallbacks, []);
+
+    const delivered = {
+      ...pending,
+      recordId: "terminal-a",
+      state: "delivered" as const,
+    };
+    worker.register(delivered, { identity: IDENTITY });
+    worker.register(
+      { ...delivered, recordId: "terminal-b" },
+      { identity: IDENTITY },
+    );
+    worker.schedule("terminal-a");
+    worker.schedule("terminal-b");
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(terminalCallbacks, ["terminal-a"]);
+  } finally {
+    await removeHarness(harness);
+  }
+});
+
+test("durable worker suspend drains an in-flight unit and resume restarts suspended pending work", async () => {
+  const drainingHarness = await createHarness();
+  try {
+    const committed = await commitTelegramDurableOutbound(
+      baseOptions(drainingHarness),
+      { store: drainingHarness.store, transformReply: identityTransform },
+    );
+    const pending = drainingHarness.store.activateOutbound(
+      committed.record.recordId,
+      { identity: IDENTITY },
+    );
+    let releaseSend: (() => void) | undefined;
+    const sendBlocked = new Promise<void>((resolve) => {
+      releaseSend = resolve;
+    });
+    let sendStarted = false;
+    const adapter = createUnitAdapterHarness({
+      sendRichMessage: async () => {
+        sendStarted = true;
+        await sendBlocked;
+        return { message_id: 501 };
+      },
+    }).adapter;
+    let terminalCount = 0;
+    const worker = createTelegramDurableOutboundWorker({
+      getStore: () => drainingHarness.store,
+      operationGate: new RecoveryProfileOperationGate(),
+      adapter,
+      onTerminal: () => {
+        terminalCount += 1;
+      },
+    });
+    worker.register(pending, { identity: IDENTITY });
+    worker.schedule(pending.recordId);
+    for (let attempt = 0; attempt < 100 && !sendStarted; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(sendStarted, true);
+    let suspendFinished = false;
+    const suspending = worker.suspend().then(() => {
+      suspendFinished = true;
+    });
+    await Promise.resolve();
+    assert.equal(suspendFinished, false);
+    releaseSend?.();
+    await suspending;
+    assert.equal(suspendFinished, true);
+    assert.equal(terminalCount, 1);
+    assert.equal(worker.isIdle(), true);
+  } finally {
+    await removeHarness(drainingHarness);
+  }
+
+  const resumeHarness = await createHarness();
+  try {
+    const committed = await commitTelegramDurableOutbound(
+      baseOptions(resumeHarness),
+      { store: resumeHarness.store, transformReply: identityTransform },
+    );
+    const pending = resumeHarness.store.activateOutbound(
+      committed.record.recordId,
+      { identity: IDENTITY },
+    );
+    let sends = 0;
+    let terminalCount = 0;
+    const worker = createTelegramDurableOutboundWorker({
+      getStore: () => resumeHarness.store,
+      operationGate: new RecoveryProfileOperationGate(),
+      adapter: createUnitAdapterHarness({
+        sendRichMessage: async () => {
+          sends += 1;
+          return { message_id: 502 };
+        },
+      }).adapter,
+      onTerminal: () => {
+        terminalCount += 1;
+      },
+      startSuspended: true,
+    });
+    worker.register(pending, { identity: IDENTITY });
+    worker.schedule(pending.recordId);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(sends, 0);
+    await worker.resume();
+    for (let attempt = 0; attempt < 100 && terminalCount === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(sends, 1);
+    assert.equal(terminalCount, 1);
+  } finally {
+    await removeHarness(resumeHarness);
   }
 });

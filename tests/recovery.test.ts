@@ -475,7 +475,12 @@ function prepareOutbound(
     finalMarkdown: "first\n\nsecond",
     renderedChunks: [],
     units,
-    ...(options.guestQueryId ? { guestQueryId: options.guestQueryId } : {}),
+    ...(options.guestQueryId
+      ? {
+          guestQueryId: options.guestQueryId,
+          guestStagingTarget: { chatId: 840585 },
+        }
+      : {}),
     spool: options.spool,
   });
   return { inbound, outbound, units };

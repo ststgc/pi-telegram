@@ -926,6 +926,150 @@ export function createTelegramAgentLifecycleHooks<
   };
 }
 
+export interface TelegramDurableAgentEndHandoff {
+  startDelivery(): void;
+}
+
+export type TelegramDurableAgentLifecycleHooksRuntimeDeps<
+  TTurn extends PendingTelegramTurn,
+  TContext,
+  TMessage,
+> = TelegramAgentStartHookRuntimeDeps<TTurn, TContext> &
+  TelegramToolExecutionHookRuntimeDeps<TContext> & {
+    getActiveTurn: () => TTurn | undefined;
+    loadConfig?: () => Promise<void>;
+    extractAssistant: (
+      messages: readonly TMessage[],
+    ) => TelegramAgentEndAssistantResult;
+    resetRuntimeState: () => void;
+    isSessionActive?: (ctx: TContext) => boolean;
+    waitForTypingIdle?: () => Promise<void>;
+    updateStatus: (ctx: TContext) => void;
+    dispatchNextQueuedTelegramTurn: (ctx: TContext) => void;
+    requestDeferredDispatchNextQueuedTelegramTurn: (
+      dispatch: (ctx: TContext) => void,
+    ) => void;
+    handoffActiveTurn: (
+      turn: TTurn,
+      assistant: TelegramAgentEndAssistantResult,
+      ctx: TContext,
+    ) => Promise<TelegramDurableAgentEndHandoff>;
+    completeTurnWithoutDelivery: (turn: TTurn) => void;
+    markTurnExecutionUncertain: (turn: TTurn) => void;
+    recordRuntimeEvent?: TelegramAgentEndRuntimeDeps<TTurn>["recordRuntimeEvent"];
+  };
+
+/**
+ * Production active-turn lifecycle: semantic results synchronously enter the
+ * durable outbox and queue advancement is owned by its terminal callback.
+ */
+export function createTelegramDurableAgentLifecycleHooks<
+  TTurn extends PendingTelegramTurn,
+  TContext,
+  TMessage,
+>(
+  deps: TelegramDurableAgentLifecycleHooksRuntimeDeps<
+    TTurn,
+    TContext,
+    TMessage
+  >,
+) {
+  const onAgentStart = createTelegramAgentStartHook<TTurn, TContext>(deps);
+  let retainedErrorEvent: TelegramAgentEndHookEvent<TMessage> | undefined;
+  let failedHandoffTurn: TTurn | undefined;
+
+  const updateStatusIgnoringStaleContext = (ctx: TContext): void => {
+    try {
+      deps.updateStatus(ctx);
+    } catch (error) {
+      if (!isTelegramStaleContextError(error)) throw error;
+    }
+  };
+  const resetAfterDisposition = async (
+    ctx: TContext,
+    dispatchNext: boolean,
+  ): Promise<void> => {
+    deps.resetRuntimeState();
+    await deps.waitForTypingIdle?.();
+    if (deps.isSessionActive?.(ctx) === false) return;
+    updateStatusIgnoringStaleContext(ctx);
+    if (dispatchNext) {
+      deps.requestDeferredDispatchNextQueuedTelegramTurn(
+        deps.dispatchNextQueuedTelegramTurn,
+      );
+    }
+  };
+
+  return {
+    onAgentStart,
+    async onAgentEnd(
+      event: TelegramAgentEndHookEvent<TMessage>,
+      ctx: TContext,
+    ): Promise<void> {
+      await deps.loadConfig?.();
+      if (deps.isSessionActive?.(ctx) === false) return;
+      const turn = deps.getActiveTurn();
+      const assistant = turn ? deps.extractAssistant(event.messages) : {};
+      if (!turn) {
+        await resetAfterDisposition(ctx, true);
+        return;
+      }
+      if (assistant.stopReason === "error") {
+        retainedErrorEvent = event;
+        deps.recordRuntimeEvent?.(
+          "provider-retry",
+          new Error("Retained Telegram turn without durable final intent"),
+          { phase: "retained", hasFinalText: !!assistant.text?.trim() },
+        );
+        return;
+      }
+      retainedErrorEvent = undefined;
+      failedHandoffTurn = undefined;
+      const hasDelivery = !!assistant.text?.trim() ||
+        turn.queuedAttachments.length > 0;
+      if (assistant.stopReason === "aborted" || !hasDelivery) {
+        deps.completeTurnWithoutDelivery(turn);
+        await resetAfterDisposition(ctx, true);
+        return;
+      }
+      let handoff: TelegramDurableAgentEndHandoff;
+      try {
+        handoff = await deps.handoffActiveTurn(turn, assistant, ctx);
+      } catch (error) {
+        failedHandoffTurn = turn;
+        deps.recordRuntimeEvent?.("delivery", error, {
+          phase: "durable-outbox-handoff",
+          turnId: turn.recovery?.turnId,
+        });
+        return;
+      }
+      if (deps.isSessionActive?.(ctx) === false) return;
+      await resetAfterDisposition(ctx, false);
+      if (deps.isSessionActive?.(ctx) !== false) handoff.startDelivery();
+    },
+    async onAgentSettled(_event: unknown, ctx: TContext): Promise<void> {
+      if (deps.isSessionActive?.(ctx) === false) return;
+      const turn = failedHandoffTurn ??
+        (retainedErrorEvent ? deps.getActiveTurn() : undefined);
+      retainedErrorEvent = undefined;
+      failedHandoffTurn = undefined;
+      if (!turn) return;
+      deps.markTurnExecutionUncertain(turn);
+      deps.recordRuntimeEvent?.(
+        "recovery",
+        new Error("Telegram execution settled without durable outbound intent"),
+        { phase: "agent-settled-without-outbox", turnId: turn.recovery?.turnId },
+      );
+      await resetAfterDisposition(ctx, true);
+    },
+    clearRetainedAgentEnd(): void {
+      retainedErrorEvent = undefined;
+      failedHandoffTurn = undefined;
+    },
+    ...createTelegramToolExecutionHooks<TContext>(deps),
+  };
+}
+
 export function createTelegramToolExecutionHooks<TContext>(
   deps: TelegramToolExecutionHookRuntimeDeps<TContext>,
 ) {

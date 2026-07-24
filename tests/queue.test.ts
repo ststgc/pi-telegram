@@ -27,6 +27,7 @@ import {
   createTelegramActiveTurnStore,
   createTelegramAgentEndHook,
   createTelegramAgentLifecycleHooks,
+  createTelegramDurableAgentLifecycleHooks,
   createTelegramAgentStartHook,
   createTelegramControlItemBuilder,
   createTelegramControlQueueController,
@@ -2712,6 +2713,216 @@ test("Agent lifecycle retains retryable errors until recovery or settlement", as
     "error:WebSocket error",
     "dispatch",
   ]);
+});
+
+function createDurableLifecycleHarness(options: {
+  handoff?: (
+    turn: PendingTelegramTurn,
+    assistant: { text?: string; stopReason?: string },
+    ctx: string,
+  ) => Promise<{ startDelivery(): void }>;
+  extractAssistant?: (messages: readonly string[]) => {
+    text?: string;
+    stopReason?: "error" | "aborted";
+  };
+  completeTurnWithoutDelivery?: (turn: PendingTelegramTurn) => void;
+  markTurnExecutionUncertain?: (turn: PendingTelegramTurn) => void;
+} = {}) {
+  const events: string[] = [];
+  const turn = createQueueTestPromptTurn({
+    recovery: { turnId: "turn-durable", recordIds: ["record-durable"] },
+  });
+  let activeTurn: PendingTelegramTurn | undefined = turn;
+  let sessionActive = true;
+  const hooks = createTelegramDurableAgentLifecycleHooks<
+    PendingTelegramTurn,
+    string,
+    string
+  >({
+    setAbortHandler: () => {},
+    getQueuedItems: () => [],
+    hasPendingDispatch: () => false,
+    hasActiveTurn: () => activeTurn !== undefined,
+    resetToolExecutions: () => {},
+    resetPendingModelSwitch: () => {},
+    setQueuedItems: () => {},
+    clearDispatchPending: () => {},
+    setFoldQueuedPromptsIntoHistory: () => {},
+    setActiveTurn: (nextTurn) => {
+      activeTurn = nextTurn;
+    },
+    createPreviewState: () => {},
+    startTypingLoop: () => {},
+    updateStatus: () => {
+      events.push("status");
+    },
+    getActiveTurn: () => activeTurn,
+    extractAssistant: options.extractAssistant ?? (() => ({ text: "final" })),
+    resetRuntimeState: () => {
+      activeTurn = undefined;
+      events.push("reset");
+    },
+    isSessionActive: () => sessionActive,
+    waitForTypingIdle: async () => {
+      events.push("typing-idle");
+    },
+    dispatchNextQueuedTelegramTurn: () => {
+      events.push("dispatch");
+    },
+    requestDeferredDispatchNextQueuedTelegramTurn: (dispatch) => {
+      dispatch("ctx");
+    },
+    handoffActiveTurn: options.handoff ?? (async (_turn, assistant) => {
+      events.push(`commit:${assistant.text}`);
+      return {
+        startDelivery() {
+          events.push("delivery:start");
+        },
+      };
+    }),
+    completeTurnWithoutDelivery: options.completeTurnWithoutDelivery ?? (() => {
+      events.push("complete:no-delivery");
+    }),
+    markTurnExecutionUncertain: options.markTurnExecutionUncertain ?? (() => {
+      events.push("execution:uncertain");
+    }),
+    recordRuntimeEvent: (category, _error, details) => {
+      events.push(`event:${category}:${details?.phase}`);
+    },
+    getActiveToolExecutions: () => 0,
+    setActiveToolExecutions: () => {},
+    triggerPendingModelSwitchAbort: () => {},
+  });
+  return {
+    hooks,
+    events,
+    getActiveTurn: () => activeTurn,
+    setSessionActive: (active: boolean) => {
+      sessionActive = active;
+    },
+  };
+}
+
+test("Durable agent end commits before execution reset and starts no detached final", async () => {
+  const harness = createDurableLifecycleHarness();
+  await harness.hooks.onAgentEnd({ messages: ["answer"] }, "ctx");
+  assert.equal(harness.getActiveTurn(), undefined);
+  assert.deepEqual(harness.events, [
+    "commit:final",
+    "reset",
+    "typing-idle",
+    "status",
+    "delivery:start",
+  ]);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(
+    harness.events.filter((event) => event === "delivery:start").length,
+    1,
+  );
+  assert.equal(harness.events.includes("dispatch"), false);
+});
+
+test("Durable outbox commit failure retains active dispatch until settlement uncertainty", async () => {
+  const harness = createDurableLifecycleHarness({
+    handoff: async () => {
+      throw new Error("outbox unavailable");
+    },
+  });
+  await harness.hooks.onAgentEnd({ messages: ["answer"] }, "ctx");
+  assert.ok(harness.getActiveTurn());
+  assert.deepEqual(harness.events, [
+    "event:delivery:durable-outbox-handoff",
+  ]);
+
+  await harness.hooks.onAgentSettled({}, "ctx");
+  assert.equal(harness.getActiveTurn(), undefined);
+  assert.deepEqual(harness.events, [
+    "event:delivery:durable-outbox-handoff",
+    "execution:uncertain",
+    "event:recovery:agent-settled-without-outbox",
+    "reset",
+    "typing-idle",
+    "status",
+    "dispatch",
+  ]);
+});
+
+test("Durable disposition store failure retains the active turn and never advances the queue", async () => {
+  const completionFailure = createDurableLifecycleHarness({
+    extractAssistant: () => ({}),
+    completeTurnWithoutDelivery: () => {
+      throw new Error("disposition unavailable");
+    },
+  });
+  await assert.rejects(
+    completionFailure.hooks.onAgentEnd({ messages: [] }, "ctx"),
+    /disposition unavailable/,
+  );
+  assert.ok(completionFailure.getActiveTurn());
+  assert.deepEqual(completionFailure.events, []);
+
+  const uncertaintyFailure = createDurableLifecycleHarness({
+    handoff: async () => {
+      throw new Error("outbox unavailable");
+    },
+    markTurnExecutionUncertain: () => {
+      throw new Error("uncertainty unavailable");
+    },
+  });
+  await uncertaintyFailure.hooks.onAgentEnd({ messages: ["answer"] }, "ctx");
+  await assert.rejects(
+    uncertaintyFailure.hooks.onAgentSettled({}, "ctx"),
+    /uncertainty unavailable/,
+  );
+  assert.ok(uncertaintyFailure.getActiveTurn());
+  assert.deepEqual(uncertaintyFailure.events, [
+    "event:delivery:durable-outbox-handoff",
+  ]);
+});
+
+test("Durable agent settlement without final intent marks execution uncertain", async () => {
+  const harness = createDurableLifecycleHarness({
+    extractAssistant: () => ({ stopReason: "error" }),
+  });
+  await harness.hooks.onAgentEnd({ messages: ["provider error"] }, "ctx");
+  assert.ok(harness.getActiveTurn());
+  await harness.hooks.onAgentSettled({}, "ctx");
+  assert.equal(harness.getActiveTurn(), undefined);
+  assert.deepEqual(harness.events, [
+    "event:provider-retry:retained",
+    "execution:uncertain",
+    "event:recovery:agent-settled-without-outbox",
+    "reset",
+    "typing-idle",
+    "status",
+    "dispatch",
+  ]);
+});
+
+test("Durable handoff from a stale old session cannot reset or schedule replacement state", async () => {
+  let releaseCommit: (() => void) | undefined;
+  const commitBlocked = new Promise<void>((resolve) => {
+    releaseCommit = resolve;
+  });
+  const harness = createDurableLifecycleHarness({
+    handoff: async () => {
+      harness.events.push("commit:start");
+      await commitBlocked;
+      harness.events.push("commit:done");
+      return {
+        startDelivery() {
+          harness.events.push("delivery:start");
+        },
+      };
+    },
+  });
+  const ending = harness.hooks.onAgentEnd({ messages: ["answer"] }, "ctx");
+  await Promise.resolve();
+  harness.setSessionActive(false);
+  releaseCommit?.();
+  await ending;
+  assert.ok(harness.getActiveTurn());
+  assert.deepEqual(harness.events, ["commit:start", "commit:done"]);
 });
 
 test("Agent start hook binds abort handler and runtime ports", async () => {
