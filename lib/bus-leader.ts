@@ -11,8 +11,13 @@ import * as Sync from "./sync.ts";
 import * as ThreadReconciler from "./thread-reconciler.ts";
 import {
   isTelegramApiCommitUnknownError,
+  isTelegramApiMethodRetrySafe,
   type TelegramApiCallOptions,
 } from "./telegram-api.ts";
+import type {
+  RecoveryBusDrainItem,
+  RecoveryStore,
+} from "./recovery.ts";
 import type { TelegramTarget } from "./target.ts";
 import * as Threads from "./threads.ts";
 import {
@@ -35,6 +40,9 @@ import { getTelegramBusTransportRetryPolicy } from "./bus-transport.ts";
 export interface TelegramBusLeaderRuntime<TContext> {
   startPolling: (ctx: TContext) => Promise<void>;
   stopPolling: () => Promise<void>;
+  handleEnvelope: (
+    envelope: TelegramBusEnvelope,
+  ) => Promise<TelegramBusEnvelope> | TelegramBusEnvelope;
 }
 
 export interface TelegramBusFollowerLifecycleAnnouncement {
@@ -241,6 +249,16 @@ export type TelegramBusFollowerMessageOwnershipRecorder = (
   record: TelegramBusFollowerMessageOwnershipRecord,
 ) => void;
 
+export interface TelegramDurableBusItemRunner {
+  (item: RecoveryBusDrainItem): Promise<boolean>;
+}
+
+export interface TelegramDurableBusJournalPort {
+  getStore: () => RecoveryStore;
+  getProfile: () => string;
+  getLeaderSessionGeneration: () => number;
+}
+
 export interface TelegramBusLeaderRuntimeDeps<TContext> {
   socketPath: TelegramBusSocketPathSource;
   commitEndpointPublication?: (commit: () => void) => boolean;
@@ -249,6 +267,7 @@ export interface TelegramBusLeaderRuntimeDeps<TContext> {
   startPolling: (ctx: TContext) => void | Promise<void>;
   stopPolling: () => void | Promise<void>;
   callApi?: (method: string, args: unknown[]) => Promise<unknown> | unknown;
+  durableBus?: TelegramDurableBusJournalPort;
   authorizeFollowerApiCall?: (input: {
     follower: TelegramBusFollowerView;
     method: string;
@@ -873,6 +892,7 @@ export function createTelegramBusLeaderEnvelopeHandler(deps: {
   getNowMs?: () => number;
   timeoutMs?: number;
   callApi?: (method: string, args: unknown[]) => Promise<unknown> | unknown;
+  durableBus?: TelegramDurableBusJournalPort;
   authorizeFollowerApiCall?: (input: {
     follower: TelegramBusFollowerView;
     method: string;
@@ -1321,85 +1341,240 @@ async function handleFollowerApiCall(
       args: unknown[];
     }) => boolean;
     recordFollowerMessageOwnership?: TelegramBusFollowerMessageOwnershipRecorder;
+    enterRecoveryOperation?: () => { release(): void } | undefined;
+    durableBus?: TelegramDurableBusJournalPort;
+    getCurrentLeaderEpoch?: () => number | string | undefined;
   },
 ): Promise<TelegramBusEnvelope> {
-  const follower = deps.followerRegistry.get(envelope.instanceId);
-  if (!follower) {
+  const recoveryLease = deps.enterRecoveryOperation?.();
+  if (deps.enterRecoveryOperation && !recoveryLease) {
     return {
       kind: "bus.ack",
       requestId: envelope.requestId,
       ok: false,
-      message: "Unknown Telegram bus follower instance.",
-    };
-  }
-  if (
-    follower.registrationGeneration &&
-    envelope.registrationGeneration !== follower.registrationGeneration
-  ) {
-    return {
-      kind: "bus.ack",
-      requestId: envelope.requestId,
-      ok: false,
-      message: "Stale Telegram bus follower registration generation.",
-    };
-  }
-  deps.followerRegistry.heartbeat(envelope.instanceId, deps.getNowMs());
-  if (
-    deps.authorizeFollowerApiCall &&
-    !deps.authorizeFollowerApiCall({
-      follower,
-      method: envelope.method,
-      args: envelope.args,
-    })
-  ) {
-    return {
-      kind: "bus.ack",
-      requestId: envelope.requestId,
-      ok: false,
-      message: "Telegram bus API call is not allowed for this follower.",
-    };
-  }
-  if (!deps.callApi) {
-    return {
-      kind: "bus.ack",
-      requestId: envelope.requestId,
-      ok: false,
-      message: "Telegram bus leader does not expose API calling.",
+      message: "Telegram recovery operations are fenced.",
     };
   }
   try {
-    const result = await deps.callApi(envelope.method, envelope.args);
-    recordFollowerApiMessageOwnership({
-      envelope,
-      follower,
-      result,
-      record: deps.recordFollowerMessageOwnership,
+    const follower = deps.followerRegistry.get(envelope.instanceId);
+    if (!follower) {
+      return {
+        kind: "bus.ack",
+        requestId: envelope.requestId,
+        ok: false,
+        message: "Unknown Telegram bus follower instance.",
+      };
+    }
+    if (
+      follower.registrationGeneration !== envelope.registrationGeneration ||
+      follower.sessionGeneration !== envelope.followerSessionGeneration ||
+      follower.manualFollowerOwnerId !== envelope.manualFollowerOwnerId ||
+      follower.target?.chatId !== envelope.target.chatId ||
+      follower.target?.threadId !== envelope.target.threadId ||
+      (deps.durableBus !== undefined &&
+        deps.durableBus.getProfile() !== envelope.profile)
+    ) {
+      return {
+        kind: "bus.ack",
+        requestId: envelope.requestId,
+        ok: false,
+        message: "Stale Telegram bus follower target or registration generation.",
+      };
+    }
+    deps.followerRegistry.heartbeat(envelope.instanceId, deps.getNowMs());
+    if (
+      deps.authorizeFollowerApiCall &&
+      !deps.authorizeFollowerApiCall({
+        follower,
+        method: envelope.method,
+        args: envelope.args,
+      })
+    ) {
+      return {
+        kind: "bus.ack",
+        requestId: envelope.requestId,
+        ok: false,
+        message: "Telegram bus API call is not allowed for this follower.",
+      };
+    }
+    if (!deps.callApi) {
+      return {
+        kind: "bus.ack",
+        requestId: envelope.requestId,
+        ok: false,
+        message: "Telegram bus leader does not expose API calling.",
+      };
+    }
+    const { apiMethod } = getFollowerApiMethodAndBody(envelope);
+    if (isTelegramApiMethodRetrySafe(apiMethod) || !deps.durableBus) {
+      try {
+        const result = await deps.callApi(envelope.method, envelope.args);
+        recordFollowerApiMessageOwnership({
+          envelope,
+          follower,
+          result,
+          record: deps.recordFollowerMessageOwnership,
+        });
+        return {
+          kind: "bus.ack",
+          requestId: envelope.requestId,
+          ok: true,
+          result,
+        };
+      } catch (error) {
+        return createFollowerApiFailureAck(envelope.requestId, error);
+      }
+    }
+
+    const leaderEpoch = deps.getCurrentLeaderEpoch?.();
+    if (leaderEpoch === undefined) {
+      return {
+        kind: "bus.ack",
+        requestId: envelope.requestId,
+        ok: false,
+        message: "Telegram bus mutation requires exact leader ownership.",
+      };
+    }
+    const identity = {
+      profile: envelope.profile,
+      target: structuredClone(envelope.target),
+      owner: {
+        kind: "manual-follower" as const,
+        ownerId: envelope.manualFollowerOwnerId,
+        registrationGeneration: envelope.registrationGeneration,
+      },
+      sessionGeneration: envelope.followerSessionGeneration,
+    };
+    let admitted;
+    try {
+      admitted = deps.durableBus.getStore().admitBus({
+        identity,
+        envelope: {
+          kind: "follower.callApi",
+          profile: envelope.profile,
+          target: structuredClone(envelope.target),
+          requestId: envelope.requestId,
+          instanceId: envelope.instanceId,
+          manualFollowerOwnerId: envelope.manualFollowerOwnerId,
+          registrationGeneration: envelope.registrationGeneration,
+          followerSessionGeneration: envelope.followerSessionGeneration,
+          method: envelope.method,
+          args: structuredClone(envelope.args),
+        },
+        apiMethod,
+        leaderEpoch,
+        leaderSessionGeneration: deps.durableBus.getLeaderSessionGeneration(),
+      });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message.includes("request id was reused")
+      ) {
+        return {
+          kind: "bus.ack",
+          requestId: envelope.requestId,
+          ok: false,
+          message: "Telegram bus request id was reused with a different payload.",
+          error: { code: "request-id-collision" },
+        };
+      }
+      throw error;
+    }
+    if (admitted.record.state === "completed" && admitted.payload.response) {
+      return recoveryBusResponseToAck(envelope.requestId, admitted.payload.response);
+    }
+    if (
+      admitted.record.state === "bus-uncertain" ||
+      admitted.record.state === "explicitly-discarded"
+    ) {
+      return {
+        kind: "bus.ack",
+        requestId: envelope.requestId,
+        ok: false,
+        message:
+          admitted.record.state === "bus-uncertain"
+            ? "Telegram bus mutation is uncertain and requires operator recovery."
+            : "Telegram bus mutation was durably discarded.",
+        error: { code: "commit-unknown", method: apiMethod },
+      };
+    }
+    deps.durableBus.getStore().claimBus({
+      recordId: admitted.record.recordId,
+      identity,
+      leaderEpoch,
+      leaderSessionGeneration: deps.durableBus.getLeaderSessionGeneration(),
     });
-    return {
-      kind: "bus.ack",
-      requestId: envelope.requestId,
-      ok: true,
-      result,
-    };
-  } catch (error) {
-    return {
-      kind: "bus.ack",
-      requestId: envelope.requestId,
-      ok: false,
-      message:
-        error instanceof Error
-          ? error.message
-          : "Telegram bus API call failed.",
-      ...(isTelegramApiCommitUnknownError(error)
-        ? {
-            error: {
-              code: "commit-unknown" as const,
-              method: error.method,
-            },
-          }
-        : {}),
-    };
+    let response: import("./recovery.ts").RecoveryBusResponseV1;
+    try {
+      const result = await deps.callApi(envelope.method, envelope.args);
+      recordFollowerApiMessageOwnership({
+        envelope,
+        follower,
+        result,
+        record: deps.recordFollowerMessageOwnership,
+      });
+      response = { ok: true, result };
+    } catch (error) {
+      if (isTelegramApiCommitUnknownError(error)) {
+        deps.durableBus.getStore().markBusUncertain(
+          admitted.record.recordId,
+          { identity },
+        );
+        return createFollowerApiFailureAck(envelope.requestId, error);
+      }
+      response = {
+        ok: false,
+        message:
+          error instanceof Error ? error.message : "Telegram bus API call failed.",
+      };
+    }
+    const completed = deps.durableBus.getStore().completeBus(
+      admitted.record.recordId,
+      { identity },
+      response,
+    );
+    return recoveryBusResponseToAck(
+      envelope.requestId,
+      completed.payload.response!,
+    );
+  } finally {
+    recoveryLease?.release();
   }
+}
+
+function createFollowerApiFailureAck(
+  requestId: string,
+  error: unknown,
+): TelegramBusEnvelope {
+  return {
+    kind: "bus.ack",
+    requestId,
+    ok: false,
+    message:
+      error instanceof Error ? error.message : "Telegram bus API call failed.",
+    ...(isTelegramApiCommitUnknownError(error)
+      ? {
+          error: {
+            code: "commit-unknown" as const,
+            method: error.method,
+          },
+        }
+      : {}),
+  };
+}
+
+function recoveryBusResponseToAck(
+  requestId: string,
+  response: import("./recovery.ts").RecoveryBusResponseV1,
+): TelegramBusEnvelope {
+  return {
+    kind: "bus.ack",
+    requestId,
+    ok: response.ok,
+    ...(response.message !== undefined ? { message: response.message } : {}),
+    ...(Object.hasOwn(response, "result") ? { result: response.result } : {}),
+    ...(response.error ? { error: response.error } : {}),
+  };
 }
 
 export interface TelegramRecoveryDowngradeGatePort {
@@ -1704,6 +1879,20 @@ export function createTelegramBusLeaderRuntime<TContext>(
     }, followerPruneIntervalMs);
     pruneInterval.unref?.();
   };
+  const handleEnvelope = createTelegramBusLeaderEnvelopeHandler({
+    followerRegistry: deps.followerRegistry,
+    authSecret: deps.authSecret,
+    getNowMs,
+    callApi: deps.callApi,
+    authorizeFollowerApiCall: deps.authorizeFollowerApiCall,
+    recordFollowerMessageOwnership: deps.recordFollowerMessageOwnership,
+    verifyFollowerDurableAdmission: deps.verifyFollowerDurableAdmission,
+    enterRecoveryOperation: deps.enterRecoveryOperation,
+    durableBus: deps.durableBus,
+    provisionFollowerTarget: deps.provisionFollowerTarget,
+    onFollowerDisconnected: deps.onFollowerDisconnected,
+    getCurrentLeaderEpoch: deps.getCurrentLeaderEpoch,
+  });
   const localServer = createTelegramBusLocalServer({
     socketPath: deps.socketPath,
     commitEndpointPublication: deps.commitEndpointPublication,
@@ -1713,21 +1902,10 @@ export function createTelegramBusLeaderRuntime<TContext>(
         ...details,
       });
     },
-    handleEnvelope: createTelegramBusLeaderEnvelopeHandler({
-      followerRegistry: deps.followerRegistry,
-      authSecret: deps.authSecret,
-      getNowMs,
-      callApi: deps.callApi,
-      authorizeFollowerApiCall: deps.authorizeFollowerApiCall,
-      recordFollowerMessageOwnership: deps.recordFollowerMessageOwnership,
-      verifyFollowerDurableAdmission: deps.verifyFollowerDurableAdmission,
-      enterRecoveryOperation: deps.enterRecoveryOperation,
-      provisionFollowerTarget: deps.provisionFollowerTarget,
-      onFollowerDisconnected: deps.onFollowerDisconnected,
-      getCurrentLeaderEpoch: deps.getCurrentLeaderEpoch,
-    }),
+    handleEnvelope,
   });
   return {
+    handleEnvelope,
     startPolling: async (ctx) => {
       await localServer.start();
       startPruning();

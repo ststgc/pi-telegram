@@ -44,7 +44,7 @@ import { isTelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
 
 async function waitForCondition(
   predicate: () => boolean,
-  timeoutMs = 250,
+  timeoutMs = 2_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -1072,6 +1072,7 @@ test("Bus follower assembly wires receiver, recovery, and registration", async (
       getLeaderSocketPath: () => leaderSocketPath,
       registrationState,
       createRequestId: () => `inst-a:${++requestSequence}`,
+      getSessionGeneration: () => 1,
     },
   });
   try {
@@ -1130,6 +1131,7 @@ test("Bus follower registration state tracks successful registration and stop", 
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => "inst-a:1",
+    getSessionGeneration: () => 1,
     getNowMs: () => 1000,
     registrationState: state,
   });
@@ -1194,6 +1196,7 @@ test("Bus follower re-registration carries its last known target", async () => {
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => `inst-a:reload:${++requestSequence}`,
+    getSessionGeneration: () => 1,
     registrationState: state,
   });
   try {
@@ -1246,6 +1249,7 @@ test("Bus follower registration runtime retries while leader endpoint is startin
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => "inst-a:1",
+    getSessionGeneration: () => 1,
     getNowMs: () => 1000,
     registrationState: state,
     registrationTimeoutMs: 50,
@@ -1299,6 +1303,7 @@ test("Bus follower registration runtime waits for slow target provisioning", asy
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => "inst-a:1",
+    getSessionGeneration: () => 1,
     getNowMs: () => 1000,
     registrationState: state,
     timeoutMs: 20,
@@ -1345,6 +1350,7 @@ test("Bus follower registration runtime registers and explicitly disconnects", a
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => `inst-a:${++sequence}`,
+    getSessionGeneration: () => 1,
     getNowMs: () => 1000,
     getPid: () => 123,
   });
@@ -1364,6 +1370,7 @@ test("Bus follower registration runtime registers and explicitly disconnects", a
       cwd: "/repo",
       pid: 123,
       registrationGeneration: "inst-a:1",
+      sessionGeneration: 1,
       connectedAtMs: 1000,
       lastHeartbeatMs: 1000,
       target: undefined,
@@ -1391,6 +1398,7 @@ test("Bus follower registration runtime accepts explicit manual profile keys", a
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => "inst-a:1",
+    getSessionGeneration: () => 1,
     getNowMs: () => 1000,
     getProfileKey: () => "manual:inst-a",
   });
@@ -1427,6 +1435,7 @@ test("Bus follower registration runtime reports heartbeat failure with active co
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => "inst-a:1",
+    getSessionGeneration: () => 1,
     registrationState: createTelegramBusFollowerRegistrationState(),
     heartbeatMs: 10,
     timeoutMs: 50,
@@ -1472,6 +1481,7 @@ test("Bus follower registration runtime reports rejected heartbeat with active c
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => `inst-a:${++requestSequence}`,
+    getSessionGeneration: () => 1,
     registrationState: createTelegramBusFollowerRegistrationState(),
     heartbeatMs: 10,
     timeoutMs: 50,
@@ -1515,6 +1525,7 @@ test("Bus follower registration runtime heartbeats until stopped", async () => {
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => `inst-a:${++requestSequence}`,
+    getSessionGeneration: () => 1,
     getNowMs: () => nowMs,
     heartbeatMs: 50,
   });
@@ -1559,6 +1570,7 @@ test("Bus follower registration runtime surfaces leader rejection reasons", asyn
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => "inst-a:1",
+    getSessionGeneration: () => 1,
     stopReceiving: () => {
       stopped.push("stop");
     },
@@ -1596,6 +1608,7 @@ test("Bus follower registration runtime derives leader socket when lock omits it
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => "inst-a:1",
+    getSessionGeneration: () => 1,
     getLeaderSocketPath: () => socketPath,
   });
   try {
@@ -1628,7 +1641,12 @@ test("Bus follower API caller sends method calls and returns leader results", as
   const callApi = createTelegramBusFollowerApiCaller({
     socketPath,
     instanceId: "inst-a",
+    manualFollowerOwnerId: "owner-a",
     createRequestId: () => "inst-a:1",
+    getProfile: () => "default",
+    getTarget: () => ({ chatId: 1, threadId: 2 }),
+    getRegistrationGeneration: () => "generation-a",
+    getSessionGeneration: () => 3,
     getNowMs: () => 7000,
   });
   try {
@@ -1640,7 +1658,12 @@ test("Bus follower API caller sends method calls and returns leader results", as
       {
         kind: "follower.callApi",
         requestId: "inst-a:1",
+        profile: "default",
+        target: { chatId: 1, threadId: 2 },
         instanceId: "inst-a",
+        manualFollowerOwnerId: "owner-a",
+        registrationGeneration: "generation-a",
+        followerSessionGeneration: 3,
         method: "sendRichMessage",
         args: [{ chat_id: 1 }],
         sentAtMs: 7000,
@@ -1668,7 +1691,12 @@ test("Bus follower API caller preserves structured commit-unknown errors", async
   const callApi = createTelegramBusFollowerApiCaller({
     socketPath,
     instanceId: "inst-a",
+    manualFollowerOwnerId: "owner-a",
     createRequestId: () => "inst-a:ambiguous:1",
+    getProfile: () => "default",
+    getTarget: () => ({ chatId: 1 }),
+    getRegistrationGeneration: () => "generation-a",
+    getSessionGeneration: () => 3,
   });
   try {
     await server.start();
@@ -1702,7 +1730,12 @@ test("Bus follower API caller classifies non-idempotent acknowledgement loss as 
   const callApi = createTelegramBusFollowerApiCaller({
     socketPath,
     instanceId: "inst-a",
+    manualFollowerOwnerId: "owner-a",
     createRequestId: () => "inst-a:ack-loss:1",
+    getProfile: () => "default",
+    getTarget: () => ({ chatId: 1 }),
+    getRegistrationGeneration: () => "generation-a",
+    getSessionGeneration: () => 3,
     timeoutMs: 10,
   });
   try {

@@ -165,6 +165,10 @@ export interface TelegramBusForwardedUpdateReceiverRuntime {
 export interface TelegramBusFollowerClientRuntimeDeps<TMessage = unknown> {
   socketPath: TelegramBusSocketPathSource;
   instanceId: string;
+  manualFollowerOwnerId: string;
+  getProfile: () => string;
+  getTarget: () => TelegramTarget | undefined;
+  getSessionGeneration: () => number;
   getApiAuthSecret?: () => string | undefined;
   getForwardingAuthSecret?: () => string | undefined;
   getRegistrationGeneration?: () => string | undefined;
@@ -182,7 +186,11 @@ export interface TelegramBusFollowerClientRuntimeDeps<TMessage = unknown> {
 export interface TelegramBusFollowerApiCallerDeps {
   socketPath: TelegramBusSocketPathSource;
   instanceId: string;
+  manualFollowerOwnerId: string;
   createRequestId: () => string;
+  getProfile: () => string;
+  getTarget: () => TelegramTarget | undefined;
+  getSessionGeneration: () => number;
   getAuthSecret?: () => string | undefined;
   getRegistrationGeneration?: () => string | undefined;
   getNowMs?: () => number;
@@ -206,6 +214,7 @@ export interface TelegramBusFollowerRegistrationRuntimeDeps<
   isContextActive?: (ctx: TContext) => boolean;
   getProfileKey?: (ctx: TContext) => string | undefined;
   getThreadName?: (ctx: TContext) => string | undefined;
+  getSessionGeneration: () => number;
   getNowMs?: () => number;
   getPid?: () => number;
   timeoutMs?: number;
@@ -668,6 +677,10 @@ export function createTelegramBusFollowerClientRuntime<
     callApi: createTelegramBusFollowerApiCaller({
       ...sharedClientDeps,
       instanceId: deps.instanceId,
+      manualFollowerOwnerId: deps.manualFollowerOwnerId,
+      getProfile: deps.getProfile,
+      getTarget: deps.getTarget,
+      getSessionGeneration: deps.getSessionGeneration,
       getAuthSecret: deps.getApiAuthSecret,
       getRegistrationGeneration: deps.getRegistrationGeneration,
     }),
@@ -697,6 +710,11 @@ export function createTelegramBusFollowerApiCaller(
   const timeoutMs = deps.timeoutMs ?? 30000;
   return async (method, args) => {
     const socketPath = resolveTelegramBusSocketPath(deps.socketPath);
+    const target = deps.getTarget();
+    const registrationGeneration = deps.getRegistrationGeneration?.();
+    if (!target || !registrationGeneration) {
+      throw new Error("Telegram follower API call requires an exact registered target.");
+    }
     let response: TelegramBusEnvelope | undefined;
     try {
       response = await sendTelegramBusLocalEnvelope({
@@ -710,12 +728,12 @@ export function createTelegramBusFollowerApiCaller(
           kind: "follower.callApi",
           requestId: deps.createRequestId(),
           auth: deps.getAuthSecret?.(),
+          profile: deps.getProfile(),
+          target,
           instanceId: deps.instanceId,
-          ...(deps.getRegistrationGeneration?.()
-            ? {
-                registrationGeneration: deps.getRegistrationGeneration?.(),
-              }
-            : {}),
+          manualFollowerOwnerId: deps.manualFollowerOwnerId,
+          registrationGeneration,
+          followerSessionGeneration: deps.getSessionGeneration(),
           method,
           args,
           sentAtMs: getNowMs(),
@@ -1311,6 +1329,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
           busSocketPath:
             deps.getFollowerBusSocketPath?.() ?? deps.followerBusSocketPath,
           registrationGeneration,
+          sessionGeneration: deps.getSessionGeneration(),
           connectedAtMs: getNowMs(),
         },
       };

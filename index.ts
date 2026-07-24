@@ -363,6 +363,12 @@ export default function (pi: Pi.ExtensionAPI) {
     >({
       socketPath: getTelegramBusSocketPath,
       instanceId: telegramInstanceId,
+      manualFollowerOwnerId: telegramManualFollowerOwnerId,
+      getProfile() {
+        return configStore.getActiveProfileName() ?? "default";
+      },
+      getTarget: telegramBusFollowerRegistrationState.getTarget,
+      getSessionGeneration: telegramSessionContextStore.getGeneration,
       getApiAuthSecret() {
         return telegramActiveBusAuthSecret;
       },
@@ -470,28 +476,38 @@ export default function (pi: Pi.ExtensionAPI) {
   ): boolean {
     if (
       identity.profile !==
-        (configStore.getActiveProfileName() ?? "default") ||
-      identity.sessionGeneration !== telegramSessionContextStore.getGeneration()
+      (configStore.getActiveProfileName() ?? "default")
     ) {
       return false;
     }
     if (identity.owner.kind === "leader") {
       const epoch = lockRuntime.getOwnedLeaderEpoch();
       return (
+        identity.sessionGeneration ===
+          telegramSessionContextStore.getGeneration() &&
         lockRuntime.owns() &&
         identity.owner.ownerId === telegramInstanceId &&
         epoch !== undefined &&
         identity.owner.leaderEpoch === String(epoch)
       );
     }
-    const target = telegramBusFollowerRegistrationState.getTarget();
-    return (
+    const localTarget = telegramBusFollowerRegistrationState.getTarget();
+    const localAuthenticated =
+      identity.sessionGeneration === telegramSessionContextStore.getGeneration() &&
       telegramBusFollowerRegistrationState.isRegistered() &&
       identity.owner.ownerId === telegramManualFollowerOwnerId &&
       identity.owner.registrationGeneration ===
         telegramBusFollowerRegistrationState.getGeneration() &&
-      target?.chatId === identity.target.chatId &&
-      target.threadId === identity.target.threadId
+      localTarget?.chatId === identity.target.chatId &&
+      localTarget.threadId === identity.target.threadId;
+    if (localAuthenticated) return true;
+    const registered = telegramBusFollowerRegistry.getByTarget(identity.target);
+    return (
+      registered?.manualFollowerOwnerId === identity.owner.ownerId &&
+      registered.registrationGeneration ===
+        identity.owner.registrationGeneration &&
+      registered.target?.chatId === identity.target.chatId &&
+      registered.target.threadId === identity.target.threadId
     );
   };
   const inboundRecoveryRuntime =
@@ -957,6 +973,9 @@ export default function (pi: Pi.ExtensionAPI) {
   let runRecoveryDowngrade:
     | BusLeader.TelegramRecoveryDowngradeCoordinator<Pi.ExtensionContext>
     | undefined;
+  let runDurableBusItem:
+    | BusLeader.TelegramDurableBusItemRunner
+    | undefined;
   const menuActions = Menu.createTelegramMenuActionRuntimeWithStateBuilder({
     runtime: modelMenuRuntime,
     createSettingsManager: Pi.createSettingsManager,
@@ -1216,8 +1235,8 @@ export default function (pi: Pi.ExtensionAPI) {
     getStatus: inboundRecoveryRuntime.getRecoveryStatus,
     getOrphanCandidates:
       inboundRecoveryRuntime.getOrphanReassignmentCandidates,
-    drainSafe(ctx) {
-      return inboundRecoveryRuntime.drainSafeForOperator(
+    async drainSafe(ctx) {
+      const count = await inboundRecoveryRuntime.drainSafeForOperator(
         ctx,
         telegramUpdateHandle,
         function (turn) {
@@ -1225,8 +1244,31 @@ export default function (pi: Pi.ExtensionAPI) {
         },
         scheduleDurableOutboundRecovery,
       );
+      const busItems = inboundRecoveryRuntime.getOutboundStore().drainSafeBus();
+      if (busItems.length > 0 && !runDurableBusItem) {
+        throw new Error("Durable bus recovery executor is unavailable");
+      }
+      for (const item of busItems) await runDurableBusItem!(item);
+      return count + busItems.length;
     },
-    retryUncertain(actionId, ctx) {
+    async retryUncertain(actionId, ctx) {
+      const item = MenuRecovery.findTelegramRecoveryStatusItem(
+        inboundRecoveryRuntime.getRecoveryStatus(),
+        actionId,
+      );
+      if (item?.family === "bus") {
+        if (!runDurableBusItem) {
+          throw new Error("Durable bus recovery executor is unavailable");
+        }
+        const retry = inboundRecoveryRuntime
+          .getOutboundStore()
+          .retryUncertainBusAction(
+            actionId,
+            telegramBusFollowerClients.createRequestId(),
+          );
+        const scheduled = await runDurableBusItem(retry);
+        return { scheduled, duplicationWarning: true as const };
+      }
       return inboundRecoveryRuntime.retryUncertainForOperator(
         actionId,
         ctx,
@@ -1238,6 +1280,14 @@ export default function (pi: Pi.ExtensionAPI) {
       );
     },
     discard(actionId, ctx) {
+      const item = MenuRecovery.findTelegramRecoveryStatusItem(
+        inboundRecoveryRuntime.getRecoveryStatus(),
+        actionId,
+      );
+      if (item?.family === "bus") {
+        inboundRecoveryRuntime.getOutboundStore().discardBusAction(actionId);
+        return;
+      }
       inboundRecoveryRuntime.discardForOperator(
         actionId,
         ctx,
@@ -1385,6 +1435,7 @@ export default function (pi: Pi.ExtensionAPI) {
           telegramActiveBusAuthSecret = secret;
         },
         getProfileKey: getTelegramManualFollowerProfileKey,
+        getSessionGeneration: telegramSessionContextStore.getGeneration,
         recordRuntimeEvent,
       },
     });
@@ -1447,6 +1498,14 @@ export default function (pi: Pi.ExtensionAPI) {
           return inboundRecoveryRuntime.verifyFollowerAdmissionProof(proof);
         },
         enterRecoveryOperation: inboundRecoveryRuntime.enterOperation,
+        durableBus: {
+          getStore: inboundRecoveryRuntime.getOutboundStore,
+          getProfile() {
+            return configStore.getActiveProfileName() ?? "default";
+          },
+          getLeaderSessionGeneration:
+            telegramSessionContextStore.getGeneration,
+        },
       },
       getAllowedUserId: configStore.getAllowedUserId,
       instanceId: telegramInstanceId,
@@ -1471,6 +1530,24 @@ export default function (pi: Pi.ExtensionAPI) {
       onProvisioningEnd: telegramProvisioningActivity.end,
       recordRuntimeEvent,
     });
+  runDurableBusItem = async function (item) {
+    const envelope = item.payload.envelope;
+    const response = await telegramBusLeaderRuntime.handleEnvelope({
+      kind: "follower.callApi",
+      requestId: envelope.requestId,
+      auth: telegramBusAuthSecret,
+      profile: envelope.profile,
+      target: envelope.target,
+      instanceId: envelope.instanceId,
+      manualFollowerOwnerId: envelope.manualFollowerOwnerId,
+      registrationGeneration: envelope.registrationGeneration,
+      followerSessionGeneration: envelope.followerSessionGeneration,
+      method: envelope.method,
+      args: envelope.args,
+      sentAtMs: Date.now(),
+    });
+    return response.kind === "bus.ack" && response.ok;
+  };
   const telegramLeaderHealthRuntime = Sync.createTelegramLeaderHealthRuntime({
     callGetMe() {
       return directTelegramApiRuntime.call("getMe", {});

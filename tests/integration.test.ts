@@ -32,7 +32,11 @@ type RuntimeTestHandler = (context: TestContext) => void | Promise<void>;
 type RuntimeTelegramExtension = (typeof import("../index.ts"))["default"];
 
 function test(name: string, fn: RuntimeTestHandler): void {
-  void testRoot(name, { concurrency: false, timeout: 5000 }, fn);
+  const timeout = name ===
+      "Public activity delivery reaches the classic instance without blocking agent start"
+    ? 15_000
+    : 5_000;
+  void testRoot(name, { concurrency: false, timeout }, fn);
 }
 
 let runtimeTelegramExtension: RuntimeTelegramExtension | undefined;

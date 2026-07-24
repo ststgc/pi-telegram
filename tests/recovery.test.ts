@@ -5,7 +5,6 @@
  */
 
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import {
   closeSync,
   existsSync,
@@ -255,18 +254,30 @@ function makeSnapshot(
     family: "bus" as const,
     recordId: `bus-${index}`,
     requestId: `request-${index}`,
+    envelopeKind: "follower.callApi" as const,
+    method: "call",
+    apiMethod: "sendMessage",
     payloadFingerprint: `sha256-${index}`,
+    followerInstanceId: "follower-a",
+    manualFollowerOwnerId: "manual-owner-a",
+    registrationGeneration: "registration-a",
+    leaderEpoch: "leader-epoch-a",
+    leaderSessionGeneration: 7,
     state,
     identity: OLD_IDENTITY,
     createdRevision: 20 + index,
     stateRevision: 20 + index,
     createdAtMs: 500 + index,
     updatedAtMs: 600 + index,
-    payloadRef: {
-      payloadId: `bus-payload-${index}`,
-      byteLength: 50 + index,
-      sha256: TEST_SHA256,
-    },
+    ...(state !== "explicitly-discarded"
+      ? {
+          payloadRef: {
+            payloadId: `bus-payload-${index}`,
+            byteLength: 50 + index,
+            sha256: TEST_SHA256,
+          },
+        }
+      : {}),
     spoolRefs: [],
   }));
   const unresolvedRecordIds = [...inbound, ...outbound, ...bus]
@@ -427,10 +438,6 @@ function readStoreSnapshot(rootPath: string): RecoverySnapshotV1 {
   return parseRecoverySnapshot(readFileSync(join(rootPath, "snapshot.json"), "utf8"));
 }
 
-function sha256(value: Uint8Array | string): string {
-  return createHash("sha256").update(value).digest("hex");
-}
-
 function prepareOutbound(
   harness: ReturnType<typeof createStoreHarness>,
   options: {
@@ -484,31 +491,6 @@ function prepareOutbound(
     spool: options.spool,
   });
   return { inbound, outbound, units };
-}
-
-function writeAccountedSnapshot(rootPath: string, snapshot: RecoverySnapshotV1): void {
-  const allRecords = [...snapshot.inbound, ...snapshot.outbound, ...snapshot.bus];
-  snapshot.quota.payloadBytes = allRecords.reduce(
-    (sum, record) => sum + (record.payloadRef?.byteLength ?? 0),
-    0,
-  );
-  snapshot.quota.spoolBytes = allRecords.reduce(
-    (sum, record) => sum + record.spoolRefs.reduce((nested, ref) => nested + ref.byteLength, 0),
-    0,
-  );
-  snapshot.quota.reservedBytes = 0;
-  let previous = -1;
-  let serialized = "";
-  for (let attempt = 0; attempt < 12; attempt += 1) {
-    snapshot.quota.recordBytes = Math.max(0, previous);
-    snapshot.quota.totalBytes =
-      snapshot.quota.recordBytes + snapshot.quota.payloadBytes + snapshot.quota.spoolBytes;
-    serialized = `${JSON.stringify(snapshot, null, 2)}\n`;
-    const next = Buffer.byteLength(serialized);
-    if (next === snapshot.quota.recordBytes) break;
-    previous = next;
-  }
-  writeFileSync(join(rootPath, "snapshot.json"), serialized, { mode: 0o600 });
 }
 
 test("recovery snapshot v1 roundtrips all states, quota, and store modes", () => {
@@ -2056,21 +2038,24 @@ test("same-process handoff updates matching unresolved inbound, outbound, and bu
       }],
     });
     harness.store.activateOutbound(outbound.recordId, { identity: OLD_IDENTITY });
-    const snapshot = readStoreSnapshot(harness.rootPath);
-    snapshot.bus.push({
-      family: "bus",
-      recordId: "bus-handoff",
-      requestId: "request-handoff",
-      payloadFingerprint: "fingerprint-handoff",
-      state: "pending",
-      identity: structuredClone(OLD_IDENTITY),
-      createdRevision: snapshot.revision,
-      stateRevision: snapshot.revision,
-      createdAtMs: harness.now.value,
-      updatedAtMs: harness.now.value,
-      spoolRefs: [],
+    const bus = harness.store.admitBus({
+      identity: OLD_IDENTITY,
+      envelope: {
+        kind: "follower.callApi",
+        profile: "default",
+        target: OLD_IDENTITY.target,
+        requestId: "request-handoff",
+        instanceId: "follower-a",
+        manualFollowerOwnerId: "manual-owner-a",
+        registrationGeneration: "registration-a",
+        followerSessionGeneration: 3,
+        method: "call",
+        args: ["sendMessage", { chat_id: 1001, message_thread_id: 42 }],
+      },
+      apiMethod: "sendMessage",
+      leaderEpoch: "leader-epoch-a",
+      leaderSessionGeneration: 7,
     });
-    writeAccountedSnapshot(harness.rootPath, snapshot);
     const handoff: RecoverySameProcessHandoff = {
       handoffId: "all-family-handoff",
       profile: "default",
@@ -2084,7 +2069,7 @@ test("same-process handoff updates matching unresolved inbound, outbound, and bu
     const result = harness.store.consumeSameProcessHandoff(handoff, nextIdentity);
     assert.deepEqual(
       [...result.claimedRecordIds].sort(),
-      [inbound.recordId, outbound.recordId, "bus-handoff"].sort(),
+      [inbound.recordId, outbound.recordId, bus.record.recordId].sort(),
     );
     const moved = readStoreSnapshot(harness.rootPath);
     assert.ok(
@@ -2502,34 +2487,35 @@ test("retention covers terminal outbound and bus payloads, spool cleanup, and de
       messageId: 55,
     });
 
-    const busPayload = Buffer.from("bus body");
-    const busSpool = Buffer.from("bus spool");
-    writeFileSync(join(harness.rootPath, "payloads", "bus-terminal-payload.bin"), busPayload, { mode: 0o600 });
-    writeFileSync(join(harness.rootPath, "spool", "bus-terminal-spool.bin"), busSpool, { mode: 0o600 });
-    const snapshot = readStoreSnapshot(harness.rootPath);
-    snapshot.bus.push({
-      family: "bus",
-      recordId: "bus-terminal",
-      requestId: "bus-terminal-request",
-      payloadFingerprint: "bus-terminal-fingerprint",
-      state: "completed",
-      identity: structuredClone(OLD_IDENTITY),
-      createdRevision: snapshot.revision,
-      stateRevision: snapshot.revision,
-      createdAtMs: harness.now.value,
-      updatedAtMs: harness.now.value,
-      payloadRef: {
-        payloadId: "bus-terminal-payload",
-        byteLength: busPayload.byteLength,
-        sha256: sha256(busPayload),
+    const bus = harness.store.admitBus({
+      identity: OLD_IDENTITY,
+      envelope: {
+        kind: "follower.callApi",
+        profile: "default",
+        target: OLD_IDENTITY.target,
+        requestId: "bus-terminal-request",
+        instanceId: "follower-a",
+        manualFollowerOwnerId: "manual-owner-a",
+        registrationGeneration: "registration-a",
+        followerSessionGeneration: 3,
+        method: "call",
+        args: ["sendMessage", { chat_id: 1001, message_thread_id: 42 }],
       },
-      spoolRefs: [{
-        spoolId: "bus-terminal-spool",
-        byteLength: busSpool.byteLength,
-        sha256: sha256(busSpool),
-      }],
+      apiMethod: "sendMessage",
+      leaderEpoch: "leader-epoch-a",
+      leaderSessionGeneration: 7,
     });
-    writeAccountedSnapshot(harness.rootPath, snapshot);
+    harness.store.claimBus({
+      recordId: bus.record.recordId,
+      identity: OLD_IDENTITY,
+      leaderEpoch: "leader-epoch-a",
+      leaderSessionGeneration: 7,
+    });
+    harness.store.completeBus(
+      bus.record.recordId,
+      { identity: OLD_IDENTITY },
+      { ok: true, result: { message_id: 56 } },
+    );
     harness.store.compact();
     assert.deepEqual(readdirSync(join(harness.rootPath, "spool")), []);
     let retained = readStoreSnapshot(harness.rootPath);
@@ -2539,7 +2525,7 @@ test("retention covers terminal outbound and bus payloads, spool cleanup, and de
     harness.store.compact();
     retained = readStoreSnapshot(harness.rootPath);
     assert.equal(retained.outbound[0]!.payloadRef, undefined);
-    assert.equal(retained.bus[0]!.payloadRef, undefined);
+    assert.ok(retained.bus[0]!.payloadRef);
     assert.equal(retained.outbound.length, 1);
     assert.equal(retained.bus.length, 1);
     harness.now.value += RECOVERY_TERMINAL_METADATA_RETENTION_MS + 1;

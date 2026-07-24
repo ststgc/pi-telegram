@@ -23,7 +23,7 @@ const KNOWN_RECOVERY_INCIDENTS = new Set([
 
 export interface TelegramRecoveryOperatorItem {
   handle: string;
-  family: "inbound" | "outbound";
+  family: "inbound" | "outbound" | "bus";
   state: string;
   requiredAction: "drain" | "retry-or-discard" | "discard" | "none";
 }
@@ -114,6 +114,13 @@ function safeIncidentLabel(value: string): string {
   return KNOWN_RECOVERY_INCIDENTS.has(value) ? value : "recovery-incident";
 }
 
+export function findTelegramRecoveryStatusItem(
+  status: RecoveryMetadataStatus,
+  actionId: string,
+): RecoveryMetadataStatus["items"][number] | undefined {
+  return status.items.find((item) => item.actionId === actionId);
+}
+
 export function projectTelegramRecoveryDeliverySummary(
   status: RecoveryMetadataStatus,
 ): TelegramRecoveryDeliverySummary {
@@ -149,13 +156,13 @@ export function projectTelegramRecoveryOperatorStatus(
     .filter(
       (item) =>
         item.family === "inbound" ||
-        (item.family === "outbound" &&
+        ((item.family === "outbound" || item.family === "bus") &&
           (item.requiredAction === "retry-or-discard" ||
             item.requiredAction === "discard")),
     )
     .map((item): TelegramRecoveryOperatorItem => ({
       handle: item.actionId,
-      family: item.family as "inbound" | "outbound",
+      family: item.family,
       state: item.state,
       requiredAction: item.requiredAction,
     }));
@@ -167,7 +174,7 @@ export function projectTelegramRecoveryOperatorStatus(
     pendingDeliveryCount: deliverySummary.pendingDeliveryCount,
     deliveryUncertainCount: deliverySummary.deliveryUncertainCount,
     drainableCount: status.items.filter(
-      (item) => item.family !== "bus" && item.requiredAction === "drain",
+      (item) => item.requiredAction === "drain",
     ).length,
     quota: {
       usedBytes: status.quota.totalBytes,
@@ -246,7 +253,7 @@ export function buildTelegramRecoveryMenuText(
     lines.push(
       "",
       `<b>Bus recovery</b>`,
-      `${status.familyCounts.bus} blocker(s); actions are unavailable until P0-E.`,
+      `${status.familyCounts.bus} durable request(s); uncertain mutations require explicit Retry or Discard.`,
     );
   }
   if (status.orphanCandidates.length > 0) {
@@ -333,7 +340,7 @@ function parseAction(
 
 function confirmationText(action: string): string {
   if (action === "retry") {
-    return "<b>Retry this uncertain delivery? Telegram may already contain the prior effect, so retrying can duplicate it.</b>";
+    return "<b>Retry this uncertain operation? Telegram may already contain the prior effect, so retrying can duplicate it.</b>";
   }
   if (action === "discard") {
     return "<b>Durably discard this recovery item?</b>";

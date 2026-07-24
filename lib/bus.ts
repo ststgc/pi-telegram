@@ -167,6 +167,7 @@ export interface TelegramBusInstanceRegistration {
   target?: TelegramTarget;
   busSocketPath?: string;
   registrationGeneration?: string;
+  sessionGeneration?: number;
   connectedAtMs: number;
 }
 
@@ -547,8 +548,12 @@ export type TelegramBusEnvelope = (
   | {
       kind: "follower.callApi";
       requestId: string;
+      profile: string;
+      target: TelegramTarget;
       instanceId: string;
-      registrationGeneration?: string;
+      manualFollowerOwnerId: string;
+      registrationGeneration: string;
+      followerSessionGeneration: number;
       method: string;
       args: unknown[];
       sentAtMs: number;
@@ -1745,22 +1750,48 @@ function parseCallApiEnvelope(
   value: Record<string, unknown>,
   requestId: string,
 ): TelegramBusEnvelope | undefined {
-  return typeof value.instanceId === "string" &&
-    typeof value.method === "string" &&
-    Array.isArray(value.args) &&
-    typeof value.sentAtMs === "number"
-    ? {
-        kind: "follower.callApi",
-        requestId,
-        instanceId: value.instanceId,
-        ...(typeof value.registrationGeneration === "string"
-          ? { registrationGeneration: value.registrationGeneration }
-          : {}),
-        method: value.method,
-        args: value.args,
-        sentAtMs: value.sentAtMs,
-      }
-    : undefined;
+  const target = parseTarget(value.target);
+  if (
+    !hasExactKeys(value, [
+      "kind",
+      "requestId",
+      "profile",
+      "target",
+      "instanceId",
+      "manualFollowerOwnerId",
+      "registrationGeneration",
+      "followerSessionGeneration",
+      "method",
+      "args",
+      "sentAtMs",
+      ...(typeof value.auth === "string" ? ["auth"] : []),
+    ]) ||
+    !isNonemptyString(value.profile) ||
+    !target ||
+    !isNonemptyString(value.instanceId) ||
+    !isNonemptyString(value.manualFollowerOwnerId) ||
+    !isNonemptyString(value.registrationGeneration) ||
+    !Number.isSafeInteger(value.followerSessionGeneration) ||
+    (value.followerSessionGeneration as number) < 0 ||
+    !isNonemptyString(value.method) ||
+    !Array.isArray(value.args) ||
+    !Number.isSafeInteger(value.sentAtMs)
+  ) {
+    return undefined;
+  }
+  return {
+    kind: "follower.callApi",
+    requestId,
+    profile: value.profile,
+    target,
+    instanceId: value.instanceId,
+    manualFollowerOwnerId: value.manualFollowerOwnerId,
+    registrationGeneration: value.registrationGeneration,
+    followerSessionGeneration: value.followerSessionGeneration as number,
+    method: value.method,
+    args: structuredClone(value.args),
+    sentAtMs: value.sentAtMs as number,
+  };
 }
 
 function parseAckEnvelope(
@@ -1868,6 +1899,13 @@ function parseRegistration(
   }
   if (typeof value.registrationGeneration === "string") {
     registration.registrationGeneration = value.registrationGeneration;
+  }
+  if (
+    typeof value.sessionGeneration === "number" &&
+    Number.isSafeInteger(value.sessionGeneration) &&
+    value.sessionGeneration >= 0
+  ) {
+    registration.sessionGeneration = value.sessionGeneration;
   }
   if (target) registration.target = target;
   return registration;

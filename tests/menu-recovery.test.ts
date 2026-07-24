@@ -160,9 +160,10 @@ test("recovery operator projection serializes only approved metadata", () => {
   assert.match(serialized, /handle_outbound_uncertain/);
   assert.match(serialized, /handle_outbound_exhausted/);
   assert.match(serialized, /orphan_handle/);
+  assert.match(serialized, /handle_bus/);
   assert.doesNotMatch(
     serialized,
-    /handle_outbound_planned|handle_outbound_sending|handle_bus/,
+    /handle_outbound_planned|handle_outbound_sending/,
   );
   assert.doesNotMatch(
     serialized,
@@ -186,10 +187,11 @@ test("recovery menu renders outbound aggregates and only supported opaque action
   assert.match(html, /delivery uncertain<\/code>: 1/);
   assert.match(html, /handle_outbound_uncertain.*outbound.*delivery-uncertain.*retry or discard/s);
   assert.match(html, /handle_outbound_exhausted.*discard/s);
-  assert.match(html, /actions are unavailable until P0-E/);
+  assert.match(html, /uncertain mutations require explicit Retry or Discard/);
+  assert.match(html, /handle_bus.*bus.*bus-uncertain.*retry or discard/s);
   assert.doesNotMatch(
     html,
-    /handle_bus|handle_outbound_planned|handle_outbound_sending/,
+    /handle_outbound_planned|handle_outbound_sending/,
   );
   assert.ok(callbacks.includes("recovery:ask:drain"));
   assert.ok(callbacks.includes("recovery:ask:retry:handle_retry"));
@@ -205,10 +207,8 @@ test("recovery menu renders outbound aggregates and only supported opaque action
   );
   assert.ok(callbacks.includes("recovery:ask:reassign:orphan_handle"));
   assert.ok(callbacks.includes("recovery:ask:downgrade"));
-  assert.equal(
-    callbacks.some((callback) => callback.includes("handle_bus")),
-    false,
-  );
+  assert.ok(callbacks.includes("recovery:ask:retry:handle_bus"));
+  assert.ok(callbacks.includes("recovery:ask:discard:handle_bus"));
   assert.ok(callbacks.every((callback) => Buffer.byteLength(callback) <= 64));
 });
 

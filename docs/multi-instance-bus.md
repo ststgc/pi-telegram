@@ -440,3 +440,9 @@ Live client and native Windows evidence gates are tracked in `BACKLOG.md`; this 
 ## Evidence Gates
 
 Open live/client questions belong in `BACKLOG.md` until confirmed. Capture confirmed quirks as focused regressions or documented caveats, not broad speculative matrices.
+
+## Durable follower mutations
+
+Follower API envelopes carry the exact profile, target, instance id, stable manual owner, registration generation, and follower session generation. The leader revalidates that tuple against the live registry on every request and replay. Retry-safe reads/idempotent methods keep the ordinary local-bus path; unsafe Bot API mutations enter the profile-scoped `recovery-v1*` journal before the leader calls Telegram.
+
+A completed journal entry stores its private serialized response and returns that response after leader restart without repeating Telegram. A process loss after mutation start but before durable completion reopens as `bus-uncertain` and never executes automatically. `/start` → Recovery exposes only an opaque metadata handle: confirmed Retry warns that Telegram may already contain the effect and creates a linked request, confirmed Discard terminalizes retained work, and safe Drain does not include uncertain requests. Profile downgrade fences new and in-flight bus operations through the same generation-bound recovery gate.

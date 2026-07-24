@@ -541,8 +541,57 @@ interface RecoveryOutboundPayloadV1 {
 export interface RecoveryBusRecord extends RecoveryRecordBase {
   family: "bus";
   requestId: string;
+  envelopeKind: "follower.callApi";
+  method: string;
+  apiMethod: string;
   payloadFingerprint: string;
+  followerInstanceId: string;
+  manualFollowerOwnerId: string;
+  registrationGeneration: string;
+  leaderEpoch: string | number;
+  leaderSessionGeneration: number;
   state: RecoveryBusState;
+  startedAtMs?: number;
+  linkedAttemptOf?: string;
+}
+
+export interface RecoveryBusCallEnvelopeV1 {
+  kind: "follower.callApi";
+  profile: string;
+  target: TelegramTarget;
+  requestId: string;
+  instanceId: string;
+  manualFollowerOwnerId: string;
+  registrationGeneration: string;
+  followerSessionGeneration: number;
+  method: string;
+  args: unknown[];
+}
+
+export interface RecoveryBusResponseV1 {
+  ok: boolean;
+  message?: string;
+  result?: unknown;
+  error?: { code: "commit-unknown"; method?: string };
+}
+
+export interface RecoveryBusPayloadV1 {
+  version: 1;
+  envelope: RecoveryBusCallEnvelopeV1;
+  response?: RecoveryBusResponseV1;
+}
+
+export interface RecoveryBusAdmissionInput {
+  identity: RecoveryIdentity;
+  envelope: RecoveryBusCallEnvelopeV1;
+  apiMethod: string;
+  leaderEpoch: string | number;
+  leaderSessionGeneration: number;
+}
+
+export interface RecoveryBusDrainItem {
+  record: RecoveryBusRecord;
+  payload: RecoveryBusPayloadV1;
 }
 
 export interface RecoveryReassignmentRecord {
@@ -1904,24 +1953,215 @@ function parseOutboundPayload(
   return readOutboundPayload(value, path, spoolCount);
 }
 
+function readRecoveryBusCallEnvelope(
+  value: unknown,
+  path: string,
+): RecoveryBusCallEnvelopeV1 {
+  const object = readObject(value, path);
+  assertKeys(object, path, [
+    "kind",
+    "profile",
+    "target",
+    "requestId",
+    "instanceId",
+    "manualFollowerOwnerId",
+    "registrationGeneration",
+    "followerSessionGeneration",
+    "method",
+    "args",
+  ]);
+  if (object.kind !== "follower.callApi") {
+    fail(`${path}.kind`, "expected follower.callApi");
+  }
+  if (!Array.isArray(object.args)) fail(`${path}.args`, "expected an array");
+  return {
+    kind: "follower.callApi",
+    profile: readProfile(object.profile, `${path}.profile`),
+    target: readTarget(object.target, `${path}.target`),
+    requestId: readStableString(object.requestId, `${path}.requestId`),
+    instanceId: readStableString(object.instanceId, `${path}.instanceId`),
+    manualFollowerOwnerId: readStableString(
+      object.manualFollowerOwnerId,
+      `${path}.manualFollowerOwnerId`,
+    ),
+    registrationGeneration: readStableString(
+      object.registrationGeneration,
+      `${path}.registrationGeneration`,
+    ),
+    followerSessionGeneration: readSafeInteger(
+      object.followerSessionGeneration,
+      `${path}.followerSessionGeneration`,
+      { minimum: 0 },
+    ),
+    method: readStableString(object.method, `${path}.method`),
+    args: structuredClone(object.args),
+  };
+}
+
+function readRecoveryBusResponse(
+  value: unknown,
+  path: string,
+): RecoveryBusResponseV1 {
+  const object = readObject(value, path);
+  assertKeys(object, path, ["ok"], ["message", "result", "error"]);
+  if (typeof object.ok !== "boolean") fail(`${path}.ok`, "expected boolean");
+  if (Object.hasOwn(object, "message") && typeof object.message !== "string") {
+    fail(`${path}.message`, "expected string");
+  }
+  if (Object.hasOwn(object, "error")) {
+    const error = readObject(object.error, `${path}.error`);
+    assertKeys(error, `${path}.error`, ["code"], ["method"]);
+    if (error.code !== "commit-unknown") {
+      fail(`${path}.error.code`, "expected commit-unknown");
+    }
+    if (Object.hasOwn(error, "method") && typeof error.method !== "string") {
+      fail(`${path}.error.method`, "expected string");
+    }
+  }
+  if (object.ok && Object.hasOwn(object, "error")) {
+    fail(`${path}.error`, "successful response cannot contain an error");
+  }
+  return {
+    ok: object.ok,
+    ...(typeof object.message === "string" ? { message: object.message } : {}),
+    ...(Object.hasOwn(object, "result")
+      ? { result: structuredClone(object.result) }
+      : {}),
+    ...(Object.hasOwn(object, "error")
+      ? {
+          error: {
+            code: "commit-unknown" as const,
+            ...(typeof (object.error as JsonObject).method === "string"
+              ? { method: (object.error as JsonObject).method as string }
+              : {}),
+          },
+        }
+      : {}),
+  };
+}
+
+export function validateRecoveryBusPayload(value: unknown): RecoveryBusPayloadV1 {
+  const object = readObject(value, "$busPayload");
+  assertKeys(object, "$busPayload", ["version", "envelope"], ["response"]);
+  if (object.version !== 1) fail("$busPayload.version", "expected 1");
+  return {
+    version: 1,
+    envelope: readRecoveryBusCallEnvelope(
+      object.envelope,
+      "$busPayload.envelope",
+    ),
+    ...(Object.hasOwn(object, "response")
+      ? { response: readRecoveryBusResponse(object.response, "$busPayload.response") }
+      : {}),
+  };
+}
+
+export function encodeRecoveryBusPayload(payload: RecoveryBusPayloadV1): Buffer {
+  return Buffer.from(JSON.stringify(validateRecoveryBusPayload(payload)), "utf8");
+}
+
+export function parseRecoveryBusPayload(bytes: Uint8Array): RecoveryBusPayloadV1 {
+  let value: unknown;
+  try {
+    value = JSON.parse(Buffer.from(bytes).toString("utf8"));
+  } catch (error) {
+    fail(
+      "$busPayload",
+      `invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  return validateRecoveryBusPayload(value);
+}
+
+export function createRecoveryBusPayloadFingerprint(
+  envelope: RecoveryBusCallEnvelopeV1,
+): string {
+  return sha256Bytes(
+    encodeRecoveryBusPayload({ version: 1, envelope, }),
+  );
+}
+
 function readBusRecord(value: unknown, path: string): RecoveryBusRecord {
   const object = readObject(value, path);
   assertKeys(
     object,
     path,
-    [...RECORD_BASE_REQUIRED_KEYS, "requestId", "payloadFingerprint", "state"],
-    RECORD_BASE_OPTIONAL_KEYS,
+    [
+      ...RECORD_BASE_REQUIRED_KEYS,
+      "requestId",
+      "envelopeKind",
+      "method",
+      "apiMethod",
+      "payloadFingerprint",
+      "followerInstanceId",
+      "manualFollowerOwnerId",
+      "registrationGeneration",
+      "leaderEpoch",
+      "leaderSessionGeneration",
+      "state",
+    ],
+    [...RECORD_BASE_OPTIONAL_KEYS, "startedAtMs", "linkedAttemptOf"],
   );
   if (object.family !== "bus") fail(`${path}.family`, "expected bus");
+  if (object.envelopeKind !== "follower.callApi") {
+    fail(`${path}.envelopeKind`, "expected follower.callApi");
+  }
+  const base = readRecordBase(object, path);
+  const state = readEnum(object.state, `${path}.state`, RECOVERY_BUS_STATES);
+  const startedAtMs = Object.hasOwn(object, "startedAtMs")
+    ? readTimestamp(object.startedAtMs, `${path}.startedAtMs`)
+    : undefined;
+  if (startedAtMs !== undefined && state !== "pending") {
+    fail(`${path}.startedAtMs`, "is valid only while pending");
+  }
+  if (state !== "explicitly-discarded" && !base.payloadRef) {
+    fail(`${path}.payloadRef`, "non-discarded bus work requires private payload");
+  }
+  if (state === "explicitly-discarded" && base.payloadRef) {
+    fail(`${path}.payloadRef`, "discarded bus work must release its payload");
+  }
   return {
-    ...readRecordBase(object, path),
+    ...base,
     family: "bus",
     requestId: readStableString(object.requestId, `${path}.requestId`),
+    envelopeKind: "follower.callApi",
+    method: readStableString(object.method, `${path}.method`),
+    apiMethod: readStableString(object.apiMethod, `${path}.apiMethod`),
     payloadFingerprint: readStableString(
       object.payloadFingerprint,
       `${path}.payloadFingerprint`,
     ),
-    state: readEnum(object.state, `${path}.state`, RECOVERY_BUS_STATES),
+    followerInstanceId: readStableString(
+      object.followerInstanceId,
+      `${path}.followerInstanceId`,
+    ),
+    manualFollowerOwnerId: readStableString(
+      object.manualFollowerOwnerId,
+      `${path}.manualFollowerOwnerId`,
+    ),
+    registrationGeneration: readStableString(
+      object.registrationGeneration,
+      `${path}.registrationGeneration`,
+    ),
+    leaderEpoch: readStringOrIntegerGeneration(
+      object.leaderEpoch,
+      `${path}.leaderEpoch`,
+    ),
+    leaderSessionGeneration: readSafeInteger(
+      object.leaderSessionGeneration,
+      `${path}.leaderSessionGeneration`,
+      { minimum: 0 },
+    ),
+    state,
+    ...(startedAtMs !== undefined ? { startedAtMs } : {}),
+    ...(Object.hasOwn(object, "linkedAttemptOf")
+      ? {
+          linkedAttemptOf: readStableString(
+            object.linkedAttemptOf,
+            `${path}.linkedAttemptOf`,
+          ),
+        }
+      : {}),
   };
 }
 
@@ -2176,7 +2416,8 @@ function assertStructurallyUniqueRequests(snapshot: RecoverySnapshotV1): void {
   assertUniqueStrings(
     snapshot.bus.map((record) =>
       JSON.stringify([
-        ...targetTuple(record.identity.target),
+        record.followerInstanceId,
+        record.manualFollowerOwnerId,
         record.requestId,
       ]),
     ),
@@ -2545,9 +2786,12 @@ export type RecoveryOutboundFaultId =
   | "OUT-05"
   | "OUT-06";
 
+export type RecoveryBusFaultId = "BUS-01" | "BUS-02" | "BUS-03" | "BUS-04";
+
 export type RecoveryStorageFaultId =
   | RecoveryInboundFaultId
-  | RecoveryOutboundFaultId;
+  | RecoveryOutboundFaultId
+  | RecoveryBusFaultId;
 
 export interface RecoveryFileSystem {
   chmod: typeof chmodSync;
@@ -3367,7 +3611,14 @@ export class RecoveryStore {
       const sendingOutbound = snapshot.outbound.filter(
         (record) => record.state === "sending",
       );
-      if (dispatching.length > 0 || sendingOutbound.length > 0) {
+      const startedBus = snapshot.bus.filter(
+        (record) => record.state === "pending" && record.startedAtMs !== undefined,
+      );
+      if (
+        dispatching.length > 0 ||
+        sendingOutbound.length > 0 ||
+        startedBus.length > 0
+      ) {
         snapshot = cloneSnapshot(snapshot);
         const revision = snapshot.revision + 1;
         const nowMs = this.#now();
@@ -3419,6 +3670,13 @@ export class RecoveryStore {
             inbound.updatedAtMs = nowMs;
           }
         }
+        for (const bus of snapshot.bus) {
+          if (bus.state !== "pending" || bus.startedAtMs === undefined) continue;
+          bus.state = "bus-uncertain";
+          delete bus.startedAtMs;
+          bus.stateRevision = revision;
+          bus.updatedAtMs = nowMs;
+        }
         snapshot.revision = revision;
         snapshot.writtenAtMs = nowMs;
         this.#writeSnapshotLocked(snapshot);
@@ -3435,6 +3693,9 @@ export class RecoveryStore {
         }
         if (sendingOutbound.length > 0) {
           this.#incidents.push("outbound-sending-marked-uncertain");
+        }
+        if (startedBus.length > 0) {
+          this.#incidents.push("bus-started-marked-uncertain");
         }
       }
       this.#admissionDisabled = snapshot.mode !== "active";
@@ -3608,6 +3869,9 @@ export class RecoveryStore {
       }
       if (record.family === "outbound" && record.payloadRef) {
         this.#readOutboundPayload(snapshot, record);
+      }
+      if (record.family === "bus" && record.payloadRef) {
+        this.#readBusPayload(record);
       }
     }
     const reservedBytes = this.#reconcileMaterializedFilesLocked(snapshot);
@@ -3862,6 +4126,35 @@ export class RecoveryStore {
     return { payload, bytes };
   }
 
+  #readBusPayload(record: RecoveryBusRecord): RecoveryBusPayloadV1 {
+    if (!record.payloadRef) {
+      throw new Error(`Recovery bus record ${record.recordId} has no payload`);
+    }
+    const payload = parseRecoveryBusPayload(
+      this.#readVerifiedBinary(
+        this.payloadDirectory,
+        record.payloadRef,
+        record.recordId,
+      ),
+    );
+    const envelope = payload.envelope;
+    if (
+      envelope.profile !== record.identity.profile ||
+      !areRecoveryTargetsEqual(envelope.target, record.identity.target) ||
+      envelope.requestId !== record.requestId ||
+      envelope.instanceId !== record.followerInstanceId ||
+      envelope.manualFollowerOwnerId !== record.manualFollowerOwnerId ||
+      envelope.registrationGeneration !== record.registrationGeneration ||
+      envelope.followerSessionGeneration !== record.identity.sessionGeneration ||
+      envelope.method !== record.method ||
+      createRecoveryBusPayloadFingerprint(envelope) !== record.payloadFingerprint ||
+      (record.state === "completed") !== (payload.response !== undefined)
+    ) {
+      throw new Error("Recovery bus payload metadata mismatch");
+    }
+    return payload;
+  }
+
   #readVerifiedBinary(
     directory: string,
     reference: RecoveryPayloadReference | RecoverySpoolReference,
@@ -3944,6 +4237,29 @@ export class RecoveryStore {
       !this.#hasCommittedGrant(snapshot, record, claim.identity)
     ) {
       throw new Error("Recovery record identity claim denied");
+    }
+  }
+
+  #assertBusClaim(
+    snapshot: RecoverySnapshotV1,
+    record: RecoveryBusRecord,
+    claim: RecoveryIdentityClaim,
+  ): void {
+    this.#authenticate(claim.identity);
+    const blockingReassignment = snapshot.reassignments.some(
+      (entry) =>
+        entry.unresolvedRecordIds.includes(record.recordId) &&
+        entry.state !== "recovery-grant-committed" &&
+        entry.state !== "cancelled-before-transfer",
+    );
+    if (blockingReassignment) {
+      throw new Error("Recovery bus record is fenced by a pending reassignment");
+    }
+    if (
+      !identitiesEqual(record.identity, claim.identity) &&
+      !this.#hasCommittedGrant(snapshot, record, claim.identity)
+    ) {
+      throw new Error("Recovery bus identity claim denied");
     }
   }
 
@@ -5112,6 +5428,425 @@ export class RecoveryStore {
     };
   }
 
+  admitBus(input: RecoveryBusAdmissionInput): RecoveryBusDrainItem {
+    const identity = readIdentity(input.identity, "$bus.identity");
+    const envelope = readRecoveryBusCallEnvelope(input.envelope, "$bus.envelope");
+    const apiMethod = readStableString(input.apiMethod, "$bus.apiMethod");
+    const leaderEpoch = readStringOrIntegerGeneration(
+      input.leaderEpoch,
+      "$bus.leaderEpoch",
+    );
+    const leaderSessionGeneration = readSafeInteger(
+      input.leaderSessionGeneration,
+      "$bus.leaderSessionGeneration",
+      { minimum: 0 },
+    );
+    if (
+      identity.owner.kind !== "manual-follower" ||
+      identity.profile !== envelope.profile ||
+      !areRecoveryTargetsEqual(identity.target, envelope.target) ||
+      identity.owner.ownerId !== envelope.manualFollowerOwnerId ||
+      identity.owner.registrationGeneration !== envelope.registrationGeneration ||
+      identity.sessionGeneration !== envelope.followerSessionGeneration
+    ) {
+      throw new Error("Recovery bus envelope identity mismatch");
+    }
+    const fingerprint = createRecoveryBusPayloadFingerprint(envelope);
+    const payload = { version: 1 as const, envelope };
+    const payloadBytes = encodeRecoveryBusPayload(payload);
+    let newlyAdmitted = false;
+    const result = withTelegramFileTransaction(
+      `${this.rootPath}.transaction`,
+      () => {
+        const current = this.#readSnapshotForMutationLocked();
+        this.#assertActive(current);
+        this.#authenticate(identity);
+        const existing = current.bus.find(
+          (record) =>
+            record.followerInstanceId === envelope.instanceId &&
+            record.manualFollowerOwnerId === envelope.manualFollowerOwnerId &&
+            record.requestId === envelope.requestId,
+        );
+        if (existing) {
+          if (
+            !identitiesEqual(existing.identity, identity) ||
+            existing.payloadFingerprint !== fingerprint ||
+            existing.envelopeKind !== envelope.kind ||
+            existing.method !== envelope.method ||
+            existing.apiMethod !== apiMethod ||
+            existing.followerInstanceId !== envelope.instanceId ||
+            existing.manualFollowerOwnerId !== envelope.manualFollowerOwnerId ||
+            existing.registrationGeneration !== envelope.registrationGeneration
+          ) {
+            throw new Error(
+              "Recovery bus request id was reused with a different payload",
+            );
+          }
+          return {
+            record: structuredClone(existing),
+            payload: this.#readBusPayload(existing),
+          };
+        }
+        this.#assertNotFencedByReassignment(current, identity);
+        this.#fault?.("BUS-01");
+        const nowMs = this.#now();
+        const revision = current.revision + 1;
+        const snapshot = cloneSnapshot(current);
+        const payloadId = this.#randomId();
+        assertSafeFileId(payloadId, "$bus.payloadId");
+        const record: RecoveryBusRecord = {
+          family: "bus",
+          recordId: this.#randomId(),
+          requestId: envelope.requestId,
+          envelopeKind: "follower.callApi",
+          method: envelope.method,
+          apiMethod,
+          payloadFingerprint: fingerprint,
+          followerInstanceId: envelope.instanceId,
+          manualFollowerOwnerId: envelope.manualFollowerOwnerId,
+          registrationGeneration: envelope.registrationGeneration,
+          leaderEpoch,
+          leaderSessionGeneration,
+          state: "pending",
+          identity,
+          createdRevision: revision,
+          stateRevision: revision,
+          createdAtMs: nowMs,
+          updatedAtMs: nowMs,
+          payloadRef: {
+            payloadId,
+            byteLength: payloadBytes.byteLength,
+            sha256: sha256Bytes(payloadBytes),
+          },
+          spoolRefs: [],
+        };
+        snapshot.bus.push(record);
+        snapshot.revision = revision;
+        snapshot.writtenAtMs = nowMs;
+        serializeAccountedSnapshot(snapshot);
+        if (snapshot.quota.totalBytes > this.quotaBytes) {
+          throw new RecoveryQuotaExceededError(
+            snapshot.quota.totalBytes,
+            this.quotaBytes,
+          );
+        }
+        const path = makeBinaryPath(this.payloadDirectory, payloadId);
+        let committed = false;
+        let commitUnknown = false;
+        try {
+          writePrivateFile(this.#fs, path, payloadBytes);
+          fsyncPath(this.#fs, this.payloadDirectory);
+          this.#writeSnapshotLocked(snapshot);
+          committed = true;
+          newlyAdmitted = true;
+          return { record: structuredClone(record), payload };
+        } catch (error) {
+          commitUnknown = error instanceof RecoverySnapshotCommitUnknownError;
+          throw error;
+        } finally {
+          if (!committed && !commitUnknown && this.#fs.exists(path)) {
+            this.#fs.remove(path, { force: true, recursive: true });
+            fsyncPath(this.#fs, this.payloadDirectory);
+          }
+        }
+      },
+    );
+    if (newlyAdmitted) this.#fault?.("BUS-02");
+    return result;
+  }
+
+  claimBus(input: {
+    recordId: string;
+    identity: RecoveryIdentity;
+    leaderEpoch: string | number;
+    leaderSessionGeneration: number;
+  }): RecoveryBusDrainItem {
+    return this.#commit((snapshot, revision, nowMs) => {
+      this.#assertActive(snapshot);
+      const record = this.#getBus(snapshot, input.recordId);
+      this.#assertBusClaim(snapshot, record, { identity: input.identity });
+      if (record.state !== "pending" || record.startedAtMs !== undefined) {
+        throw new Error(`Recovery bus request is not claimable (${record.state})`);
+      }
+      record.leaderEpoch = readStringOrIntegerGeneration(
+        input.leaderEpoch,
+        "$bus.leaderEpoch",
+      );
+      record.leaderSessionGeneration = readSafeInteger(
+        input.leaderSessionGeneration,
+        "$bus.leaderSessionGeneration",
+        { minimum: 0 },
+      );
+      record.startedAtMs = nowMs;
+      record.stateRevision = revision;
+      record.updatedAtMs = nowMs;
+      return { record: structuredClone(record), payload: this.#readBusPayload(record) };
+    });
+  }
+
+  completeBus(
+    recordId: string,
+    claim: RecoveryIdentityClaim,
+    response: RecoveryBusResponseV1,
+  ): RecoveryBusDrainItem {
+    const parsedResponse = readRecoveryBusResponse(response, "$bus.response");
+    const result = withTelegramFileTransaction(
+      `${this.rootPath}.transaction`,
+      () => {
+        const current = this.#readSnapshotForMutationLocked();
+        this.#assertActive(current);
+        const currentRecord = this.#getBus(current, recordId);
+        this.#assertBusClaim(current, currentRecord, claim);
+        if (currentRecord.state === "completed") {
+          return {
+            record: structuredClone(currentRecord),
+            payload: this.#readBusPayload(currentRecord),
+          };
+        }
+        if (currentRecord.state !== "pending" || currentRecord.startedAtMs === undefined) {
+          throw new Error("Recovery bus request has no active mutation claim");
+        }
+        this.#fault?.("BUS-03");
+        const snapshot = cloneSnapshot(current);
+        const record = this.#getBus(snapshot, recordId);
+        const existingPayload = this.#readBusPayload(currentRecord);
+        const payload: RecoveryBusPayloadV1 = {
+          version: 1,
+          envelope: existingPayload.envelope,
+          response: parsedResponse,
+        };
+        const bytes = encodeRecoveryBusPayload(payload);
+        const payloadId = this.#randomId();
+        assertSafeFileId(payloadId, "$bus.responsePayloadId");
+        const oldPath = makeBinaryPath(
+          this.payloadDirectory,
+          currentRecord.payloadRef!.payloadId,
+        );
+        const newPath = makeBinaryPath(this.payloadDirectory, payloadId);
+        const revision = current.revision + 1;
+        const nowMs = this.#now();
+        record.payloadRef = {
+          payloadId,
+          byteLength: bytes.byteLength,
+          sha256: sha256Bytes(bytes),
+        };
+        record.state = "completed";
+        delete record.startedAtMs;
+        record.stateRevision = revision;
+        record.updatedAtMs = nowMs;
+        snapshot.revision = revision;
+        snapshot.writtenAtMs = nowMs;
+        serializeAccountedSnapshot(snapshot);
+        let committed = false;
+        let commitUnknown = false;
+        try {
+          writePrivateFile(this.#fs, newPath, bytes);
+          fsyncPath(this.#fs, this.payloadDirectory);
+          this.#writeSnapshotLocked(snapshot);
+          committed = true;
+          try {
+            this.#fs.remove(oldPath, { force: true });
+            fsyncPath(this.#fs, this.payloadDirectory);
+          } catch {
+            this.#incidents.push("post-commit-cleanup-failed");
+          }
+          return { record: structuredClone(record), payload };
+        } catch (error) {
+          commitUnknown = error instanceof RecoverySnapshotCommitUnknownError;
+          throw error;
+        } finally {
+          if (!committed && !commitUnknown && this.#fs.exists(newPath)) {
+            this.#fs.remove(newPath, { force: true });
+            fsyncPath(this.#fs, this.payloadDirectory);
+          }
+        }
+      },
+    );
+    this.#fault?.("BUS-04");
+    return result;
+  }
+
+  markBusUncertain(
+    recordId: string,
+    claim: RecoveryIdentityClaim,
+  ): RecoveryBusRecord {
+    return this.#commit((snapshot, revision, nowMs) => {
+      this.#assertActive(snapshot);
+      const record = this.#getBus(snapshot, recordId);
+      this.#assertBusClaim(snapshot, record, claim);
+      if (record.state === "bus-uncertain") return structuredClone(record);
+      if (record.state !== "pending" || record.startedAtMs === undefined) {
+        throw new Error("Recovery bus request has no uncertain mutation claim");
+      }
+      record.state = "bus-uncertain";
+      delete record.startedAtMs;
+      record.stateRevision = revision;
+      record.updatedAtMs = nowMs;
+      return structuredClone(record);
+    });
+  }
+
+  drainSafeBus(): RecoveryBusDrainItem[] {
+    return withTelegramFileTransaction(`${this.rootPath}.transaction`, () => {
+      const snapshot = this.#readSnapshotForMutationLocked();
+      this.#assertActive(snapshot);
+      const result: RecoveryBusDrainItem[] = [];
+      for (const record of snapshot.bus) {
+        if (record.state !== "pending" || record.startedAtMs !== undefined) continue;
+        try {
+          this.#authenticate(record.identity);
+        } catch {
+          continue;
+        }
+        result.push({
+          record: structuredClone(record),
+          payload: this.#readBusPayload(record),
+        });
+      }
+      return result;
+    });
+  }
+
+  discardBusAction(actionId: string): RecoveryBusRecord {
+    return this.#commit((snapshot, revision, nowMs, deleteAfterCommit) => {
+      this.#assertActive(snapshot);
+      const record = this.#resolveBusActionId(snapshot, actionId);
+      this.#authenticate(record.identity);
+      if (record.state !== "bus-uncertain") {
+        throw new Error("Only bus-uncertain work may be discarded");
+      }
+      if (record.payloadRef) {
+        deleteAfterCommit.push(
+          makeBinaryPath(this.payloadDirectory, record.payloadRef.payloadId),
+        );
+        delete record.payloadRef;
+      }
+      record.state = "explicitly-discarded";
+      delete record.startedAtMs;
+      record.stateRevision = revision;
+      record.updatedAtMs = nowMs;
+      return structuredClone(record);
+    });
+  }
+
+  retryUncertainBusAction(
+    actionId: string,
+    newRequestId: string,
+  ): RecoveryBusDrainItem {
+    const requestId = readStableString(newRequestId, "$bus.retry.requestId");
+    return withTelegramFileTransaction(`${this.rootPath}.transaction`, () => {
+      const current = this.#readSnapshotForMutationLocked();
+      this.#assertActive(current);
+      const source = this.#resolveBusActionId(current, actionId);
+      this.#authenticate(source.identity);
+      const existing = current.bus.find(
+        (candidate) => candidate.linkedAttemptOf === source.recordId,
+      );
+      if (existing) {
+        return {
+          record: structuredClone(existing),
+          payload: this.#readBusPayload(existing),
+        };
+      }
+      if (source.state !== "bus-uncertain" || !source.payloadRef) {
+        throw new Error("Only bus-uncertain work may be retried");
+      }
+      const sourcePayload = this.#readBusPayload(source);
+      const envelope = readRecoveryBusCallEnvelope(
+        { ...sourcePayload.envelope, requestId },
+        "$bus.retry.envelope",
+      );
+      if (
+        current.bus.some(
+          (candidate) =>
+            candidate.followerInstanceId === envelope.instanceId &&
+            candidate.manualFollowerOwnerId === envelope.manualFollowerOwnerId &&
+            candidate.requestId === requestId,
+        )
+      ) {
+        throw new Error("Recovery bus retry request id collision");
+      }
+      const payload = { version: 1 as const, envelope };
+      const payloadBytes = encodeRecoveryBusPayload(payload);
+      const snapshot = cloneSnapshot(current);
+      const original = this.#getBus(snapshot, source.recordId);
+      const revision = snapshot.revision + 1;
+      const nowMs = this.#now();
+      const payloadId = this.#randomId();
+      assertSafeFileId(payloadId, "$bus.retry.payloadId");
+      const retry: RecoveryBusRecord = {
+        family: "bus",
+        recordId: this.#randomId(),
+        requestId,
+        envelopeKind: "follower.callApi",
+        method: envelope.method,
+        apiMethod: original.apiMethod,
+        payloadFingerprint: createRecoveryBusPayloadFingerprint(envelope),
+        followerInstanceId: envelope.instanceId,
+        manualFollowerOwnerId: envelope.manualFollowerOwnerId,
+        registrationGeneration: envelope.registrationGeneration,
+        leaderEpoch: original.leaderEpoch,
+        leaderSessionGeneration: original.leaderSessionGeneration,
+        state: "pending",
+        identity: structuredClone(original.identity),
+        linkedAttemptOf: original.recordId,
+        createdRevision: revision,
+        stateRevision: revision,
+        createdAtMs: nowMs,
+        updatedAtMs: nowMs,
+        payloadRef: {
+          payloadId,
+          byteLength: payloadBytes.byteLength,
+          sha256: sha256Bytes(payloadBytes),
+        },
+        spoolRefs: [],
+      };
+      const oldPayloadPath = makeBinaryPath(
+        this.payloadDirectory,
+        source.payloadRef.payloadId,
+      );
+      original.state = "explicitly-discarded";
+      original.stateRevision = revision;
+      original.updatedAtMs = nowMs;
+      delete original.startedAtMs;
+      delete original.payloadRef;
+      snapshot.bus.push(retry);
+      snapshot.revision = revision;
+      snapshot.writtenAtMs = nowMs;
+      serializeAccountedSnapshot(snapshot);
+      if (snapshot.quota.totalBytes > this.quotaBytes) {
+        throw new RecoveryQuotaExceededError(
+          snapshot.quota.totalBytes,
+          this.quotaBytes,
+        );
+      }
+      const newPayloadPath = makeBinaryPath(this.payloadDirectory, payloadId);
+      let committed = false;
+      let commitUnknown = false;
+      try {
+        writePrivateFile(this.#fs, newPayloadPath, payloadBytes);
+        fsyncPath(this.#fs, this.payloadDirectory);
+        this.#writeSnapshotLocked(snapshot);
+        committed = true;
+      } catch (error) {
+        commitUnknown = error instanceof RecoverySnapshotCommitUnknownError;
+        throw error;
+      } finally {
+        if (!committed && !commitUnknown && this.#fs.exists(newPayloadPath)) {
+          this.#fs.remove(newPayloadPath, { force: true, recursive: true });
+          fsyncPath(this.#fs, this.payloadDirectory);
+        }
+      }
+      try {
+        this.#fs.remove(oldPayloadPath, { force: true, recursive: true });
+        fsyncPath(this.#fs, this.payloadDirectory);
+      } catch {
+        this.#incidents.push("post-commit-cleanup-failed");
+      }
+      return { record: structuredClone(retry), payload };
+    });
+  }
+
   planOutbound(input: RecoveryOutboundPlanInput): RecoveryOutboundRecord {
     const identity = readIdentity(input.claim.identity, "$plan.claim.identity");
     const sourceInboundRecordIds = input.sourceInboundRecordIds.map((recordId, index) =>
@@ -5946,6 +6681,21 @@ export class RecoveryStore {
     return this.#getOutbound(snapshot, recordId);
   }
 
+  #resolveBusActionId(
+    snapshot: RecoverySnapshotV1,
+    actionId: string,
+  ): RecoveryBusRecord {
+    const recordId = this.#recordActionIds(snapshot).get(actionId);
+    if (!recordId) throw new Error("Unknown recovery action id");
+    return this.#getBus(snapshot, recordId);
+  }
+
+  #getBus(snapshot: RecoverySnapshotV1, recordId: string): RecoveryBusRecord {
+    const record = snapshot.bus.find((entry) => entry.recordId === recordId);
+    if (!record) throw new Error("Unknown recovery bus record");
+    return record;
+  }
+
   #getInbound(
     snapshot: RecoverySnapshotV1,
     recordId: string,
@@ -6399,6 +7149,7 @@ export class RecoveryStore {
       if (!isTerminalRecord(record)) continue;
       if (
         record.payloadRef &&
+        record.family !== "bus" &&
         (!isSuccessfulTerminalRecord(record) ||
           nowMs - record.updatedAtMs >= RECOVERY_DELIVERED_PAYLOAD_RETENTION_MS)
       ) {
