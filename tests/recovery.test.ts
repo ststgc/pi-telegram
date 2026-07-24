@@ -1110,10 +1110,10 @@ test("outbound transitions preserve ordered receipts and atomically complete inb
   }
 });
 
-test("outbound known-safe failures use exactly three starts with 250/1000 ms delays and operator drain reset", () => {
+test("outbound known-safe failures use exactly three starts and exhausted work is discard-only", () => {
   const harness = createStoreHarness();
   try {
-    const { outbound } = prepareOutbound(harness);
+    const { inbound, outbound } = prepareOutbound(harness);
     harness.store.activateOutbound(outbound.recordId, { identity: OLD_IDENTITY });
     const first = harness.store.claimOutboundUnit({
       recordId: outbound.recordId,
@@ -1168,16 +1168,25 @@ test("outbound known-safe failures use exactly three starts with 250/1000 ms del
       }),
       /attempts are exhausted/,
     );
-    const drained = harness.store.drainSafeOutbound({ identity: OLD_IDENTITY });
-    assert.equal(drained.length, 1);
-    assert.equal(drained[0]!.record.state, "pending");
-    assert.equal(drained[0]!.record.automaticAttemptCount, 0);
+    assert.deepEqual(
+      harness.store.drainSafeOutbound({ identity: OLD_IDENTITY }),
+      [],
+    );
+    const statusItem = harness.store.getStatus().items.find(
+      (item) => item.family === "outbound" && item.state === "retryable-pending",
+    );
+    assert.equal(statusItem?.requiredAction, "discard");
     assert.equal(
-      harness.store.claimOutboundUnit({
-        recordId: outbound.recordId,
-        claim: { identity: OLD_IDENTITY },
-      }).record.automaticAttemptCount,
-      1,
+      harness.store.discardOutboundAction(statusItem!.actionId, {
+        identity: OLD_IDENTITY,
+      }).state,
+      "explicitly-discarded",
+    );
+    assert.equal(
+      readStoreSnapshot(harness.rootPath).inbound.find(
+        (record) => record.recordId === inbound.recordId,
+      )!.state,
+      "completed",
     );
   } finally {
     removeHarness(harness);
@@ -1291,9 +1300,11 @@ test("outbound uncertainty never auto-retries and explicit linked retry transfer
     );
     assert.equal(secondRetry.record.linkedAttemptOf, retry.record.recordId);
     assert.equal(secondRetry.record.payloadRef!.payloadId, beforeRefs.payloadId);
-    assert.throws(
-      () => harness.store.discardOutbound(outbound.recordId, { identity: OLD_IDENTITY }),
-      /linked retry exists/,
+    assert.equal(
+      harness.store.discardOutbound(outbound.recordId, {
+        identity: OLD_IDENTITY,
+      }).state,
+      "explicitly-discarded",
     );
   } finally {
     removeHarness(harness);

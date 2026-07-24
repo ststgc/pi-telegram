@@ -937,6 +937,36 @@ test("Bridge status lines include queue lanes and recent runtime events", () => 
   ]);
 });
 
+test("Bridge status exposes metadata-only durable delivery aggregates", () => {
+  const lines = buildTelegramBridgeStatusLines(
+    {
+      botUsername: "demo_bot",
+      allowedUserId: 42,
+      pollingActive: true,
+      pendingDispatch: false,
+      compactionInProgress: false,
+      activeToolExecutions: 0,
+      pendingModelSwitch: false,
+      queuedItems: [],
+      recovery: {
+        pendingDeliveryCount: 4,
+        deliveryUncertainCount: 1,
+        busBlockerCount: 2,
+      },
+      recentRuntimeEvents: [],
+    },
+    { verbose: true },
+  );
+  assert.ok(lines.includes("recovery:"));
+  assert.ok(lines.includes("- pending delivery: 4"));
+  assert.ok(lines.includes("- delivery uncertain: 1"));
+  assert.ok(lines.includes("- bus blockers: 2 (actions unavailable)"));
+  assert.doesNotMatch(
+    JSON.stringify(lines),
+    /recordId|turnId|chatId|threadId|payload|receipt|token|path/,
+  );
+});
+
 test("Status HTML builder binds active model lookup", () => {
   const model = { provider: "openai", id: "gpt-5", contextWindow: 1000 };
   const buildStatusHtml = createTelegramStatusHtmlBuilder({

@@ -54,6 +54,40 @@ function makeStatus(): RecoveryMetadataStatus {
         requiredAction: "drain",
       },
       {
+        id: "outbound-planned-record-id",
+        actionId: "handle_outbound_planned",
+        family: "outbound",
+        state: "planned",
+        ageMs: 4_000,
+        requiredAction: "drain",
+      },
+      {
+        id: "outbound-sending-record-id",
+        actionId: "handle_outbound_sending",
+        family: "outbound",
+        state: "sending",
+        ageMs: 3_000,
+        requiredAction: "none",
+      },
+      {
+        id: "outbound-uncertain-record-id",
+        actionId: "handle_outbound_uncertain",
+        family: "outbound",
+        state: "delivery-uncertain",
+        ageMs: 2_500,
+        requiredAction: "retry-or-discard",
+        target: { chatId: 654321 },
+        receipts: [{ method: "sendMessage", messageId: 55 }],
+      } as RecoveryMetadataStatus["items"][number],
+      {
+        id: "outbound-exhausted-record-id",
+        actionId: "handle_outbound_exhausted",
+        family: "outbound",
+        state: "retryable-pending",
+        ageMs: 2_250,
+        requiredAction: "discard",
+      },
+      {
         id: "bus-record-id",
         actionId: "handle_bus",
         family: "bus",
@@ -91,35 +125,52 @@ test("recovery operator projection serializes only approved metadata", () => {
 
   assert.deepEqual(projected.familyCounts, {
     inbound: 2,
-    outbound: 0,
+    outbound: 4,
     bus: 1,
   });
   assert.deepEqual(projected.stateCounts, {
     "execution-uncertain": 1,
     admitted: 1,
+    planned: 1,
+    sending: 1,
+    "delivery-uncertain": 1,
+    "retryable-pending": 1,
     "bus-uncertain": 1,
   });
+  assert.equal(projected.pendingDeliveryCount, 3);
+  assert.equal(projected.deliveryUncertainCount, 1);
+  assert.equal(projected.drainableCount, 2);
   assert.deepEqual(projected.incidents, [
     "orphaned-dispatch-marked-uncertain",
     "recovery-incident",
   ]);
-  assert.deepEqual(Object.keys(projected.items[0]!).sort(), [
-    "handle",
-    "requiredAction",
-  ]);
+  for (const item of projected.items) {
+    assert.deepEqual(Object.keys(item).sort(), [
+      "family",
+      "handle",
+      "requiredAction",
+      "state",
+    ]);
+  }
   assert.deepEqual(Object.keys(projected.orphanCandidates[0]!).sort(), [
     "handle",
     "requiredAction",
   ]);
   assert.match(serialized, /handle_retry/);
+  assert.match(serialized, /handle_outbound_uncertain/);
+  assert.match(serialized, /handle_outbound_exhausted/);
   assert.match(serialized, /orphan_handle/);
   assert.doesNotMatch(
     serialized,
-    /987654|123456|789|forbidden-record-id|another-record-id|bus-record-id|forbidden-owner|secret prompt|private\/secret|super-secret|committedUpdateId|admissionEnabled|payloadBytes|spoolBytes|recordBytes|target|ownerId|recordId|turnId|payload|path|token/,
+    /handle_outbound_planned|handle_outbound_sending|handle_bus/,
+  );
+  assert.doesNotMatch(
+    serialized,
+    /987654|123456|654321|789|forbidden-record-id|another-record-id|record-id|forbidden-owner|secret prompt|private\/secret|super-secret|committedUpdateId|admissionEnabled|payloadBytes|spoolBytes|recordBytes|receipts|messageId|target|ownerId|recordId|turnId|payload|path|token/,
   );
 });
 
-test("recovery menu renders opaque handles and only inbound supported actions", () => {
+test("recovery menu renders outbound aggregates and only supported opaque actions", () => {
   const projected = projectTelegramRecoveryOperatorStatus(
     makeStatus(),
     makeOrphans(),
@@ -131,11 +182,27 @@ test("recovery menu renders opaque handles and only inbound supported actions", 
 
   assert.match(html, /profile/);
   assert.match(html, /handle_retry/);
-  assert.match(html, /retry or discard/);
-  assert.doesNotMatch(html, /handle_bus/);
+  assert.match(html, /pending delivery<\/code>: 3/);
+  assert.match(html, /delivery uncertain<\/code>: 1/);
+  assert.match(html, /handle_outbound_uncertain.*outbound.*delivery-uncertain.*retry or discard/s);
+  assert.match(html, /handle_outbound_exhausted.*discard/s);
+  assert.match(html, /actions are unavailable until P0-E/);
+  assert.doesNotMatch(
+    html,
+    /handle_bus|handle_outbound_planned|handle_outbound_sending/,
+  );
   assert.ok(callbacks.includes("recovery:ask:drain"));
   assert.ok(callbacks.includes("recovery:ask:retry:handle_retry"));
   assert.ok(callbacks.includes("recovery:ask:discard:handle_retry"));
+  assert.ok(
+    callbacks.includes("recovery:ask:retry:handle_outbound_uncertain"),
+  );
+  assert.ok(
+    callbacks.includes("recovery:ask:discard:handle_outbound_uncertain"),
+  );
+  assert.ok(
+    callbacks.includes("recovery:ask:discard:handle_outbound_exhausted"),
+  );
   assert.ok(callbacks.includes("recovery:ask:reassign:orphan_handle"));
   assert.ok(callbacks.includes("recovery:ask:downgrade"));
   assert.equal(
@@ -167,7 +234,7 @@ test("recovery actions require confirmation, warn on retry, and refresh", async 
     },
     retryUncertain: async (handle) => {
       events.push(`retry:${handle}`);
-      return { appended: true, duplicationWarning: true };
+      return { scheduled: true, duplicationWarning: true };
     },
     discard: (handle) => {
       events.push(`discard:${handle}`);
@@ -185,7 +252,7 @@ test("recovery actions require confirmation, warn on retry, and refresh", async 
     },
   });
 
-  assert.equal(runtime.getUnresolvedCount(), 3);
+  assert.equal(runtime.getUnresolvedCount(), 7);
   assert.equal(
     await runtime.handleCallbackQuery(
       { id: "ask", data: "recovery:ask:retry:handle_retry" },
@@ -194,14 +261,14 @@ test("recovery actions require confirmation, warn on retry, and refresh", async 
     true,
   );
   assert.deepEqual(events, []);
-  assert.match(edits.at(-1)!, /duplicate work/);
+  assert.match(edits.at(-1)!, /Telegram may already contain the prior effect/);
 
   await runtime.handleCallbackQuery(
     { id: "confirm", data: "recovery:confirm:retry:handle_retry" },
     {},
   );
   assert.deepEqual(events, ["retry:handle_retry"]);
-  assert.match(answers.at(-1)!, /Duplicate execution remains possible/);
+  assert.match(answers.at(-1)!, /Duplicate delivery remains possible/);
   assert.match(edits.at(-1)!, /Durable recovery/);
 
   await runtime.handleCallbackQuery(
@@ -227,7 +294,7 @@ test("recovery status-count failures log only a fixed sanitized error", () => {
     getOrphanCandidates: () => [],
     drainSafe: async () => 0,
     retryUncertain: async () => ({
-      appended: false,
+      scheduled: false,
       duplicationWarning: true,
     }),
     discard: () => {},

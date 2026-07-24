@@ -1788,6 +1788,64 @@ test("Guest media faults are phase-exact across reopen and ambiguity never selec
 });
 
 
+test("durable worker registers and schedules a confirmed linked uncertain retry", async () => {
+  const harness = await createHarness();
+  try {
+    const committed = await commitTelegramDurableOutbound(
+      baseOptions(harness),
+      { store: harness.store, transformReply: identityTransform },
+    );
+    const pending = harness.store.activateOutbound(
+      committed.record.recordId,
+      { identity: IDENTITY },
+    );
+    const sending = harness.store.claimOutboundUnit({
+      recordId: pending.recordId,
+      claim: { identity: IDENTITY },
+    });
+    harness.store.markOutboundUncertain({
+      recordId: pending.recordId,
+      claim: { identity: IDENTITY },
+      attemptId: sending.record.activeUnit!.attemptId,
+      reason: "response-lost",
+    });
+    const linked = harness.store.retryUncertainOutbound(
+      pending.recordId,
+      "operator-retry-v1:test-handle",
+      { identity: IDENTITY },
+    );
+    let sends = 0;
+    let terminal = 0;
+    const worker = createTelegramDurableOutboundWorker({
+      getStore: () => harness.store,
+      operationGate: new RecoveryProfileOperationGate(),
+      adapter: createUnitAdapterHarness({
+        sendRichMessage: async () => {
+          sends += 1;
+          return { message_id: 900 };
+        },
+      }).adapter,
+      onTerminal: () => {
+        terminal += 1;
+      },
+    });
+    worker.register(linked.record, { identity: IDENTITY });
+    worker.schedule(linked.record.recordId);
+    for (let attempt = 0; attempt < 100 && terminal === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(sends, 1);
+    assert.equal(terminal, 1);
+    assert.equal(
+      harness.store.getStatus().items.filter((item) => item.family === "outbound")
+        .length,
+      0,
+    );
+  } finally {
+    await removeHarness(harness);
+  }
+});
+
 test("durable worker advances terminal disposition once and never advances registered pending or sending", async () => {
   const harness = await createHarness();
   try {

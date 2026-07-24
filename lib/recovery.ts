@@ -2279,8 +2279,15 @@ function assertSnapshotConsistency(snapshot: RecoverySnapshotV1): void {
     }
     if (record.linkedAttemptOf) {
       const source = outboundById.get(record.linkedAttemptOf);
-      if (!source || source.state !== "delivery-uncertain") {
-        fail(`${path}.linkedAttemptOf`, "must reference delivery-uncertain outbound work");
+      if (
+        !source ||
+        (source.state !== "delivery-uncertain" &&
+          source.state !== "explicitly-discarded")
+      ) {
+        fail(
+          `${path}.linkedAttemptOf`,
+          "must reference resolved delivery-uncertain outbound work",
+        );
       }
       if (
         source.turnId !== record.turnId ||
@@ -2709,7 +2716,7 @@ export interface RecoveryStatusItem {
   family: "inbound" | "outbound" | "bus";
   state: RecoveryInboundState | RecoveryOutboundState | RecoveryBusState;
   ageMs: number;
-  requiredAction: "drain" | "retry-or-discard" | "none";
+  requiredAction: "drain" | "retry-or-discard" | "discard" | "none";
 }
 
 export interface RecoveryMetadataStatus {
@@ -5568,6 +5575,35 @@ export class RecoveryStore {
     });
   }
 
+  discardOutboundAction(
+    actionId: string,
+    claim: RecoveryIdentityClaim,
+  ): RecoveryOutboundRecord {
+    const recordId = withTelegramFileTransaction(
+      `${this.rootPath}.transaction`,
+      () => {
+        const record = this.#resolveOutboundActionId(
+          this.#readSnapshotLocked(),
+          actionId,
+        );
+        if (
+          record.state !== "delivery-uncertain" &&
+          !(
+            record.state === "retryable-pending" &&
+            record.automaticAttemptCount >=
+              RECOVERY_OUTBOUND_MAX_AUTOMATIC_STARTS
+          )
+        ) {
+          throw new Error(
+            "Only delivery-uncertain or exhausted outbound work may be discarded by an operator",
+          );
+        }
+        return record.recordId;
+      },
+    );
+    return this.discardOutbound(recordId, claim);
+  }
+
   retryUncertainOutbound(
     recordId: string,
     newIntentId: string,
@@ -5623,6 +5659,8 @@ export class RecoveryStore {
       delete attempt.uncertainty;
       delete source.payloadRef;
       source.spoolRefs = [];
+      source.state = "explicitly-discarded";
+      delete source.uncertainty;
       source.stateRevision = revision;
       source.updatedAtMs = nowMs;
       snapshot.outbound.push(attempt);
@@ -5631,6 +5669,20 @@ export class RecoveryStore {
         duplicationWarning: true,
       };
     });
+  }
+
+  retryUncertainOutboundAction(
+    actionId: string,
+    newIntentId: string,
+    claim: RecoveryIdentityClaim,
+  ): RecoveryOutboundRetryResult {
+    const recordId = withTelegramFileTransaction(
+      `${this.rootPath}.transaction`,
+      () =>
+        this.#resolveOutboundActionId(this.#readSnapshotLocked(), actionId)
+          .recordId,
+    );
+    return this.retryUncertainOutbound(recordId, newIntentId, claim);
   }
 
   /** Repairs terminal outbound/source relationships before queue rehydration. */
@@ -5741,22 +5793,21 @@ export class RecoveryStore {
       this.#authenticate(claim.identity);
       const result: RecoveryOutboundDrainItem[] = [];
       for (const record of snapshot.outbound) {
-        if (
-          record.state !== "planned" &&
-          record.state !== "pending" &&
-          record.state !== "retryable-pending"
-        ) {
-          continue;
-        }
+        const safe =
+          record.state === "planned" ||
+          record.state === "pending" ||
+          (record.state === "retryable-pending" &&
+            record.automaticAttemptCount <
+              RECOVERY_OUTBOUND_MAX_AUTOMATIC_STARTS &&
+            record.retryNotBeforeMs !== undefined);
+        if (!safe) continue;
         try {
           this.#assertOutboundClaim(snapshot, record, claim);
         } catch {
           continue;
         }
-        if (record.state !== "pending" || record.automaticAttemptCount !== 0) {
+        if (record.state === "planned") {
           record.state = "pending";
-          record.automaticAttemptCount = 0;
-          delete record.retryNotBeforeMs;
           record.stateRevision = revision;
           record.updatedAtMs = nowMs;
         }
@@ -5884,6 +5935,15 @@ export class RecoveryStore {
     const recordId = this.#recordActionIds(snapshot).get(actionId);
     if (!recordId) throw new Error("Unknown recovery action id");
     return this.#getInbound(snapshot, recordId);
+  }
+
+  #resolveOutboundActionId(
+    snapshot: RecoverySnapshotV1,
+    actionId: string,
+  ): RecoveryOutboundRecord {
+    const recordId = this.#recordActionIds(snapshot).get(actionId);
+    if (!recordId) throw new Error("Unknown recovery action id");
+    return this.#getOutbound(snapshot, recordId);
   }
 
   #getInbound(
@@ -6450,10 +6510,15 @@ export class RecoveryStore {
             state: record.state,
             ageMs: Math.max(0, nowMs - record.createdAtMs),
             requiredAction:
-              record.state === "delivery-uncertain" ||
-              record.state === "sending"
+              record.state === "delivery-uncertain"
                 ? "retry-or-discard"
-                : "drain",
+                : record.state === "retryable-pending" &&
+                    record.automaticAttemptCount >=
+                      RECOVERY_OUTBOUND_MAX_AUTOMATIC_STARTS
+                  ? "discard"
+                  : record.state === "sending"
+                    ? "none"
+                    : "drain",
           })),
         ...snapshot.bus
           .filter(isUnresolvedRecord)

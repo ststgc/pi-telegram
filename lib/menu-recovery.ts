@@ -23,7 +23,9 @@ const KNOWN_RECOVERY_INCIDENTS = new Set([
 
 export interface TelegramRecoveryOperatorItem {
   handle: string;
-  requiredAction: "drain" | "retry-or-discard" | "none";
+  family: "inbound" | "outbound";
+  state: string;
+  requiredAction: "drain" | "retry-or-discard" | "discard" | "none";
 }
 
 export interface TelegramRecoveryOrphanCandidate {
@@ -31,11 +33,20 @@ export interface TelegramRecoveryOrphanCandidate {
   requiredAction: "reassign";
 }
 
+export interface TelegramRecoveryDeliverySummary {
+  pendingDeliveryCount: number;
+  deliveryUncertainCount: number;
+  busBlockerCount: number;
+}
+
 export interface TelegramRecoveryOperatorStatus {
   profile: string;
   mode: "active" | "downgrade-exclusive";
   familyCounts: { inbound: number; outbound: number; bus: number };
   stateCounts: Record<string, number>;
+  pendingDeliveryCount: number;
+  deliveryUncertainCount: number;
+  drainableCount: number;
   quota: { usedBytes: number; limitBytes: number };
   oldestUnresolvedAgeMs: number | null;
   incidents: string[];
@@ -50,7 +61,7 @@ export interface TelegramRecoveryOperatorPort<TContext> {
   retryUncertain: (
     actionId: string,
     ctx: TContext,
-  ) => Promise<{ appended: boolean; duplicationWarning: true }>;
+  ) => Promise<{ scheduled: boolean; duplicationWarning: true }>;
   discard: (actionId: string, ctx: TContext) => Promise<void> | void;
   reassign: (actionId: string, ctx: TContext) => Promise<void>;
   downgrade: (
@@ -103,6 +114,26 @@ function safeIncidentLabel(value: string): string {
   return KNOWN_RECOVERY_INCIDENTS.has(value) ? value : "recovery-incident";
 }
 
+export function projectTelegramRecoveryDeliverySummary(
+  status: RecoveryMetadataStatus,
+): TelegramRecoveryDeliverySummary {
+  return {
+    pendingDeliveryCount: status.items.filter(
+      (item) =>
+        item.family === "outbound" &&
+        (item.state === "planned" ||
+          item.state === "pending" ||
+          item.state === "retryable-pending" ||
+          item.state === "sending"),
+    ).length,
+    deliveryUncertainCount: status.items.filter(
+      (item) =>
+        item.family === "outbound" && item.state === "delivery-uncertain",
+    ).length,
+    busBlockerCount: status.items.filter((item) => item.family === "bus").length,
+  };
+}
+
 export function projectTelegramRecoveryOperatorStatus(
   status: RecoveryMetadataStatus,
   orphanCandidates: readonly RecoveryOrphanReassignmentCandidate[],
@@ -113,10 +144,19 @@ export function projectTelegramRecoveryOperatorStatus(
     familyCounts[item.family] += 1;
     stateCounts[item.state] = (stateCounts[item.state] ?? 0) + 1;
   }
+  const deliverySummary = projectTelegramRecoveryDeliverySummary(status);
   const items = status.items
-    .filter((item) => item.family === "inbound")
+    .filter(
+      (item) =>
+        item.family === "inbound" ||
+        (item.family === "outbound" &&
+          (item.requiredAction === "retry-or-discard" ||
+            item.requiredAction === "discard")),
+    )
     .map((item): TelegramRecoveryOperatorItem => ({
       handle: item.actionId,
+      family: item.family as "inbound" | "outbound",
+      state: item.state,
       requiredAction: item.requiredAction,
     }));
   return {
@@ -124,6 +164,11 @@ export function projectTelegramRecoveryOperatorStatus(
     mode: status.mode,
     familyCounts,
     stateCounts,
+    pendingDeliveryCount: deliverySummary.pendingDeliveryCount,
+    deliveryUncertainCount: deliverySummary.deliveryUncertainCount,
+    drainableCount: status.items.filter(
+      (item) => item.family !== "bus" && item.requiredAction === "drain",
+    ).length,
     quota: {
       usedBytes: status.quota.totalBytes,
       limitBytes: status.quota.limitBytes,
@@ -167,6 +212,7 @@ function requiredActionLabel(
 ): string {
   if (action === "drain") return "safe drain";
   if (action === "retry-or-discard") return "retry or discard";
+  if (action === "discard") return "discard";
   return "none";
 }
 
@@ -183,6 +229,8 @@ export function buildTelegramRecoveryMenuText(
     `<code>mode</code>: ${escapeHtml(status.mode)}`,
     `<code>families</code>: inbound=${status.familyCounts.inbound}, outbound=${status.familyCounts.outbound}, bus=${status.familyCounts.bus}`,
     `<code>states</code>: ${stateCounts}`,
+    `<code>pending delivery</code>: ${status.pendingDeliveryCount}`,
+    `<code>delivery uncertain</code>: ${status.deliveryUncertainCount}`,
     `<code>quota</code>: ${formatBytes(status.quota.usedBytes)} / ${formatBytes(status.quota.limitBytes)}`,
     `<code>oldest unresolved</code>: ${formatAge(status.oldestUnresolvedAgeMs)}`,
   ];
@@ -190,9 +238,16 @@ export function buildTelegramRecoveryMenuText(
     lines.push("", "<b>Work handles</b>");
     for (const item of status.items) {
       lines.push(
-        `<code>${escapeHtml(item.handle)}</code> · ${requiredActionLabel(item.requiredAction)}`,
+        `<code>${escapeHtml(item.handle)}</code> · ${escapeHtml(item.family)} · ${escapeHtml(item.state)} · ${requiredActionLabel(item.requiredAction)}`,
       );
     }
+  }
+  if (status.familyCounts.bus > 0) {
+    lines.push(
+      "",
+      `<b>Bus recovery</b>`,
+      `${status.familyCounts.bus} blocker(s); actions are unavailable until P0-E.`,
+    );
   }
   if (status.orphanCandidates.length > 0) {
     lines.push("", "<b>Orphan candidates</b>");
@@ -216,25 +271,33 @@ export function buildTelegramRecoveryMenuReplyMarkup(
     [{ text: "⬆️ Main menu", callback_data: "menu:back" }],
     [{ text: "🌀 Refresh", callback_data: "recovery:refresh" }],
   ];
-  if (status.items.some((item) => item.requiredAction === "drain")) {
+  if (status.drainableCount > 0) {
     rows.push([
       { text: "☑️ Drain safe work", callback_data: "recovery:ask:drain" },
     ]);
   }
   for (const item of status.items) {
-    if (item.requiredAction !== "retry-or-discard") {
+    if (item.requiredAction === "retry-or-discard") {
+      rows.push([
+        {
+          text: `⚠️ Retry ${item.handle}`,
+          callback_data: `recovery:ask:retry:${item.handle}`,
+        },
+        {
+          text: `🗑 Discard ${item.handle}`,
+          callback_data: `recovery:ask:discard:${item.handle}`,
+        },
+      ]);
       continue;
     }
-    rows.push([
-      {
-        text: `⚠️ Retry ${item.handle}`,
-        callback_data: `recovery:ask:retry:${item.handle}`,
-      },
-      {
-        text: `🗑 Discard ${item.handle}`,
-        callback_data: `recovery:ask:discard:${item.handle}`,
-      },
-    ]);
+    if (item.requiredAction === "discard") {
+      rows.push([
+        {
+          text: `🗑 Discard ${item.handle}`,
+          callback_data: `recovery:ask:discard:${item.handle}`,
+        },
+      ]);
+    }
   }
   for (const candidate of status.orphanCandidates) {
     rows.push([
@@ -270,7 +333,7 @@ function parseAction(
 
 function confirmationText(action: string): string {
   if (action === "retry") {
-    return "<b>Retry this uncertain attempt? It may duplicate work that already ran.</b>";
+    return "<b>Retry this uncertain delivery? Telegram may already contain the prior effect, so retrying can duplicate it.</b>";
   }
   if (action === "discard") {
     return "<b>Durably discard this recovery item?</b>";
@@ -397,9 +460,9 @@ export function createTelegramRecoveryMenuRuntime<TContext>(
           callbackText = `Safe recovery drain completed (${count}).`;
         } else if (parsed.action === "retry") {
           const result = await deps.retryUncertain(parsed.handle!, ctx);
-          callbackText = result.appended
-            ? "Retry queued. Duplicate execution remains possible."
-            : "Linked retry was already queued. Duplicate execution remains possible.";
+          callbackText = result.scheduled
+            ? "Retry queued. Duplicate delivery remains possible."
+            : "Linked retry was already queued. Duplicate delivery remains possible.";
         } else if (parsed.action === "discard") {
           await deps.discard(parsed.handle!, ctx);
           callbackText = "Recovery item durably discarded.";

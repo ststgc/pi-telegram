@@ -290,6 +290,10 @@ export default function (pi: Pi.ExtensionAPI) {
       getFollowerThreadName: telegramBusFollowerRegistrationState.getThreadName,
       getCurrentIdentity: currentInstanceThreadRuntime.getRestorationIdentity,
     });
+  let getRecoveryStatusProjection =
+    function (): Status.TelegramBridgeRecoveryStatus | undefined {
+      return undefined;
+    };
   const statusRuntime = Status.createTelegramBridgeStatusRuntime<
     Pi.ExtensionContext,
     Queue.TelegramQueueItem<Pi.ExtensionContext>
@@ -320,6 +324,9 @@ export default function (pi: Pi.ExtensionAPI) {
     getSyncState: telegramSyncStateRuntime.getState,
     getThreadReconciliationState() {
       return threadReconciliationRuntime.getState();
+    },
+    getRecoveryStatus() {
+      return getRecoveryStatusProjection();
     },
   });
   runtimeDiagnostics.bindStatus({
@@ -564,6 +571,15 @@ export default function (pi: Pi.ExtensionAPI) {
       },
       recordRuntimeEvent,
     });
+  getRecoveryStatusProjection = function () {
+    try {
+      return MenuRecovery.projectTelegramRecoveryDeliverySummary(
+        inboundRecoveryRuntime.getRecoveryStatus(),
+      );
+    } catch {
+      return undefined;
+    }
+  };
 
   // --- Reply Runtime & Preview ---
 
@@ -805,6 +821,13 @@ export default function (pi: Pi.ExtensionAPI) {
       recordRuntimeEvent,
       startSuspended: true,
     });
+  const scheduleDurableOutboundRecovery = function (
+    item: Recovery.RecoveryOutboundDrainItem,
+    claim: Recovery.RecoveryIdentityClaim,
+  ): void {
+    durableOutboundWorker.register(item.record, claim);
+    durableOutboundWorker.schedule(item.record.recordId);
+  };
   const durableOutboundLifecycle = {
     async handoffActiveTurn(
       turn: Queue.PendingTelegramTurn,
@@ -1200,6 +1223,7 @@ export default function (pi: Pi.ExtensionAPI) {
         function (turn) {
           return appendRecoveryTurn(turn, ctx);
         },
+        scheduleDurableOutboundRecovery,
       );
     },
     retryUncertain(actionId, ctx) {
@@ -1210,6 +1234,7 @@ export default function (pi: Pi.ExtensionAPI) {
         function (turn) {
           return appendRecoveryTurn(turn, ctx);
         },
+        scheduleDurableOutboundRecovery,
       );
     },
     discard(actionId, ctx) {
@@ -1223,9 +1248,13 @@ export default function (pi: Pi.ExtensionAPI) {
               return item.kind !== "prompt" || item.recovery?.turnId !== turnId;
             },
           );
-          if (remaining.length === current.length) return;
-          telegramQueueStore.setQueuedItems(remaining);
+          if (remaining.length !== current.length) {
+            telegramQueueStore.setQueuedItems(remaining);
+          }
           updateStatus(ctx);
+          deferredQueueDispatchRuntime.request(
+            dispatchNextQueuedTelegramTurn,
+          );
         },
       );
     },
@@ -1605,10 +1634,7 @@ export default function (pi: Pi.ExtensionAPI) {
             }
             await inboundRecoveryRuntime.rehydrateOutbound(
               ctx,
-              function (item, claim) {
-                durableOutboundWorker.register(item.record, claim);
-                durableOutboundWorker.schedule(item.record.recordId);
-              },
+              scheduleDurableOutboundRecovery,
             );
             await durableOutboundWorker.resume();
             await inboundRecoveryRuntime.rehydrate(

@@ -202,6 +202,48 @@ test("Recovery downgrade suspends and drains outbound scheduling before failure 
   assert.ok(gate.enter("default"));
 });
 
+test("Recovery downgrade reports outbound and future bus blockers before fencing", async () => {
+  const gate = new Recovery.RecoveryProfileOperationGate();
+  const sideEffects: string[] = [];
+  const downgrade = BusLeader.createTelegramRecoveryDowngradeCoordinator<string>({
+    canCoordinate: () => true,
+    getCoordinationGeneration: () => "leader-epoch-blocked",
+    getProfile: () => "default",
+    getFollowers: () => [],
+    getAuthSecret: () => "secret",
+    createRequestId: () => "leader:fence:blocked",
+    gate,
+    preflight: () => ({ safe: false, blockerCount: 3 }),
+    beginStoreExclusive() {
+      sideEffects.push("exclusive");
+    },
+    quarantineStore() {
+      sideEffects.push("quarantine");
+      return "quarantine";
+    },
+    cancelStoreExclusive() {
+      sideEffects.push("cancel");
+    },
+    stopPolling() {
+      sideEffects.push("polling");
+    },
+    suspendRuntime() {
+      sideEffects.push("suspend");
+    },
+    resumeRuntime() {
+      sideEffects.push("resume");
+    },
+    createFenceGeneration: () => "fence-blocked",
+  });
+
+  assert.deepEqual(await downgrade("ctx"), {
+    status: "blocked",
+    blockerCount: 3,
+  });
+  assert.deepEqual(sideEffects, []);
+  assert.equal(gate.getState("default").phase, "active");
+});
+
 test("Poll supervisor terminal failure stops bus transport and releases the exact lease", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-poll-terminal-"));
   const socketPath = join(dir, "bus.sock");

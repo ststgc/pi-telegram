@@ -277,13 +277,21 @@ export interface InboundRecoveryRuntime<
     ctx: TContext,
     handle: (update: TUpdate, ctx: TContext) => Promise<unknown>,
     appendTurn: (turn: PendingTelegramTurn) => boolean,
+    scheduleOutbound: (
+      item: RecoveryOutboundDrainItem,
+      claim: RecoveryIdentityClaim,
+    ) => void | Promise<void>,
   ): Promise<number>;
   retryUncertainForOperator(
     actionId: string,
     ctx: TContext,
     handle: (update: TUpdate, ctx: TContext) => Promise<unknown>,
     appendTurn: (turn: PendingTelegramTurn) => boolean,
-  ): Promise<{ appended: boolean; duplicationWarning: true }>;
+    scheduleOutbound: (
+      item: RecoveryOutboundDrainItem,
+      claim: RecoveryIdentityClaim,
+    ) => void | Promise<void>,
+  ): Promise<{ scheduled: boolean; duplicationWarning: true }>;
   discardForOperator(
     actionId: string,
     ctx: TContext,
@@ -1099,27 +1107,83 @@ export function createInboundRecoveryRuntime<
       }
     },
 
-    async drainSafeForOperator(ctx, handle, appendTurn) {
+    async drainSafeForOperator(ctx, handle, appendTurn, scheduleOutbound) {
       return runGatedOperation(async () => {
-        getOperatorIdentity(ctx);
+        const identity = getOperatorIdentity(ctx);
+        const claim = { identity };
+        const outbound = getStore().drainSafeOutbound(claim);
+        for (const item of outbound) {
+          await scheduleOutbound(item, claim);
+        }
         let appended = 0;
         await runtime.rehydrate(ctx, handle, (turn) => {
           if (appendTurn(turn)) appended += 1;
         });
-        return appended;
+        return outbound.length + appended;
       });
     },
 
-    retryUncertainForOperator(actionId, ctx, handle, appendTurn) {
-      return runGatedOperation(() =>
-        replayRetriedEnvelope(actionId, ctx, handle, appendTurn),
-      );
+    retryUncertainForOperator(
+      actionId,
+      ctx,
+      handle,
+      appendTurn,
+      scheduleOutbound,
+    ) {
+      return runGatedOperation(async () => {
+        const recoveryStore = getStore();
+        const item = recoveryStore
+          .getStatus()
+          .items.find((candidate) => candidate.actionId === actionId);
+        if (!item) throw new Error("Unknown recovery action id");
+        if (item.family === "inbound") {
+          const result = await replayRetriedEnvelope(
+            actionId,
+            ctx,
+            handle,
+            appendTurn,
+          );
+          return {
+            scheduled: result.appended,
+            duplicationWarning: true,
+          };
+        }
+        if (item.family !== "outbound") {
+          throw new Error("Recovery bus actions are not supported");
+        }
+        const identity = getOperatorIdentity(ctx);
+        const claim = { identity };
+        const result = recoveryStore.retryUncertainOutboundAction(
+          actionId,
+          `operator-retry-v1:${actionId}`,
+          claim,
+        );
+        await scheduleOutbound(result, claim);
+        return { scheduled: true, duplicationWarning: true };
+      });
     },
 
     discardForOperator(actionId, ctx, afterDurableDiscard) {
       runGatedOperationSync(() => {
         const identity = getOperatorIdentity(ctx);
-        const result = getStore().discardInboundAction(actionId, { identity });
+        const recoveryStore = getStore();
+        const item = recoveryStore
+          .getStatus()
+          .items.find((candidate) => candidate.actionId === actionId);
+        if (!item) throw new Error("Unknown recovery action id");
+        if (item.family === "inbound") {
+          const result = recoveryStore.discardInboundAction(actionId, {
+            identity,
+          });
+          afterDurableDiscard(result.turnId);
+          return;
+        }
+        if (item.family !== "outbound") {
+          throw new Error("Recovery bus actions are not supported");
+        }
+        const result = recoveryStore.discardOutboundAction(actionId, {
+          identity,
+        });
         afterDurableDiscard(result.turnId);
       });
     },

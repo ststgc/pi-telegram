@@ -1378,6 +1378,171 @@ test(
 );
 
 test(
+  "operator outbound drain, uncertain retry, discard, and stale handles stay exact",
+  withTempAgentDir(async (agentDir) => {
+    const harness = createHarness(agentDir);
+    const pending = await seedPendingOutbound(
+      harness.runtime,
+      harness.identity,
+      213,
+    );
+    const retryable = await seedPendingOutbound(
+      harness.runtime,
+      harness.identity,
+      214,
+    );
+    const retryableClaim = retryable.store.claimOutboundUnit({
+      recordId: retryable.record.recordId,
+      claim: { identity: harness.identity },
+    });
+    const retryableRecord = retryable.store.recordOutboundSafeFailure({
+      recordId: retryable.record.recordId,
+      claim: { identity: harness.identity },
+      attemptId: retryableClaim.record.activeUnit!.attemptId,
+    });
+    const sending = await seedPendingOutbound(
+      harness.runtime,
+      harness.identity,
+      215,
+    );
+    sending.store.claimOutboundUnit({
+      recordId: sending.record.recordId,
+      claim: { identity: harness.identity },
+    });
+    const uncertain = await seedPendingOutbound(
+      harness.runtime,
+      harness.identity,
+      216,
+    );
+    const uncertainClaim = uncertain.store.claimOutboundUnit({
+      recordId: uncertain.record.recordId,
+      claim: { identity: harness.identity },
+    });
+    uncertain.store.markOutboundUncertain({
+      recordId: uncertain.record.recordId,
+      claim: { identity: harness.identity },
+      attemptId: uncertainClaim.record.activeUnit!.attemptId,
+      reason: "response-lost",
+    });
+
+    const scheduled: Array<{
+      item: Parameters<
+        Parameters<typeof harness.runtime.drainSafeForOperator>[3]
+      >[0];
+      claim: Parameters<
+        Parameters<typeof harness.runtime.drainSafeForOperator>[3]
+      >[1];
+    }> = [];
+    const count = await harness.runtime.drainSafeForOperator(
+      harness.ctx,
+      async () => ({ kind: "completed", reason: "ignored" }),
+      () => false,
+      (item, claim) => {
+        scheduled.push({ item, claim });
+      },
+    );
+    assert.equal(count, 2);
+    assert.deepEqual(
+      scheduled.map(({ item }) => item.record.recordId).sort(),
+      [pending.record.recordId, retryable.record.recordId].sort(),
+    );
+    assert.equal(
+      scheduled.find(({ item }) =>
+        item.record.recordId === retryable.record.recordId
+      )!.item.record.automaticAttemptCount,
+      retryableRecord.automaticAttemptCount,
+    );
+    assert.equal(
+      scheduled.some(({ item }) => item.record.recordId === sending.record.recordId),
+      false,
+    );
+    assert.equal(
+      scheduled.some(({ item }) => item.record.recordId === uncertain.record.recordId),
+      false,
+    );
+    assert.deepEqual(scheduled[0]!.claim.identity, harness.identity);
+
+    const uncertainHandle = harness.runtime.getRecoveryStatus().items.find(
+      (item) =>
+        item.family === "outbound" &&
+        item.state === "delivery-uncertain" &&
+        item.actionId,
+    )!.actionId;
+    let linkedRecordId: string | undefined;
+    const retry = await harness.runtime.retryUncertainForOperator(
+      uncertainHandle,
+      harness.ctx,
+      async () => ({ kind: "completed", reason: "ignored" }),
+      () => false,
+      (item, claim) => {
+        linkedRecordId = item.record.recordId;
+        assert.equal(item.record.state, "pending");
+        assert.equal(item.record.linkedAttemptOf, uncertain.record.recordId);
+        assert.deepEqual(claim.identity, harness.identity);
+      },
+    );
+    assert.deepEqual(retry, {
+      scheduled: true,
+      duplicationWarning: true,
+    });
+    assert.ok(linkedRecordId);
+    await assert.rejects(
+      harness.runtime.retryUncertainForOperator(
+        uncertainHandle,
+        harness.ctx,
+        async () => ({ kind: "completed", reason: "ignored" }),
+        () => false,
+        () => {},
+      ),
+      /Unknown recovery action id/,
+    );
+
+    const discard = await seedPendingOutbound(
+      harness.runtime,
+      harness.identity,
+      217,
+    );
+    const discardClaim = discard.store.claimOutboundUnit({
+      recordId: discard.record.recordId,
+      claim: { identity: harness.identity },
+    });
+    discard.store.markOutboundUncertain({
+      recordId: discard.record.recordId,
+      claim: { identity: harness.identity },
+      attemptId: discardClaim.record.activeUnit!.attemptId,
+      reason: "commit-unknown",
+    });
+    const discardHandle = harness.runtime.getRecoveryStatus().items.find(
+      (item) =>
+        item.family === "outbound" &&
+        item.state === "delivery-uncertain" &&
+        item.actionId !== uncertainHandle,
+    )!.actionId;
+    const discardedTurns: string[] = [];
+    harness.runtime.discardForOperator(
+      discardHandle,
+      harness.ctx,
+      (turnId) => discardedTurns.push(turnId),
+    );
+    assert.deepEqual(discardedTurns, [discard.record.turnId]);
+    assert.equal(
+      harness.runtime.getRecoveryStatus().items.some(
+        (item) => item.actionId === discardHandle,
+      ),
+      false,
+    );
+    assert.throws(
+      () => harness.runtime.discardForOperator(
+        "wrong_handle",
+        harness.ctx,
+        () => {},
+      ),
+      /Unknown recovery action id/,
+    );
+  }),
+);
+
+test(
   "strict corrupt envelope is terminalized without blocking a later valid record",
   withTempAgentDir(async (agentDir) => {
     const harness = createHarness(agentDir);
