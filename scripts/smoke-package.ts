@@ -19,6 +19,15 @@ interface PackResult {
 }
 
 const root = process.cwd();
+const npmCliPath = process.env.npm_execpath;
+if (!npmCliPath) {
+  throw new Error("npm_execpath is required for cross-platform package smoke");
+}
+const runNpm = (
+  args: string[],
+  options: Parameters<typeof execFileSync>[2],
+): ReturnType<typeof execFileSync> =>
+  execFileSync(process.execPath, [npmCliPath, ...args], options);
 const manifest = JSON.parse(
   readFileSync(path.join(root, "package.json"), "utf8"),
 ) as PackageManifest;
@@ -27,11 +36,13 @@ let tarballPath: string | undefined;
 
 try {
   const packed = JSON.parse(
-    execFileSync("npm", ["pack", "--json"], {
-      cwd: root,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "inherit"],
-    }),
+    String(
+      runNpm(["pack", "--json"], {
+        cwd: root,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "inherit"],
+      }),
+    ),
   ) as PackResult[];
   if (packed.length !== 1 || typeof packed[0]?.filename !== "string") {
     throw new Error("npm pack did not produce exactly one tarball");
@@ -41,8 +52,7 @@ try {
     path.join(consumer, "package.json"),
     JSON.stringify({ name: "pi-telegram-package-smoke", private: true, type: "module" }),
   );
-  execFileSync(
-    "npm",
+  runNpm(
     ["install", "--ignore-scripts", "tsx", tarballPath],
     { cwd: consumer, stdio: "inherit" },
   );
@@ -57,7 +67,7 @@ try {
       `for (const specifier of specifiers) await import(specifier);\n` +
       `console.log(\`Imported \${specifiers.length} public package exports from tarball.\`);\n`,
   );
-  execFileSync("npm", ["exec", "--offline", "--", "tsx", smokePath], {
+  runNpm(["exec", "--offline", "--", "tsx", smokePath], {
     cwd: consumer,
     stdio: "inherit",
   });
