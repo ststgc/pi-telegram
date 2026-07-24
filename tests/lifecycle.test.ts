@@ -10,6 +10,7 @@ import {
   appendTelegramLifecycleHooks,
   createTelegramCompactionObserverRuntime,
   createTelegramSessionContextStore,
+  createTelegramBridgeSessionLifecycleAssembly,
   createTelegramSessionGenerationFence,
   createTelegramMessageActivityTypingHooks,
   registerTelegramLifecycleHooks,
@@ -256,6 +257,93 @@ test("Compaction observer keeps native typing for non-turn compaction", () => {
     "status",
     "dispatch:request",
     "dispatch",
+  ]);
+});
+
+test("Session startup rehydrates outbound and inbound before opening ingress", async () => {
+  const createAssembly = (events: string[], failRecovery = false) =>
+    createTelegramBridgeSessionLifecycleAssembly({
+      contextStore: createTelegramSessionContextStore(),
+      queue: {
+        getCurrentModel: () => undefined,
+        loadConfig: async () => events.push("queue:reset"),
+        setQueuedItems: () => {},
+        setCurrentModel: () => {},
+        setPendingModelSwitch: () => {},
+        syncCounters: () => {},
+        syncFlags: () => {},
+        bindDeferredDispatchContext: () => {},
+        prepareTempDir: async () => {},
+        updateStatus: () => {},
+        unbindDeferredDispatchContext: () => {},
+        clearModelMenuState: () => {},
+        getActiveTurnChatId: () => undefined,
+        getActiveTurnTarget: () => undefined,
+        clearPreview: () => {},
+        clearActiveTurn: () => {},
+        clearAbort: () => {},
+        recordRuntimeEvent: () => {},
+      },
+      follower: {
+        registrationState: { isRegistered: () => false },
+        registrationRuntime: {},
+        instanceId: "instance-a",
+        suspendPolling: async () => {},
+        isLeader: () => false,
+        getLeaderBinding: () => undefined,
+        getActiveContext: () => undefined,
+        getActiveProfileName: () => "default",
+        getLeaderState: () => undefined,
+        updateStatus: () => {},
+        recordRuntimeEvent: () => {},
+      },
+      services: {
+        recovery: {
+          async onSessionStart() {
+            events.push("recovery:outbound-inbound");
+            if (failRecovery) throw new Error("rehydrate failed");
+          },
+        },
+        resumeGroupedInput: () => events.push("ingress:grouped"),
+        suspendGroupedInput: () => {},
+        delivery: {
+          onSessionStart: async () => events.push("ingress:delivery"),
+          onSessionShutdown: async () => {},
+        },
+        polling: {
+          onSessionStart: async () => events.push("ingress:polling"),
+        },
+        capabilityMonitor: {
+          start: () => events.push("ingress:capability"),
+          stop: () => {},
+        },
+        queueWatchdog: {
+          start: () => events.push("ingress:watchdog"),
+          stop: () => {},
+        },
+      },
+    } as unknown as Parameters<typeof createTelegramBridgeSessionLifecycleAssembly>[0]);
+  const ctx = { cwd: "/repo" } as ExtensionContext;
+  const events: string[] = [];
+  await createAssembly(events).onSessionStart({} as never, ctx);
+  assert.deepEqual(events, [
+    "queue:reset",
+    "recovery:outbound-inbound",
+    "ingress:grouped",
+    "ingress:delivery",
+    "ingress:polling",
+    "ingress:capability",
+    "ingress:watchdog",
+  ]);
+
+  const failedEvents: string[] = [];
+  await assert.rejects(
+    createAssembly(failedEvents, true).onSessionStart({} as never, ctx),
+    /rehydrate failed/,
+  );
+  assert.deepEqual(failedEvents, [
+    "queue:reset",
+    "recovery:outbound-inbound",
   ]);
 });
 

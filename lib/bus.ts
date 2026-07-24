@@ -51,9 +51,36 @@ export interface TelegramBusProcessRuntime {
   getFollowerSocketPath: () => string;
 }
 
+const TELEGRAM_PROCESS_FALLBACK_IDENTITIES_KEY = Symbol.for(
+  "@ststgc/pi-telegram/process-fallback-identities-v1",
+);
+
+function getTelegramProcessFallbackIdentity(pid: number): string {
+  const existing = Reflect.get(
+    globalThis,
+    TELEGRAM_PROCESS_FALLBACK_IDENTITIES_KEY,
+  );
+  let identities: Map<number, string>;
+  if (existing instanceof Map) {
+    identities = existing;
+  } else {
+    identities = new Map<number, string>();
+    Reflect.set(
+      globalThis,
+      TELEGRAM_PROCESS_FALLBACK_IDENTITIES_KEY,
+      identities,
+    );
+  }
+  const current = identities.get(pid);
+  if (typeof current === "string") return current;
+  const created = `${pid}:process:${randomBytes(16).toString("base64url")}`;
+  identities.set(pid, created);
+  return created;
+}
+
 export function getTelegramProcessBirthIdentity(
   pid: number,
-  fallbackGeneration: number | string,
+  _fallbackGeneration: number | string,
 ): string {
   if (pid > 0) {
     try {
@@ -66,10 +93,10 @@ export function getTelegramProcessBirthIdentity(
       const startTicks = fields[19];
       if (startTicks) return `${pid}:start:${startTicks}`;
     } catch {
-      /* non-Linux or inaccessible process metadata */
+      /* macOS/Windows and inaccessible Linux process metadata use a process-global identity. */
     }
   }
-  return `${pid}:generation:${fallbackGeneration}`;
+  return getTelegramProcessFallbackIdentity(pid);
 }
 
 export function createTelegramBusProcessRuntime(input: {
@@ -80,10 +107,9 @@ export function createTelegramBusProcessRuntime(input: {
   createdAtMs: number;
 }): TelegramBusProcessRuntime {
   const instanceId = `${input.pid}:${input.createdAtMs}`;
-  const ownerPid = input.parentPid || input.pid;
   const manualFollowerOwnerId =
     input.parentProcessIdentity ??
-    getTelegramProcessBirthIdentity(ownerPid, input.createdAtMs);
+    getTelegramProcessBirthIdentity(input.pid, input.createdAtMs);
   return {
     instanceId,
     manualFollowerOwnerId,
@@ -131,6 +157,8 @@ export function getTelegramBusFollowerSocketPath(
 
 export interface TelegramBusInstanceRegistration {
   instanceId: string;
+  /** Stable parent-process identity used only for exact durable recovery claims. */
+  manualFollowerOwnerId?: string;
   profileKey?: string;
   threadName?: string;
   slot?: string;
@@ -139,6 +167,7 @@ export interface TelegramBusInstanceRegistration {
   target?: TelegramTarget;
   busSocketPath?: string;
   registrationGeneration?: string;
+  sessionGeneration?: number;
   connectedAtMs: number;
 }
 
@@ -344,6 +373,87 @@ export function createTelegramFollowerApiCallAuthorizer(deps: {
     });
 }
 
+export interface TelegramFollowerDurableAdmissionAckV1 {
+  version: 1;
+  updateId: number;
+  recordId: string;
+  turnId: string;
+  profile: string;
+  target: TelegramTarget;
+  ownerId: string;
+  registrationGeneration: string;
+  sessionGeneration: number;
+  admissionRevision: number;
+  disposition: "admitted" | "terminal";
+}
+
+export function isTelegramFollowerDurableAdmissionAckV1(
+  value: unknown,
+): value is TelegramFollowerDurableAdmissionAckV1 {
+  if (!isRecord(value)) return false;
+  const keys = [
+    "version",
+    "updateId",
+    "recordId",
+    "turnId",
+    "profile",
+    "target",
+    "ownerId",
+    "registrationGeneration",
+    "sessionGeneration",
+    "admissionRevision",
+    "disposition",
+  ];
+  return (
+    hasExactKeys(value, keys) &&
+    value.version === 1 &&
+    Number.isSafeInteger(value.updateId) &&
+    (value.updateId as number) >= 0 &&
+    isNonemptyString(value.recordId) &&
+    isNonemptyString(value.turnId) &&
+    isNonemptyString(value.profile) &&
+    isExactTarget(value.target) &&
+    isNonemptyString(value.ownerId) &&
+    isNonemptyString(value.registrationGeneration) &&
+    Number.isSafeInteger(value.sessionGeneration) &&
+    (value.sessionGeneration as number) >= 0 &&
+    Number.isSafeInteger(value.admissionRevision) &&
+    (value.admissionRevision as number) >= 0 &&
+    (value.disposition === "admitted" || value.disposition === "terminal")
+  );
+}
+
+export interface TelegramRecoveryFenceAckV1 {
+  version: 1;
+  state: "fenced" | "resumed";
+  profile: string;
+  recipientInstanceId: string;
+  recipientRegistrationGeneration: string;
+  fenceGeneration: string;
+}
+
+export function isTelegramRecoveryFenceAckV1(
+  value: unknown,
+): value is TelegramRecoveryFenceAckV1 {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, [
+      "version",
+      "state",
+      "profile",
+      "recipientInstanceId",
+      "recipientRegistrationGeneration",
+      "fenceGeneration",
+    ]) &&
+    value.version === 1 &&
+    (value.state === "fenced" || value.state === "resumed") &&
+    isNonemptyString(value.profile) &&
+    isNonemptyString(value.recipientInstanceId) &&
+    isNonemptyString(value.recipientRegistrationGeneration) &&
+    isNonemptyString(value.fenceGeneration)
+  );
+}
+
 export type TelegramBusEnvelope = (
   | {
       kind: "follower.register";
@@ -362,6 +472,16 @@ export type TelegramBusEnvelope = (
       requestId: string;
       instanceId: string;
       registrationGeneration?: string;
+      sentAtMs: number;
+    }
+  | {
+      kind: "leader.forwardUpdate";
+      requestId: string;
+      profile: string;
+      target: TelegramTarget;
+      recipientInstanceId: string;
+      recipientRegistrationGeneration: string;
+      update: { update_id: number };
       sentAtMs: number;
     }
   | {
@@ -408,10 +528,32 @@ export type TelegramBusEnvelope = (
       sentAtMs: number;
     }
   | {
+      kind: "leader.fenceRecovery";
+      requestId: string;
+      profile: string;
+      recipientInstanceId: string;
+      recipientRegistrationGeneration: string;
+      fenceGeneration: string;
+      sentAtMs: number;
+    }
+  | {
+      kind: "leader.resumeRecovery";
+      requestId: string;
+      profile: string;
+      recipientInstanceId: string;
+      recipientRegistrationGeneration: string;
+      fenceGeneration: string;
+      sentAtMs: number;
+    }
+  | {
       kind: "follower.callApi";
       requestId: string;
+      profile: string;
+      target: TelegramTarget;
       instanceId: string;
-      registrationGeneration?: string;
+      manualFollowerOwnerId: string;
+      registrationGeneration: string;
+      followerSessionGeneration: number;
       method: string;
       args: unknown[];
       sentAtMs: number;
@@ -422,6 +564,8 @@ export type TelegramBusEnvelope = (
       ok: boolean;
       message?: string;
       result?: unknown;
+      durableAdmission?: TelegramFollowerDurableAdmissionAckV1;
+      recoveryFence?: TelegramRecoveryFenceAckV1;
       error?: {
         code: "commit-unknown" | "request-id-collision" | "ledger-overloaded";
         method?: string;
@@ -464,7 +608,11 @@ export function parseTelegramBusEnvelope(
   if (!isRecord(value)) return undefined;
   const kind = value.kind;
   const requestId = value.requestId;
-  if (typeof kind !== "string" || typeof requestId !== "string") {
+  if (
+    typeof kind !== "string" ||
+    typeof requestId !== "string" ||
+    requestId.length === 0
+  ) {
     return undefined;
   }
   let envelope: TelegramBusEnvelope | undefined;
@@ -477,6 +625,9 @@ export function parseTelegramBusEnvelope(
       break;
     case "follower.disconnect":
       envelope = parseDisconnectEnvelope(value, requestId);
+      break;
+    case "leader.forwardUpdate":
+      envelope = parseForwardUpdateEnvelope(value, requestId);
       break;
     case "leader.forwardCallback":
       envelope = parseForwardCallbackEnvelope(value, requestId);
@@ -500,6 +651,10 @@ export function parseTelegramBusEnvelope(
       break;
     case "leader.replaceFollowerTarget":
       envelope = parseReplaceFollowerTargetEnvelope(value, requestId);
+      break;
+    case "leader.fenceRecovery":
+    case "leader.resumeRecovery":
+      envelope = parseRecoveryFenceEnvelope(value, requestId, kind);
       break;
     case "follower.callApi":
       envelope = parseCallApiEnvelope(value, requestId);
@@ -605,6 +760,12 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
 >(
   deps: TelegramBusForeignOwnedForwarderDeps<TMessage>,
 ): {
+  forwardUpdate: (input: {
+    update: { update_id: number };
+    profile: string;
+    target: TelegramTarget;
+    ownership: { instanceId: string; ownerGeneration?: string };
+  }) => Promise<TelegramFollowerDurableAdmissionAckV1 | undefined>;
   forwardCallback: (input: {
     query: TCallbackQuery;
     ownership: { instanceId: string; ownerGeneration?: string };
@@ -627,10 +788,12 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
   }) => Promise<boolean>;
 } {
   const getNowMs = deps.getNowMs ?? Date.now;
-  const send = async (envelope: TelegramBusEnvelope): Promise<boolean> => {
+  const request = async (
+    envelope: TelegramBusEnvelope,
+  ): Promise<TelegramBusEnvelope | undefined> => {
     if (deps.getAuthSecret) envelope.auth = deps.getAuthSecret();
     const socketPath = resolveTelegramBusSocketPath(deps.socketPath);
-    const response = await sendTelegramBusLocalEnvelope({
+    return sendTelegramBusLocalEnvelope({
       socketPath,
       envelope,
       timeoutMs: deps.timeoutMs,
@@ -639,6 +802,9 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
         operation: "operation",
       }),
     });
+  };
+  const send = async (envelope: TelegramBusEnvelope): Promise<boolean> => {
+    const response = await request(envelope);
     const accepted = response?.kind === "bus.ack" && response.ok;
     if (!accepted) {
       deps.recordRuntimeEvent?.(
@@ -659,6 +825,24 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
     return accepted;
   };
   return {
+    async forwardUpdate({ update, profile, target, ownership }) {
+      if (!ownership.ownerGeneration) return undefined;
+      const response = await request({
+        kind: "leader.forwardUpdate",
+        requestId: deps.createRequestId(),
+        profile,
+        target,
+        recipientInstanceId: ownership.instanceId,
+        recipientRegistrationGeneration: ownership.ownerGeneration,
+        update,
+        sentAtMs: getNowMs(),
+      });
+      return response?.kind === "bus.ack" &&
+        response.ok &&
+        isTelegramFollowerDurableAdmissionAckV1(response.durableAdmission)
+        ? response.durableAdmission
+        : undefined;
+    },
     forwardCallback: ({ query, ownership }) =>
       send({
         kind: "leader.forwardCallback",
@@ -1146,7 +1330,14 @@ function sendTelegramBusLocalEnvelopeOnce(
       const newlineIndex = buffer.indexOf("\n");
       if (newlineIndex < 0) return;
       const line = buffer.slice(0, newlineIndex);
-      settle(() => resolve(parseTelegramBusEnvelope(line)));
+      const response = parseTelegramBusEnvelope(line);
+      if (response && response.requestId !== options.envelope.requestId) {
+        settle(() =>
+          reject(new Error("Telegram bus response request id mismatch")),
+        );
+        return;
+      }
+      settle(() => resolve(response));
     });
     socket.once("error", (error) => settle(() => reject(error)));
     socket.once("end", () => settle(() => resolve(undefined)));
@@ -1372,6 +1563,47 @@ function parseDisconnectEnvelope(
     : undefined;
 }
 
+function parseForwardUpdateEnvelope(
+  value: Record<string, unknown>,
+  requestId: string,
+): TelegramBusEnvelope | undefined {
+  const target = parseTarget(value.target);
+  const update = isRecord(value.update) ? value.update : undefined;
+  if (
+    !hasExactKeys(value, [
+      "kind",
+      "requestId",
+      "profile",
+      "target",
+      "recipientInstanceId",
+      "recipientRegistrationGeneration",
+      "update",
+      "sentAtMs",
+      ...(typeof value.auth === "string" ? ["auth"] : []),
+    ]) ||
+    !isNonemptyString(value.profile) ||
+    !target ||
+    !isNonemptyString(value.recipientInstanceId) ||
+    !isNonemptyString(value.recipientRegistrationGeneration) ||
+    !update ||
+    !Number.isSafeInteger(update.update_id) ||
+    (update.update_id as number) < 0 ||
+    !Number.isSafeInteger(value.sentAtMs)
+  ) {
+    return undefined;
+  }
+  return {
+    kind: "leader.forwardUpdate",
+    requestId,
+    profile: value.profile,
+    target,
+    recipientInstanceId: value.recipientInstanceId,
+    recipientRegistrationGeneration: value.recipientRegistrationGeneration,
+    update: structuredClone(update) as { update_id: number },
+    sentAtMs: value.sentAtMs as number,
+  };
+}
+
 function parseForwardCallbackEnvelope(
   value: Record<string, unknown>,
   requestId: string,
@@ -1478,33 +1710,135 @@ function parseReplaceFollowerTargetEnvelope(
   };
 }
 
+function parseRecoveryFenceEnvelope(
+  value: Record<string, unknown>,
+  requestId: string,
+  kind: "leader.fenceRecovery" | "leader.resumeRecovery",
+): TelegramBusEnvelope | undefined {
+  if (
+    !hasExactKeys(value, [
+      "kind",
+      "requestId",
+      "profile",
+      "recipientInstanceId",
+      "recipientRegistrationGeneration",
+      "fenceGeneration",
+      "sentAtMs",
+      ...(typeof value.auth === "string" ? ["auth"] : []),
+    ]) ||
+    !isNonemptyString(value.profile) ||
+    !isNonemptyString(value.recipientInstanceId) ||
+    !isNonemptyString(value.recipientRegistrationGeneration) ||
+    !isNonemptyString(value.fenceGeneration) ||
+    !Number.isSafeInteger(value.sentAtMs)
+  ) {
+    return undefined;
+  }
+  return {
+    kind,
+    requestId,
+    profile: value.profile,
+    recipientInstanceId: value.recipientInstanceId,
+    recipientRegistrationGeneration:
+      value.recipientRegistrationGeneration,
+    fenceGeneration: value.fenceGeneration,
+    sentAtMs: value.sentAtMs as number,
+  };
+}
+
 function parseCallApiEnvelope(
   value: Record<string, unknown>,
   requestId: string,
 ): TelegramBusEnvelope | undefined {
-  return typeof value.instanceId === "string" &&
-    typeof value.method === "string" &&
-    Array.isArray(value.args) &&
-    typeof value.sentAtMs === "number"
-    ? {
-        kind: "follower.callApi",
-        requestId,
-        instanceId: value.instanceId,
-        ...(typeof value.registrationGeneration === "string"
-          ? { registrationGeneration: value.registrationGeneration }
-          : {}),
-        method: value.method,
-        args: value.args,
-        sentAtMs: value.sentAtMs,
-      }
-    : undefined;
+  const target = parseTarget(value.target);
+  if (
+    !hasExactKeys(value, [
+      "kind",
+      "requestId",
+      "profile",
+      "target",
+      "instanceId",
+      "manualFollowerOwnerId",
+      "registrationGeneration",
+      "followerSessionGeneration",
+      "method",
+      "args",
+      "sentAtMs",
+      ...(typeof value.auth === "string" ? ["auth"] : []),
+    ]) ||
+    !isNonemptyString(value.profile) ||
+    !target ||
+    !isNonemptyString(value.instanceId) ||
+    !isNonemptyString(value.manualFollowerOwnerId) ||
+    !isNonemptyString(value.registrationGeneration) ||
+    !Number.isSafeInteger(value.followerSessionGeneration) ||
+    (value.followerSessionGeneration as number) < 0 ||
+    !isNonemptyString(value.method) ||
+    !Array.isArray(value.args) ||
+    !Number.isSafeInteger(value.sentAtMs)
+  ) {
+    return undefined;
+  }
+  return {
+    kind: "follower.callApi",
+    requestId,
+    profile: value.profile,
+    target,
+    instanceId: value.instanceId,
+    manualFollowerOwnerId: value.manualFollowerOwnerId,
+    registrationGeneration: value.registrationGeneration,
+    followerSessionGeneration: value.followerSessionGeneration as number,
+    method: value.method,
+    args: structuredClone(value.args),
+    sentAtMs: value.sentAtMs as number,
+  };
 }
 
 function parseAckEnvelope(
   value: Record<string, unknown>,
   requestId: string,
 ): TelegramBusEnvelope | undefined {
-  if (typeof value.ok !== "boolean") return undefined;
+  const allowedKeys = new Set([
+    "kind",
+    "requestId",
+    "ok",
+    "message",
+    "result",
+    "durableAdmission",
+    "recoveryFence",
+    "error",
+  ]);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) return undefined;
+  if (
+    typeof value.ok !== "boolean" ||
+    (Object.hasOwn(value, "message") &&
+      typeof value.message !== "string") ||
+    (value.ok && Object.hasOwn(value, "error")) ||
+    (!value.ok &&
+      (Object.hasOwn(value, "durableAdmission") ||
+        Object.hasOwn(value, "recoveryFence")))
+  ) {
+    return undefined;
+  }
+  if (
+    Object.hasOwn(value, "durableAdmission") &&
+    !isTelegramFollowerDurableAdmissionAckV1(value.durableAdmission)
+  ) {
+    return undefined;
+  }
+  if (
+    Object.hasOwn(value, "recoveryFence") &&
+    !isTelegramRecoveryFenceAckV1(value.recoveryFence)
+  ) {
+    return undefined;
+  }
+  if (Object.hasOwn(value, "error")) {
+    if (!isRecord(value.error)) return undefined;
+    const errorKeys = new Set(["code", "method"]);
+    if (Object.keys(value.error).some((key) => !errorKeys.has(key))) {
+      return undefined;
+    }
+  }
   const envelope: TelegramBusEnvelope = {
     kind: "bus.ack",
     requestId,
@@ -1512,6 +1846,12 @@ function parseAckEnvelope(
     message: typeof value.message === "string" ? value.message : undefined,
   };
   if (Object.hasOwn(value, "result")) envelope.result = value.result;
+  if (isTelegramFollowerDurableAdmissionAckV1(value.durableAdmission)) {
+    envelope.durableAdmission = value.durableAdmission;
+  }
+  if (isTelegramRecoveryFenceAckV1(value.recoveryFence)) {
+    envelope.recoveryFence = value.recoveryFence;
+  }
   if (isRecord(value.error)) {
     const code = value.error.code;
     if (
@@ -1542,6 +1882,9 @@ function parseRegistration(
     instanceId: value.instanceId,
     connectedAtMs: value.connectedAtMs,
   };
+  if (typeof value.manualFollowerOwnerId === "string") {
+    registration.manualFollowerOwnerId = value.manualFollowerOwnerId;
+  }
   if (typeof value.profileKey === "string")
     registration.profileKey = value.profileKey;
   if (typeof value.threadName === "string")
@@ -1556,6 +1899,13 @@ function parseRegistration(
   }
   if (typeof value.registrationGeneration === "string") {
     registration.registrationGeneration = value.registrationGeneration;
+  }
+  if (
+    typeof value.sessionGeneration === "number" &&
+    Number.isSafeInteger(value.sessionGeneration) &&
+    value.sessionGeneration >= 0
+  ) {
+    registration.sessionGeneration = value.sessionGeneration;
   }
   if (target) registration.target = target;
   return registration;
@@ -1576,6 +1926,27 @@ function parseThreadTarget(
   return target && typeof target.threadId === "number"
     ? { chatId: target.chatId, threadId: target.threadId }
     : undefined;
+}
+
+function isNonemptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function hasExactKeys(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+): boolean {
+  const keys = Object.keys(value);
+  return keys.length === expected.length && expected.every((key) => Object.hasOwn(value, key));
+}
+
+function isExactTarget(value: unknown): value is TelegramTarget {
+  if (!isRecord(value) || !Number.isSafeInteger(value.chatId)) return false;
+  const keys = value.threadId === undefined ? ["chatId"] : ["chatId", "threadId"];
+  return (
+    hasExactKeys(value, keys) &&
+    (value.threadId === undefined || Number.isSafeInteger(value.threadId))
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

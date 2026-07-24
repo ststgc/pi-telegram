@@ -179,6 +179,12 @@ export interface TelegramBridgeThreadReconciliationState {
 export type TelegramBridgeBusRole = "leader" | "follower";
 export type TelegramBridgeBusLifecyclePhase = "electing";
 
+export interface TelegramBridgeRecoveryStatus {
+  pendingDeliveryCount: number;
+  deliveryUncertainCount: number;
+  busBlockerCount: number;
+}
+
 export interface TelegramBridgeStatusLineState {
   hasBotToken?: boolean;
   botUsername?: string;
@@ -208,6 +214,7 @@ export interface TelegramBridgeStatusLineState {
   topicSyncObservations?: TelegramBridgeStatusSyncObservation[];
   syncState?: Record<string, TelegramBridgeStatusSyncSlice | undefined>;
   threadReconciliation?: TelegramBridgeThreadReconciliationState;
+  recovery?: TelegramBridgeRecoveryStatus;
   busNowMs?: number;
   recentRuntimeEvents: TelegramRuntimeEvent[];
 }
@@ -297,6 +304,7 @@ export interface TelegramBridgeStatusRuntimeDeps<
   >;
   getThreadReconciliationState?: () =>
     TelegramBridgeThreadReconciliationState | undefined;
+  getRecoveryStatus?: () => TelegramBridgeRecoveryStatus | undefined;
   getInstanceSlot?: () => string | undefined;
   getInstanceThreadName?: () => string | undefined;
   getNowMs?: () => number;
@@ -652,6 +660,7 @@ export function createTelegramBridgeStatusRuntime<
         topicSyncObservations: deps.getTopicSyncObservations?.(),
         syncState: deps.getSyncState?.(),
         threadReconciliation: deps.getThreadReconciliationState?.(),
+        recovery: deps.getRecoveryStatus?.(),
         busNowMs: deps.getNowMs?.(),
         recentRuntimeEvents: deps.getRecentRuntimeEvents(),
       };
@@ -715,6 +724,7 @@ export function createTelegramStatusSnapshot(
       pendingModelSwitch: state.pendingModelSwitch,
       syncState: state.syncState,
       threadReconciliation: state.threadReconciliation,
+      ...(state.recovery ? { recovery: state.recovery } : {}),
       recentRuntimeEvents: state.recentRuntimeEvents,
     },
   };
@@ -1044,6 +1054,21 @@ function buildTelegramBridgeCompactThreadLines(
   return lines;
 }
 
+function buildTelegramRecoveryStatusLines(
+  state: Pick<TelegramBridgeStatusLineState, "recovery">,
+): string[] {
+  const recovery = state.recovery;
+  if (!recovery) return [];
+  return [
+    "recovery:",
+    `- pending delivery: ${recovery.pendingDeliveryCount}`,
+    `- delivery uncertain: ${recovery.deliveryUncertainCount}`,
+    ...(recovery.busBlockerCount > 0
+      ? [`- bus blockers: ${recovery.busBlockerCount} (actions unavailable)`]
+      : []),
+  ];
+}
+
 function buildTelegramBridgeCompactStatusLines(
   state: TelegramBridgeStatusLineState,
 ): string[] {
@@ -1102,6 +1127,7 @@ function buildTelegramBridgeCompactStatusLines(
       ? [`- active tools: ${state.activeToolExecutions}`]
       : []),
     ...(state.pendingModelSwitch ? ["- pending model switch: yes"] : []),
+    ...buildTelegramRecoveryStatusLines(state),
     ...buildTelegramBridgeCompactThreadLines(state),
     ...buildTelegramBusFollowerLines(state),
     ...buildTelegramLocalBusLines(state),
@@ -1169,6 +1195,7 @@ export function buildTelegramBridgeDiagnosticStatusLines(
     "queue:",
     `- queued turns: ${state.queuedItems.length}`,
     `- lanes: control=${controlQueueCount}, priority=${priorityQueueCount}, default=${defaultQueueCount}`,
+    ...buildTelegramRecoveryStatusLines(state),
     ...buildTelegramBusFollowerLines(state),
     ...buildTelegramLocalBusLines(state, { verbose: true }),
     ...buildTelegramTopicTargetDiagnosticLines(state),

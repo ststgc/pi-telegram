@@ -6,6 +6,7 @@
 
 import { setTimeout as waitForTimeout } from "node:timers/promises";
 
+import type { TelegramInboundHandlingOutcome } from "./updates.ts";
 import {
   extractTelegramMessageText,
   type TelegramMessageForwardOrigin,
@@ -32,6 +33,7 @@ export interface TelegramTextGroupMessage {
 }
 
 export interface TelegramTextGroupState<TMessage, TContext = unknown> {
+  key?: string;
   messages: TMessage[];
   context?: TContext;
   flushTimer?: ReturnType<typeof setTimeout>;
@@ -40,6 +42,11 @@ export interface TelegramTextGroupState<TMessage, TContext = unknown> {
   reschedule?: (delayMs?: number) => void;
   dispatchLimit?: number;
   forwardPairCandidate?: TelegramForwardCommentBatchPosition;
+  onSettled?: (
+    messages: TMessage[],
+    outcome: TelegramInboundHandlingOutcome,
+  ) => void | Promise<void>;
+  onFailed?: (messages: TMessage[], error: unknown) => void | Promise<void>;
 }
 
 export type TelegramForwardCommentBatchPosition = "comment" | "forward";
@@ -61,8 +68,14 @@ export interface TelegramTextGroupController<TMessage, TContext = unknown> {
     dispatchMessages: (
       messages: TMessage[],
       ctx: TContext,
-    ) => unknown | Promise<unknown>;
+    ) => Promise<TelegramInboundHandlingOutcome>;
+    onSettled?: (
+      messages: TMessage[],
+      outcome: TelegramInboundHandlingOutcome,
+    ) => void | Promise<void>;
+    onFailed?: (messages: TMessage[], error: unknown) => void | Promise<void>;
   }) => boolean;
+  removeMessages: (messageIds: number[]) => number;
   suspend: () => void;
   resume: (context: TContext) => void;
   clear: () => void;
@@ -83,7 +96,10 @@ export interface TelegramTextGroupDispatchRuntime<
   TMessage extends TelegramTextGroupMessage,
   TContext,
 > {
-  handleMessage: (message: TMessage, ctx: TContext) => Promise<void>;
+  handleMessage: (
+    message: TMessage,
+    ctx: TContext,
+  ) => Promise<TelegramInboundHandlingOutcome>;
 }
 
 export interface TelegramGroupedInputClearerDeps {
@@ -126,7 +142,7 @@ function getTelegramTextGroupMessageIdentity(
   return `${message.chat.id}:${threadKey}:${message.message_id}`;
 }
 
-function getTelegramTextGroupKey(
+export function getTelegramTextGroupKey(
   message: TelegramTextGroupMessage,
 ): string | undefined {
   if (message.media_group_id) return undefined;
@@ -184,7 +200,12 @@ export function queueTelegramTextGroupMessage<
   dispatchMessages: (
     messages: TMessage[],
     ctx: TContext,
-  ) => unknown | Promise<unknown>;
+  ) => Promise<TelegramInboundHandlingOutcome>;
+  onSettled?: (
+    messages: TMessage[],
+    outcome: TelegramInboundHandlingOutcome,
+  ) => void | Promise<void>;
+  onFailed?: (messages: TMessage[], error: unknown) => void | Promise<void>;
   forceStart?: boolean;
   dispatchImmediately?: boolean;
   forwardPairCandidate?: TelegramForwardCommentBatchPosition;
@@ -204,10 +225,13 @@ export function queueTelegramTextGroupMessage<
     return false;
   if (existing && !canAppendTelegramTextGroupMessage(existing, options.message))
     return false;
-  const state = existing ?? { messages: [] };
+  const state = existing ?? { key, messages: [] };
+  state.key = key;
   state.messages.push(options.message);
   state.context = options.context;
   state.forwardPairCandidate = options.forwardPairCandidate;
+  state.onSettled = options.onSettled;
+  state.onFailed = options.onFailed;
   const dispatchQueued = (): void => {
       state.flushTimer = undefined;
       const queued = options.groups.get(key);
@@ -223,24 +247,43 @@ export function queueTelegramTextGroupMessage<
         dispatchedMessages.map((message) => message.message_id),
       );
       queued.dispatching = true;
-      void Promise.resolve(
-        options.dispatchMessages(dispatchedMessages, queued.context),
-      ).then(
-        () => {
+      let dispatchResult: Promise<TelegramInboundHandlingOutcome>;
+      try {
+        dispatchResult = options.dispatchMessages(
+          dispatchedMessages,
+          queued.context,
+        );
+      } catch (error) {
+        dispatchResult = Promise.reject(error);
+      }
+      void Promise.resolve(dispatchResult).then(async (outcome) => {
+          const normalizedOutcome =
+            outcome ?? ({ kind: "completed", reason: "ignored" } as const);
+          if (queued.onSettled) {
+            await queued.onSettled(dispatchedMessages, normalizedOutcome);
+          }
           if (options.groups.get(key) !== queued) return;
+          queued.dispatching = false;
+          if (normalizedOutcome.kind === "deferred") {
+            queued.suspended = true;
+            return;
+          }
           queued.messages = queued.messages.filter(
             (message) => !dispatchedIds.has(message.message_id),
           );
-          queued.dispatching = false;
           if (queued.messages.length === 0) options.groups.delete(key);
           else if (!queued.flushTimer) scheduleDispatch();
-        },
-        () => {
+        }).catch(async (error) => {
           if (options.groups.get(key) !== queued) return;
           queued.dispatching = false;
-          if (!queued.flushTimer) scheduleDispatch();
-        },
-      );
+          try {
+            if (queued.onFailed) {
+              await queued.onFailed(dispatchedMessages, error);
+            }
+          } finally {
+            if (!queued.flushTimer) scheduleDispatch();
+          }
+        });
   };
   const scheduleDispatch = (delayMs = options.debounceMs): void => {
     if (state.suspended) return;
@@ -329,7 +372,13 @@ export function createTelegramTextGroupController<
       if (position === "comment") plannedForwardCommentStarts.add(identity);
       else plannedForwardCommentEnds.add(identity);
     },
-    queueMessage: ({ message, context, dispatchMessages }) => {
+    queueMessage: ({
+      message,
+      context,
+      dispatchMessages,
+      onSettled,
+      onFailed,
+    }) => {
       const identity = getTelegramTextGroupMessageIdentity(message);
       const key = getTelegramTextGroupKey(message);
       const plannedStart = plannedForwardCommentStarts.delete(identity);
@@ -376,6 +425,8 @@ export function createTelegramTextGroupController<
         setTimer,
         clearTimer,
         dispatchMessages,
+        onSettled,
+        onFailed,
         forceStart,
         dispatchImmediately,
         forwardPairCandidate:
@@ -389,6 +440,24 @@ export function createTelegramTextGroupController<
               : forwardCommentWaitMs
             : undefined,
       });
+    },
+    removeMessages: (messageIds) => {
+      if (messageIds.length === 0 || groups.size === 0) return 0;
+      const deleted = new Set(messageIds);
+      let removed = 0;
+      for (const [key, state] of groups) {
+        const retained = state.messages.filter(
+          (message) => !deleted.has(message.message_id),
+        );
+        removed += state.messages.length - retained.length;
+        if (retained.length === state.messages.length) continue;
+        state.messages = retained;
+        if (retained.length === 0 && !state.dispatching) {
+          if (state.flushTimer) clearTimer(state.flushTimer);
+          groups.delete(key);
+        }
+      }
+      return removed;
     },
     suspend: () => {
       for (const state of groups.values()) {
@@ -420,8 +489,19 @@ export function createTelegramTextGroupDispatchRuntime<
   TContext,
 >(deps: {
   textGroups: TelegramTextGroupController<TMessage, TContext>;
-  dispatchMessages: (messages: TMessage[], ctx: TContext) => Promise<void>;
-  dispatchSingleMessage: (message: TMessage, ctx: TContext) => Promise<void>;
+  dispatchMessages: (
+    messages: TMessage[],
+    ctx: TContext,
+  ) => Promise<TelegramInboundHandlingOutcome>;
+  dispatchSingleMessage: (
+    message: TMessage,
+    ctx: TContext,
+  ) => Promise<TelegramInboundHandlingOutcome>;
+  onSettled?: (
+    messages: TMessage[],
+    outcome: TelegramInboundHandlingOutcome,
+  ) => void | Promise<void>;
+  onFailed?: (messages: TMessage[], error: unknown) => void | Promise<void>;
 }): TelegramTextGroupDispatchRuntime<TMessage, TContext> {
   return {
     handleMessage: async (message, ctx) => {
@@ -430,9 +510,17 @@ export function createTelegramTextGroupDispatchRuntime<
         context: ctx,
         dispatchMessages: (messages, queuedCtx) =>
           deps.dispatchMessages(messages, queuedCtx),
+        onSettled: deps.onSettled,
+        onFailed: deps.onFailed,
       });
-      if (queuedTextGroup) return;
-      await deps.dispatchSingleMessage(message, ctx);
+      if (queuedTextGroup) {
+        return {
+          kind: "deferred",
+          reason: "text-group",
+          key: getTelegramTextGroupKey(message)!,
+        };
+      }
+      return deps.dispatchSingleMessage(message, ctx);
     },
   };
 }

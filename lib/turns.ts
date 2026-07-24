@@ -645,6 +645,15 @@ export async function buildTelegramPromptTurn(
     }
   }
 
+  const recoveryFiles = [
+    ...options.files,
+    ...(options.promptFiles ?? []),
+  ].filter(
+    (file, index, entries) =>
+      !file.isImage &&
+      entries.findIndex((candidate) => candidate.path === file.path) === index,
+  );
+
   return {
     kind: "prompt",
     chatId: firstMessage.chat.id,
@@ -656,6 +665,16 @@ export async function buildTelegramPromptTurn(
     laneOrder: options.queueOrder,
     queuedAttachments: [],
     content,
+    ...(recoveryFiles.length > 0
+      ? {
+          recoveryFiles: recoveryFiles.map((file) => ({
+            path: file.path,
+            fileName: file.fileName,
+            ...(file.mimeType ? { mimeType: file.mimeType } : {}),
+            ...(file.kind ? { kind: file.kind } : {}),
+          })),
+        }
+      : {}),
     historyText: appendTelegramSourceContext(
       formatTelegramHistoryText(
         options.rawText,

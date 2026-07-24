@@ -8,6 +8,11 @@ import test from "node:test";
 
 import { extractTelegramMessageText } from "../lib/media.ts";
 import * as TextGroups from "../lib/text-groups.ts";
+import type { TelegramInboundHandlingOutcome } from "../lib/updates.ts";
+
+function promptMaterialized(): TelegramInboundHandlingOutcome {
+  return { kind: "prompt-materialized", turnId: "test-turn", recordIds: [] };
+}
 
 type TestMessage = TextGroups.TelegramTextGroupMessage;
 
@@ -44,10 +49,11 @@ test("Text group helper delays likely split messages and appends quick continuat
         return callback as unknown as ReturnType<typeof setTimeout>;
       },
       clearTimer: () => {},
-      dispatchMessages: (messages, ctx) => {
+      dispatchMessages: async (messages, ctx) => {
         dispatched.push(
           `${ctx}:${messages.map((item) => item.text).join("|")}`,
         );
+        return promptMaterialized();
       },
     });
   assert.equal(queue(createMessage(1, "short")), false);
@@ -83,12 +89,10 @@ test("Text group controller coalesces same-batch forward comments and bounds ord
   const forwarded = createMessage(11, "Пересланный текст", {
     forward_origin: { type: "user" },
   });
-  controller.prepareUpdateBatch([
-    { message: comment },
-    { message: forwarded },
-  ]);
-  const dispatchMessages = (messages: TestMessage[]) => {
+  controller.prepareUpdateBatch([{ message: comment }, { message: forwarded }]);
+  const dispatchMessages = async (messages: TestMessage[]) => {
     dispatched.push(messages.map((message) => message.text).join("|"));
+    return promptMaterialized();
   };
   assert.equal(
     controller.queueMessage({
@@ -145,10 +149,11 @@ test("Text group controller coalesces a cross-batch comment with a rich forwarde
       (timer as unknown as { active: boolean }).active = false;
     },
   });
-  const dispatchMessages = (messages: TestMessage[]) => {
+  const dispatchMessages = async (messages: TestMessage[]) => {
     dispatched.push(
       messages.map((message) => extractTelegramMessageText(message)).join("|"),
     );
+    return promptMaterialized();
   };
   const comment = createMessage(30, "Комментарий");
   const forwarded = createMessage(31, "", {
@@ -159,12 +164,20 @@ test("Text group controller coalesces a cross-batch comment with a rich forwarde
     forward_origin: { type: "user" },
   });
   assert.equal(
-    controller.queueMessage({ message: comment, context: "ctx", dispatchMessages }),
+    controller.queueMessage({
+      message: comment,
+      context: "ctx",
+      dispatchMessages,
+    }),
     true,
   );
   assert.equal(timers[0]?.delay, 1000);
   assert.equal(
-    controller.queueMessage({ message: forwarded, context: "ctx", dispatchMessages }),
+    controller.queueMessage({
+      message: forwarded,
+      context: "ctx",
+      dispatchMessages,
+    }),
     true,
   );
   assert.equal(timers[0]?.active, false);
@@ -204,8 +217,9 @@ test("Text group controller coalesces media-only forwards and comments in either
         controller.queueMessage({
           message,
           context: "ctx",
-          dispatchMessages: (group) => {
+          dispatchMessages: async (group) => {
             dispatched.push(group.map((item) => item.message_id));
+            return promptMaterialized();
           },
         }),
         true,
@@ -230,23 +244,17 @@ test("Text group controller coalesces media-only forwards and comments in either
     });
 
   assert.deepEqual(
-    await runPair([
-      createMessage(40, "Комментарий"),
-      mediaForward(41),
-    ]),
+    await runPair([createMessage(40, "Комментарий"), mediaForward(41)]),
     [[40, 41]],
   );
   assert.deepEqual(
-    await runPair([
-      mediaForward(50),
-      createMessage(51, "Комментарий"),
-    ]),
+    await runPair([mediaForward(50), createMessage(51, "Комментарий")]),
     [[50, 51]],
   );
-  assert.deepEqual(
-    await runPair([mediaForward(60), mediaForward(61)], true),
-    [[60], [61]],
-  );
+  assert.deepEqual(await runPair([mediaForward(60), mediaForward(61)], true), [
+    [60],
+    [61],
+  ]);
 });
 
 test("Text group keeps split messages until asynchronous dispatch succeeds", async () => {
@@ -270,6 +278,7 @@ test("Text group keeps split messages until asynchronous dispatch succeeds", asy
     dispatchMessages: async () => {
       attempts += 1;
       if (attempts === 1) throw new Error("queue admission failed");
+      return promptMaterialized();
     },
   });
 
@@ -303,8 +312,9 @@ test("Text group controller clears pending timers without stale dispatch", () =>
       (timer as unknown as { active: boolean }).active = false;
     },
   });
-  const dispatchMessages = (messages: TestMessage[], ctx: string) => {
+  const dispatchMessages = async (messages: TestMessage[], ctx: string) => {
     dispatched.push(`${ctx}:${messages.map((item) => item.text).join("|")}`);
+    return promptMaterialized();
   };
   assert.equal(
     controller.queueMessage({
@@ -342,8 +352,9 @@ test("Text group suspension resumes admitted input in the replacement context", 
   controller.queueMessage({
     message: createMessage(1, "long-enough"),
     context: "old-session",
-    dispatchMessages: (messages, ctx) => {
+    dispatchMessages: async (messages, ctx) => {
       dispatched.push(`${ctx}:${messages.map((item) => item.text).join("|")}`);
+      return promptMaterialized();
     },
   });
 
@@ -375,7 +386,7 @@ test("Text group helper uses 3600 as the default near-limit threshold", () => {
         return callback as unknown as ReturnType<typeof setTimeout>;
       },
       clearTimer: () => {},
-      dispatchMessages: () => {},
+      dispatchMessages: async () => promptMaterialized(),
     });
   assert.equal(queue(createMessage(1, "x".repeat(3599))), false);
   assert.equal(queue(createMessage(2, "x".repeat(3600))), true);
@@ -397,7 +408,7 @@ test("Text group helper ignores commands, bots, media groups, and non-contiguous
       return callback as unknown as ReturnType<typeof setTimeout>;
     },
     clearTimer: () => {},
-    dispatchMessages: () => {},
+    dispatchMessages: async () => promptMaterialized(),
   };
   assert.equal(
     TextGroups.queueTelegramTextGroupMessage({
@@ -457,10 +468,11 @@ test("Text group helper scopes split recovery by thread target", () => {
         return callback as unknown as ReturnType<typeof setTimeout>;
       },
       clearTimer: () => {},
-      dispatchMessages: (messages, ctx) => {
+      dispatchMessages: async (messages, ctx) => {
         dispatched.push(
           `${ctx}:${messages.map((item) => item.text).join("|")}`,
         );
+        return promptMaterialized();
       },
     });
 
@@ -504,10 +516,11 @@ test("Text group helper appends many split tails with wider id gaps", () => {
         return callback as unknown as ReturnType<typeof setTimeout>;
       },
       clearTimer: () => {},
-      dispatchMessages: (messages, ctx) => {
+      dispatchMessages: async (messages, ctx) => {
         dispatched.push(
           `${ctx}:${messages.map((item) => item.text).join("|")}`,
         );
+        return promptMaterialized();
       },
     });
 

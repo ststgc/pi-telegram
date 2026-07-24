@@ -6,6 +6,8 @@
 
 import { basename, dirname } from "node:path";
 
+import type { TelegramInboundHandlingOutcome } from "./updates.ts";
+
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
 const TELEGRAM_REPLY_CONTEXT_MAX_LENGTH = 1000;
 
@@ -97,12 +99,18 @@ export interface TelegramMediaGroupMessage {
 }
 
 export interface TelegramMediaGroupState<TMessage, TContext = unknown> {
+  key?: string;
   messages: TMessage[];
   context?: TContext;
   flushTimer?: ReturnType<typeof setTimeout>;
   dispatching?: boolean;
   suspended?: boolean;
   reschedule?: () => void;
+  onSettled?: (
+    messages: TMessage[],
+    outcome: TelegramInboundHandlingOutcome,
+  ) => void | Promise<void>;
+  onFailed?: (messages: TMessage[], error: unknown) => void | Promise<void>;
 }
 
 export interface TelegramMediaGroupController<
@@ -115,9 +123,14 @@ export interface TelegramMediaGroupController<
     dispatchMessages: (
       messages: TMessage[],
       ctx?: TContext,
-    ) => unknown | Promise<unknown>;
+    ) => Promise<TelegramInboundHandlingOutcome>;
+    onSettled?: (
+      messages: TMessage[],
+      outcome: TelegramInboundHandlingOutcome,
+    ) => void | Promise<void>;
+    onFailed?: (messages: TMessage[], error: unknown) => void | Promise<void>;
   }) => boolean;
-  removeMessages: (messageIds: number[]) => number;
+  removeMessages: (messageIds: number[]) => number[];
   suspend: () => void;
   resume: (context: TContext) => void;
   clear: () => void;
@@ -128,14 +141,25 @@ export interface TelegramMediaGroupDispatchRuntimeDeps<
   TContext,
 > {
   mediaGroups: TelegramMediaGroupController<TMessage, TContext>;
-  dispatchMessages: (messages: TMessage[], ctx: TContext) => Promise<void>;
+  dispatchMessages: (
+    messages: TMessage[],
+    ctx: TContext,
+  ) => Promise<TelegramInboundHandlingOutcome>;
+  onSettled?: (
+    messages: TMessage[],
+    outcome: TelegramInboundHandlingOutcome,
+  ) => void | Promise<void>;
+  onFailed?: (messages: TMessage[], error: unknown) => void | Promise<void>;
 }
 
 export interface TelegramMediaGroupDispatchRuntime<
   TMessage extends TelegramMediaGroupMessage,
   TContext,
 > {
-  handleMessage: (message: TMessage, ctx: TContext) => Promise<void>;
+  handleMessage: (
+    message: TMessage,
+    ctx: TContext,
+  ) => Promise<TelegramInboundHandlingOutcome>;
 }
 
 export interface TelegramMediaGroupControllerOptions {
@@ -467,10 +491,10 @@ export function removePendingTelegramMediaGroupMessages<
   groups: Map<string, TelegramMediaGroupState<TMessage, unknown>>,
   messageIds: number[],
   clearTimer: (timer: ReturnType<typeof setTimeout>) => void,
-): number {
-  if (messageIds.length === 0 || groups.size === 0) return 0;
+): number[] {
+  if (messageIds.length === 0 || groups.size === 0) return [];
   const deletedMessageIds = new Set(messageIds);
-  let removedGroups = 0;
+  const removedMessageIds = new Set<number>();
   for (const [key, state] of groups.entries()) {
     if (
       !state.messages.some((message) =>
@@ -480,10 +504,12 @@ export function removePendingTelegramMediaGroupMessages<
       continue;
     }
     if (state.flushTimer) clearTimer(state.flushTimer);
+    for (const message of state.messages) {
+      removedMessageIds.add(message.message_id);
+    }
     groups.delete(key);
-    removedGroups += 1;
   }
-  return removedGroups;
+  return [...removedMessageIds];
 }
 
 export function queueTelegramMediaGroupMessage<
@@ -499,13 +525,27 @@ export function queueTelegramMediaGroupMessage<
   dispatchMessages: (
     messages: TMessage[],
     ctx?: TContext,
-  ) => unknown | Promise<unknown>;
+  ) => Promise<TelegramInboundHandlingOutcome>;
+  onSettled?: (
+    messages: TMessage[],
+    outcome: TelegramInboundHandlingOutcome,
+  ) => void | Promise<void>;
+  onFailed?: (messages: TMessage[], error: unknown) => void | Promise<void>;
 }): boolean {
   const key = getTelegramMediaGroupKey(options.message);
   if (!key) return false;
-  const existing = options.groups.get(key) ?? { messages: [] };
-  existing.messages.push(options.message);
+  const existing = options.groups.get(key) ?? { key, messages: [] };
+  existing.key = key;
+  if (
+    !existing.messages.some(
+      (message) => message.message_id === options.message.message_id,
+    )
+  ) {
+    existing.messages.push(options.message);
+  }
   existing.context = options.context;
+  existing.onSettled = options.onSettled;
+  existing.onFailed = options.onFailed;
   const scheduleDispatch = (): void => {
     if (existing.suspended) return;
     existing.flushTimer = options.setTimer(() => {
@@ -521,24 +561,43 @@ export function queueTelegramMediaGroupMessage<
         dispatchedMessages.map((message) => message.message_id),
       );
       state.dispatching = true;
-      void Promise.resolve(
-        options.dispatchMessages(dispatchedMessages, state.context),
-      ).then(
-        () => {
+      let dispatchResult: Promise<TelegramInboundHandlingOutcome>;
+      try {
+        dispatchResult = options.dispatchMessages(
+          dispatchedMessages,
+          state.context,
+        );
+      } catch (error) {
+        dispatchResult = Promise.reject(error);
+      }
+      void Promise.resolve(dispatchResult).then(async (outcome) => {
+          const normalizedOutcome =
+            outcome ?? ({ kind: "completed", reason: "ignored" } as const);
+          if (state.onSettled) {
+            await state.onSettled(dispatchedMessages, normalizedOutcome);
+          }
           if (options.groups.get(key) !== state) return;
+          state.dispatching = false;
+          if (normalizedOutcome.kind === "deferred") {
+            state.suspended = true;
+            return;
+          }
           state.messages = state.messages.filter(
             (message) => !dispatchedIds.has(message.message_id),
           );
-          state.dispatching = false;
           if (state.messages.length === 0) options.groups.delete(key);
           else if (!state.flushTimer) scheduleDispatch();
-        },
-        () => {
+        }).catch(async (error) => {
           if (options.groups.get(key) !== state) return;
           state.dispatching = false;
-          if (!state.flushTimer) scheduleDispatch();
-        },
-      );
+          try {
+            if (state.onFailed) {
+              await state.onFailed(dispatchedMessages, error);
+            }
+          } finally {
+            if (!state.flushTimer) scheduleDispatch();
+          }
+        });
     }, options.debounceMs);
     existing.flushTimer.unref?.();
   };
@@ -563,7 +622,13 @@ export function createTelegramMediaGroupController<
       setTimeout(callback, ms));
   const clearTimer = options.clearTimer ?? clearTimeout;
   return {
-    queueMessage: ({ message, context, dispatchMessages }) =>
+    queueMessage: ({
+      message,
+      context,
+      dispatchMessages,
+      onSettled,
+      onFailed,
+    }) =>
       queueTelegramMediaGroupMessage({
         message,
         context,
@@ -572,6 +637,8 @@ export function createTelegramMediaGroupController<
         setTimer,
         clearTimer,
         dispatchMessages,
+        onSettled,
+        onFailed,
       }),
     removeMessages: (messageIds) =>
       removePendingTelegramMediaGroupMessages(groups, messageIds, clearTimer),
@@ -606,16 +673,25 @@ export function createTelegramMediaGroupDispatchRuntime<
 ): TelegramMediaGroupDispatchRuntime<TMessage, TContext> {
   return {
     handleMessage: async (message, ctx) => {
+      const groupKey = getTelegramMediaGroupKey(message);
       const queuedMediaGroup = deps.mediaGroups.queueMessage({
         message,
         context: ctx,
         dispatchMessages: (messages, queuedCtx) =>
           queuedCtx === undefined
-            ? Promise.resolve()
+            ? Promise.resolve({ kind: "completed", reason: "ignored" })
             : deps.dispatchMessages(messages, queuedCtx),
+        onSettled: deps.onSettled,
+        onFailed: deps.onFailed,
       });
-      if (queuedMediaGroup) return;
-      await deps.dispatchMessages([message], ctx);
+      if (queuedMediaGroup) {
+        return {
+          kind: "deferred",
+          reason: "media-group",
+          key: groupKey!,
+        };
+      }
+      return deps.dispatchMessages([message], ctx);
     },
   };
 }

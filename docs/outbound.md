@@ -12,6 +12,14 @@ Proactive projection defaults on. With `assistant.proactivePush` omitted or set 
 
 Proactive blocks use `assistant.rendering` independently of voice policy. Rich mode sends native Rich Markdown and HTML mode keeps the established HTML renderer; proactive projection does not synthesize voice or attach queued files merely because Rich rendering is active. The queue revalidates exact target, profile/token transport generation, leader epoch or follower registration generation, and session generation before each send. Telegram-owned turns remain on their ordinary reply path, and `commit-unknown` never permits proactive replay.
 
+## Durable Final Delivery
+
+For a Telegram-owned turn, `agent_end` first commits the transformed semantic reply, deterministic ordered delivery units, and every attachment/voice source into the private profile-scoped recovery store. Only then does the active turn release its Pi dispatch lease and schedule Telegram delivery. Each unit is claimed separately; a confirmed Bot API result becomes a durable unit receipt before the next unit begins. The queue receives a terminal notification only after the outbound record is durably `delivered`, `delivery-uncertain`, or explicitly discarded. On restart, an already delivered record is not sent again, its completed inbound source lets the next safe turn advance once, and `planned`, `pending`, or bounded `retryable-pending` work resumes from its first unreceipted unit.
+
+The outbox does **not** promise exactly-once delivery across Telegram's non-transactional network boundary. A known-not-committed response may retry automatically under the bounded start policy. A response-lost/commit-unknown mutation becomes `delivery-uncertain` immediately; so does a process crash after Telegram confirms a unit but before its receipt commits. Neither case is auto-resent. Confirmed operator Retry creates a linked attempt and warns that the earlier effect may already exist, so duplication is possible by design; Discard records a terminal decision without sending.
+
+Outbound payloads and operation-owned attachment spools use private `0700` directories and `0600` files, required size/SHA-256 verification, and the profile's 512 MiB physical-byte quota. Uncertain payload/spool data has no TTL; confirmed delivered spools are released with the terminal receipt, completed payload compacts after 24 hours, and terminal metadata compacts after 7 days within the store bounds. Status exposes only aggregate states and opaque action handles, never answer text, artifact bytes or paths, Telegram identities, record ids, tokens, or secrets. Store downgrade is therefore allowed only after every outbound record is terminal and the profile-wide runtime/follower fence has drained in-flight delivery.
+
 ## Standard
 
 An outbound handler is selected by `type`. Text replies and assistant markup map to handler types:

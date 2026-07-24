@@ -246,6 +246,7 @@ export interface TelegramMenuActionRuntimeDeps<
   getActiveModel: (ctx: TContext) => TModel | undefined;
   getThinkingLevel: () => ThinkingLevel;
   getQueueItemCount?: () => number;
+  getRecoveryItemCount?: () => number;
   buildStatusHtml: (ctx: TContext) => string;
   storeModelMenuState: (state: TelegramModelMenuState<TModel>) => void;
   isIdle: (ctx: TContext) => boolean;
@@ -751,6 +752,7 @@ export function createTelegramMenuActionRuntimeWithStateBuilder<
     getActiveModel: deps.getActiveModel,
     getThinkingLevel: deps.getThinkingLevel,
     getQueueItemCount: deps.getQueueItemCount,
+    getRecoveryItemCount: deps.getRecoveryItemCount,
     buildStatusHtml: deps.buildStatusHtml,
     storeModelMenuState: deps.storeModelMenuState,
     isIdle: deps.isIdle,
@@ -786,6 +788,7 @@ export function createTelegramMenuActionRuntime<
         deps.getThinkingLevel(),
         deps,
         deps.getQueueItemCount?.() ?? 0,
+        deps.getRecoveryItemCount?.() ?? 0,
         deps.sectionRegistry,
         deps.isVoiceReplyActive?.(),
       ),
@@ -805,12 +808,14 @@ export function createTelegramMenuActionRuntime<
         getActiveModel: () => deps.getActiveModel(ctx),
         getThinkingLevel: deps.getThinkingLevel,
         getQueueItemCount: deps.getQueueItemCount,
+        getRecoveryItemCount: deps.getRecoveryItemCount,
         sendStatusMenu: (
           state,
           statusHtml,
           activeModel,
           thinkingLevel,
           queueItemCount,
+          recoveryItemCount,
         ) =>
           sendTelegramStatusMessage(
             state,
@@ -819,6 +824,7 @@ export function createTelegramMenuActionRuntime<
             thinkingLevel,
             deps,
             queueItemCount,
+            recoveryItemCount,
             deps.sectionRegistry,
             deps.isVoiceReplyActive?.(),
           ),

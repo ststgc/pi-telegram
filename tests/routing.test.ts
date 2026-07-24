@@ -164,7 +164,6 @@ test("Routing runtime forwards authorized text messages into prompt queueing", a
     configStore: {
       get: () => ({}),
       getAllowedUserId: () => 7,
-      setAllowedUserId: () => undefined,
       persist: async () => undefined,
     },
     bridgeRuntime,
@@ -458,7 +457,6 @@ function createRouteHarness(options: RouteHarnessOptions = {}) {
     configStore: {
       get: () => (options.config ?? {}) as never,
       getAllowedUserId: () => 7,
-      setAllowedUserId: () => undefined,
       persist: async () => undefined,
     },
     callApi: options.callApi,

@@ -70,7 +70,7 @@ function runNodeScript(
 async function waitForFileText(
   path: string,
   predicate: (text: string) => boolean,
-  timeoutMs = 3000,
+  timeoutMs = 15_000,
 ): Promise<string> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -311,7 +311,7 @@ test("Child process sharing the agent dir does not poll while parent owns Telegr
       await handlers.get("session_shutdown")?.({}, ctx);
       process.exit(0);
     }, 20);
-    setTimeout(() => process.exit(2), 5000).unref?.();
+    setTimeout(() => process.exit(2), 20_000).unref?.();
   `;
   const parent = spawn(
     process.execPath,

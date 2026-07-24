@@ -53,13 +53,13 @@ The connected Pi instance owns Telegram polling. Use `/telegram-connect <name>` 
 
 ### 4. Pair your Telegram account
 
-Open the bot DM and send:
+When the bot is not yet paired, `/telegram-setup` and `/telegram-connect` display a one-time pairing code only in the local Pi UI. Open the private bot DM and send the exact command shown locally:
 
 ```text
-/start
+/start <code>
 ```
 
-The first Telegram user to message the bot becomes the allowed owner. Other users are ignored.
+The code expires after 10 minutes and is single-use. The bridge stores only a strictly validated salted verifier; the raw code never enters `telegram.json`, diagnostics, status, or public update handlers. Re-running setup/connect in the creating process redisplays the same unexpired code; another process or a restarted runtime reports a pending claim without rotating or revealing it. Proof-shaped updates remain private even if replayed after pairing. Every other update is ignored until pairing succeeds. Existing `allowedUserId` profiles remain paired and do not generate a code.
 
 ## What It Feels Like
 
@@ -106,7 +106,7 @@ The first Telegram user to message the bot becomes the allowed owner. Other user
 | Threaded Mode | Run one leader plus visible follower Pi instances through named private-chat threads. | One bot can host a local multi-instance Pi organism without hidden process spawning. |
 | Reroute and restore | Preserve unknown threads and offer explicit target choices. | Telegram client state can be repaired without silently deleting or hijacking prompts. |
 | Extension sections | Add menu sections, commands, status rows, settings, callbacks, and delivery helpers from companion extensions. | `pi-telegram` becomes a platform surface for other Pi extensions. |
-| Runtime diagnostics | Use `/telegram-status` and recent runtime events for connection, role, queue, transport, and failure evidence. | Debugging lives in the operator surface instead of hidden logs only. |
+| Runtime diagnostics | Use `/telegram-status`, the Recovery submenu, and recent runtime events for connection, role, queue, transport, durable-work controls, and failure evidence. Pending delivery is a metadata-only aggregate; delivery-uncertain and bus-uncertain work expose only an opaque handle, family, state, and required action. | Debugging and confirmed recovery actions live in the operator surface instead of hidden logs only. |
 | Safety and ownership | Pair one owner, lock transport, scope targets, and reject fake terminal behavior. | Remote access remains explicit, bounded, and understandable. |
 
 ## Core Loop
@@ -240,6 +240,10 @@ Stable public entrypoints are documented in [Public API](./docs/public-api.md), 
 Telegram is a companion surface around a live Pi runtime, not a second runtime. It can compact the current session, but it cannot create, resume, fork, browse, or switch sessions until Pi exposes safe public extension APIs for those operations.
 
 A Telegram prompt is a normal model turn in the active Pi session and therefore inherits that session's active post-compaction context; the bridge does not make token cost proportional only to the new mobile message. Current releases keep per-turn guidance small and transient, with detailed bridge instructions available on demand through `telegram_help` instead of persisted in every user turn. Pi session JSONL contains model history; profile-scoped pi-telegram `logs*.jsonl` contains redacted operational events and is never model context.
+
+Durable recovery primitives may retain the minimum full prompt payload and operation-owned attachment spool needed to recover admitted work under the private profile-scoped `tmp/telegram/recovery-v1*` store. Directories use `0700`, files use `0600`, binary references and private rematerialized attachment caches are size- and SHA-256-verified, and each profile has a hard 512 MiB physical-byte quota that includes those caches. Unresolved or uncertain work is never TTL-deleted; retention runs when the runtime opens the store and at a bounded hourly cadence, completed payload compacts after 24 hours, terminal inbound/outbound/bus metadata (including bus dedup) after 7 days within count/full-record-byte bounds, and downgrade quarantine requires zero nonterminal work. The `/start` Recovery submenu exposes collision-checked opaque metadata handles plus profile/mode, unresolved family/state counts, quota use/limit, oldest age, fixed incident labels, and required-action labels only—never retained prompt text, attachment bytes/paths, chat/thread/user ids, target/record/turn ids, tokens, secrets, or filesystem references. Confirmed controls can safely drain replayable work, explicitly retry uncertain inbound work with a duplicate-execution warning, durably discard it, or reassign orphaned work after exact current profile/target/owner/leader-or-follower/session-generation proof. Confirmed downgrade now runs a profile-wide barrier from the current leader: it snapshots every live follower generation, closes admission/forwarding/grouped-input/queue-dispatch gates, waits for all in-flight recovery operations to drain, rechecks every durable family under store-exclusive mode, then atomically quarantines the store and fsyncs its parent. Any unreachable, stale, mismatched, or newly blocked follower/store state aborts before quarantine; a pre-quarantine failure cancels only an exclusive mode this attempt actually changed and resumes the exact fenced generations. A successful or commit-uncertain quarantine never reopens the gates or recreates the store. Classic and leader-local inbound polling use the recovery committed prefix as the sole offset authority; admitted/pre-dispatch turns and non-image input files rehydrate through exact owner/session claims, and ambiguous Pi dispatch is never replayed automatically.
+
+Final replies and attachments use the same private store as a durable ordered outbox. The semantic answer and artifact bytes are committed before delivery starts; each confirmed Telegram unit gets a durable receipt before the next unit or queued turn advances. Restart automatically resumes only work known not to have started or known not to have committed. A send that may have reached Telegram, or a crash after Telegram confirmed it but before the receipt commit, becomes `delivery-uncertain` and is never auto-resent. This is deliberately not an exactly-once promise: confirmed Retry warns that Telegram may already contain the effect and can create a duplicate. Attachment spools remain private and quota-accounted until delivery, discard, or explicit linked retry resolves ownership; live downgrade remains blocked while any outbound record is nonterminal.
 
 ## Documentation Map
 

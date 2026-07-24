@@ -2381,3 +2381,38 @@ test("Locked polling runtime does not claim stale ownership from another cwd dur
     rmSync(temp.dir, { recursive: true, force: true });
   }
 });
+
+test("Terminal polling teardown releases exact ownership even when transport stop fails", async () => {
+  const temp = createTempLockPath();
+  try {
+    const events: string[] = [];
+    const lock = createTelegramLockRuntime({
+      locksPath: temp.path,
+      pid: 10,
+      isProcessAlive: () => true,
+    });
+    const runtime = createTelegramLockedPollingRuntime({
+      lock,
+      hasBotToken: () => true,
+      ownershipCheckMs: 1,
+      ownershipRefreshMs: 1,
+      startPolling: async () => { events.push("start"); },
+      stopPolling: async () => {
+        events.push("stop");
+        throw new Error("transport stop failed");
+      },
+      updateStatus: () => {},
+    });
+    assert.equal((await runtime.start({ cwd: "/repo" })).ok, true);
+    assert.equal(lock.owns({ cwd: "/repo" }), true);
+    await assert.rejects(
+      runtime.terminalizeTransportLease(),
+      /transport stop failed/u,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(lock.owns({ cwd: "/repo" }), false);
+    assert.deepEqual(events, ["start", "stop"]);
+  } finally {
+    rmSync(temp.dir, { recursive: true, force: true });
+  }
+});

@@ -23,6 +23,11 @@ import {
   removePendingTelegramMediaGroupMessages,
   type TelegramMediaGroupState,
 } from "../lib/media.ts";
+import type { TelegramInboundHandlingOutcome } from "../lib/updates.ts";
+
+function promptMaterialized(): TelegramInboundHandlingOutcome {
+  return { kind: "prompt-materialized", turnId: "test-turn", recordIds: [] };
+}
 
 type TestTimer = ReturnType<typeof setTimeout>;
 
@@ -294,8 +299,10 @@ test("Media helpers replace debounce timers and dispatch grouped messages", asyn
       debounceMs: 100,
       setTimer,
       clearTimer,
-      dispatchMessages: (messages) =>
-        dispatched.push(messages.map((message) => message.message_id)),
+      dispatchMessages: async (messages) => {
+        dispatched.push(messages.map((message) => message.message_id));
+        return promptMaterialized();
+      },
     }),
     true,
   );
@@ -305,8 +312,10 @@ test("Media helpers replace debounce timers and dispatch grouped messages", asyn
     debounceMs: 100,
     setTimer,
     clearTimer,
-    dispatchMessages: (messages) =>
-      dispatched.push(messages.map((message) => message.message_id)),
+    dispatchMessages: async (messages) => {
+      dispatched.push(messages.map((message) => message.message_id));
+      return promptMaterialized();
+    },
   });
   assert.deepEqual(cleared, [1]);
   callbacks.at(-1)?.();
@@ -338,6 +347,7 @@ test("Media group keeps messages until asynchronous dispatch succeeds", async ()
     dispatchMessages: async () => {
       attempts += 1;
       if (attempts === 1) throw new Error("queue admission failed");
+      return promptMaterialized();
     },
   });
 
@@ -375,28 +385,63 @@ test("Media group controller owns timers, removal, and cleanup", () => {
   assert.equal(
     controller.queueMessage({
       message: { message_id: 1, chat: { id: 7 }, media_group_id: "album" },
-      dispatchMessages: (messages) =>
-        dispatched.push(messages.map((message) => message.message_id)),
+      dispatchMessages: async (messages) => {
+        dispatched.push(messages.map((message) => message.message_id));
+        return promptMaterialized();
+      },
     }),
     true,
   );
   controller.queueMessage({
     message: { message_id: 2, chat: { id: 7 }, media_group_id: "album" },
-    dispatchMessages: (messages) =>
-      dispatched.push(messages.map((message) => message.message_id)),
+    dispatchMessages: async (messages) => {
+      dispatched.push(messages.map((message) => message.message_id));
+      return promptMaterialized();
+    },
   });
   assert.deepEqual(cleared, [1]);
-  assert.equal(controller.removeMessages([2]), 1);
+  assert.deepEqual(controller.removeMessages([2]), [1, 2]);
   assert.deepEqual(cleared, [1, 2]);
   callbacks.at(-1)?.();
   assert.equal(dispatched.length, 0);
   controller.queueMessage({
     message: { message_id: 3, chat: { id: 7 }, media_group_id: "album" },
-    dispatchMessages: (messages) =>
-      dispatched.push(messages.map((message) => message.message_id)),
+    dispatchMessages: async (messages) => {
+      dispatched.push(messages.map((message) => message.message_id));
+      return promptMaterialized();
+    },
   });
   controller.clear();
   assert.deepEqual(cleared, [1, 2, 3]);
+});
+
+test("Media group re-admission deduplicates by Telegram message id", async () => {
+  const callbacks: Array<() => void> = [];
+  const dispatched: number[][] = [];
+  const controller = createTelegramMediaGroupController<{
+    message_id: number;
+    chat: { id: number };
+    media_group_id?: string;
+  }>({
+    setTimer: (callback) => {
+      callbacks.push(callback);
+      return createTestTimer(callbacks.length);
+    },
+    clearTimer: () => {},
+  });
+  const enqueue = () =>
+    controller.queueMessage({
+      message: { message_id: 1, chat: { id: 7 }, media_group_id: "album" },
+      dispatchMessages: async (messages) => {
+        dispatched.push(messages.map((message) => message.message_id));
+        return promptMaterialized();
+      },
+    });
+  enqueue();
+  enqueue();
+  callbacks.at(-1)?.();
+  await Promise.resolve();
+  assert.deepEqual(dispatched, [[1]]);
 });
 
 test("Media group suspension preserves admitted messages for replacement context", async () => {
@@ -418,11 +463,13 @@ test("Media group suspension preserves admitted messages for replacement context
   controller.queueMessage({
     message: { message_id: 1, chat: { id: 7 }, media_group_id: "album" },
     context: "old-session",
-    dispatchMessages: (messages, ctx) =>
+    dispatchMessages: async (messages, ctx) => {
       dispatched.push({
         ids: messages.map((message) => message.message_id),
         ctx,
-      }),
+      });
+      return promptMaterialized();
+    },
   });
 
   controller.suspend();
@@ -458,6 +505,7 @@ test("Media group dispatch runtime handles immediate and grouped messages", asyn
         ids: messages.map((message) => message.message_id),
         ctx,
       });
+      return promptMaterialized();
     },
   });
   await runtime.handleMessage({ message_id: 1, chat: { id: 7 } }, "ctx-a");
@@ -489,11 +537,11 @@ test("Media helpers remove pending groups by message id", () => {
     flushTimer: createTestTimer(10),
   });
   const cleared: number[] = [];
-  assert.equal(
+  assert.deepEqual(
     removePendingTelegramMediaGroupMessages(groups, [2], (timer) => {
       cleared.push(getTestTimerId(timer));
     }),
-    1,
+    [1, 2],
   );
   assert.deepEqual(cleared, [10]);
   assert.equal(groups.size, 0);

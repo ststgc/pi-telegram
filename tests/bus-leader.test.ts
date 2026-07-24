@@ -4,13 +4,16 @@
  */
 
 import assert from "node:assert/strict";
+import { fork, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
   createTelegramBusFollowerRegistry,
+  createTelegramBusLocalServer,
   resolveTelegramBusSocketPath,
   sendTelegramBusLocalEnvelope,
 } from "../lib/bus.ts";
@@ -24,9 +27,307 @@ import {
   createTelegramBusLeaderRuntime,
   createTelegramBusLeaderRuntimeAssembly,
   createTelegramBusLeaderTargetProvisioner,
+  createTelegramRecoveryDowngradeCoordinator,
 } from "../lib/bus-leader.ts";
+import {
+  openRecoveryStore,
+  RecoveryProfileOperationGate,
+} from "../lib/recovery.ts";
 import { createTelegramTopicTargetStore } from "../lib/threads.ts";
 import { TelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
+
+test("Recovery downgrade coordinator cancels store exclusive and resumes after rename failure", async () => {
+  const gate = new RecoveryProfileOperationGate();
+  const events: string[] = [];
+  let storeExclusive = false;
+  const downgrade = createTelegramRecoveryDowngradeCoordinator<string>({
+    canCoordinate: () => true,
+    getCoordinationGeneration: () => "leader-epoch-1",
+    getProfile: () => "default",
+    getFollowers: () => [],
+    getAuthSecret: () => "secret",
+    createRequestId: () => "leader:1",
+    gate,
+    preflight: () => ({ safe: true, blockerCount: 0 }),
+    beginStoreExclusive() {
+      storeExclusive = true;
+      events.push("store-exclusive");
+    },
+    quarantineStore() {
+      events.push("rename-failed");
+      throw new Error("rename failed");
+    },
+    cancelStoreExclusive() {
+      assert.equal(storeExclusive, true);
+      storeExclusive = false;
+      events.push("store-cancelled");
+    },
+    stopPolling() {
+      events.push("polling-stopped");
+    },
+    suspendRuntime() {
+      events.push("runtime-suspended");
+    },
+    resumeRuntime() {
+      events.push("runtime-resumed");
+    },
+    createFenceGeneration: () => "fence-a",
+  });
+
+  await assert.rejects(() => downgrade("ctx"), /rename failed/);
+  assert.equal(storeExclusive, false);
+  assert.equal(gate.getState("default").phase, "active");
+  assert.deepEqual(events, [
+    "polling-stopped",
+    "runtime-suspended",
+    "store-exclusive",
+    "rename-failed",
+    "store-cancelled",
+    "runtime-resumed",
+  ]);
+});
+
+test("Recovery downgrade leader remains exactly fenced when runtime resume fails", async () => {
+  const gate = new RecoveryProfileOperationGate();
+  const downgrade = createTelegramRecoveryDowngradeCoordinator<string>({
+    canCoordinate: () => true,
+    getCoordinationGeneration: () => "leader-epoch-1",
+    getProfile: () => "default",
+    getFollowers: () => [],
+    getAuthSecret: () => undefined,
+    createRequestId: () => "leader:resume-failure",
+    gate,
+    preflight: () => ({ safe: true, blockerCount: 0 }),
+    beginStoreExclusive() {
+      throw new Error("new blocker");
+    },
+    quarantineStore: () => "never",
+    cancelStoreExclusive() {},
+    stopPolling() {},
+    suspendRuntime() {},
+    resumeRuntime() {
+      assert.equal(gate.getState("default").phase, "downgrade-exclusive");
+      throw new Error("leader resume failed");
+    },
+    createFenceGeneration: () => "fence-resume-failure",
+  });
+
+  await assert.rejects(() => downgrade("ctx"), /leader resume failed/);
+  assert.equal(gate.getState("default").phase, "downgrade-exclusive");
+  assert.equal(
+    gate.getState("default").fenceGeneration,
+    "fence-resume-failure",
+  );
+  assert.equal(gate.enter("default"), undefined);
+});
+
+test("Recovery downgrade coordinator leaves gates closed when quarantine commit is uncertain", async () => {
+  const gate = new RecoveryProfileOperationGate();
+  let resumed = 0;
+  const downgrade = createTelegramRecoveryDowngradeCoordinator<string>({
+    canCoordinate: () => true,
+    getCoordinationGeneration: () => "leader-epoch-1",
+    getProfile: () => "default",
+    getFollowers: () => [],
+    getAuthSecret: () => undefined,
+    createRequestId: () => "leader:1",
+    gate,
+    preflight: () => ({ safe: true, blockerCount: 0 }),
+    beginStoreExclusive() {},
+    quarantineStore() {
+      throw new Error("post-rename fsync failed");
+    },
+    cancelStoreExclusive() {
+      throw new Error("store root already moved");
+    },
+    stopPolling() {},
+    suspendRuntime() {},
+    resumeRuntime() {
+      resumed += 1;
+    },
+    createFenceGeneration: () => "fence-a",
+  });
+
+  await assert.rejects(() => downgrade("ctx"), /post-rename fsync failed/);
+  assert.equal(resumed, 0);
+  assert.equal(gate.getState("default").phase, "downgrade-exclusive");
+  assert.equal(gate.enter("default"), undefined);
+});
+
+test("Recovery downgrade coordinator reopens nothing after successful quarantine", async () => {
+  const gate = new RecoveryProfileOperationGate();
+  let quarantineCalls = 0;
+  let resumed = 0;
+  const downgrade = createTelegramRecoveryDowngradeCoordinator<string>({
+    canCoordinate: () => true,
+    getCoordinationGeneration: () => "leader-epoch-1",
+    getProfile: () => "default",
+    getFollowers: () => [],
+    getAuthSecret: () => undefined,
+    createRequestId: () => "leader:1",
+    gate,
+    preflight: () => ({ safe: true, blockerCount: 0 }),
+    beginStoreExclusive() {},
+    quarantineStore() {
+      quarantineCalls += 1;
+      return "/private/quarantine";
+    },
+    cancelStoreExclusive() {
+      assert.fail("successful downgrade must not cancel the store");
+    },
+    stopPolling() {},
+    suspendRuntime() {},
+    resumeRuntime() {
+      resumed += 1;
+    },
+    createFenceGeneration: () => "fence-a",
+  });
+
+  assert.deepEqual(await downgrade("ctx"), { status: "downgraded" });
+  assert.equal(quarantineCalls, 1);
+  assert.equal(resumed, 0);
+  assert.equal(gate.getState("default").phase, "quarantined");
+  assert.equal(gate.enter("default"), undefined);
+  await assert.rejects(() => downgrade("ctx"), /already fenced/);
+  assert.equal(quarantineCalls, 1);
+});
+
+test("Recovery downgrade coordinator aborts and resumes on stale follower acknowledgement", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-stale-fence-ack-"));
+  const socketPath = join(dir, "follower.sock");
+  const gate = new RecoveryProfileOperationGate();
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope(envelope) {
+      return {
+        kind: "bus.ack",
+        requestId: envelope.requestId,
+        ok: true,
+        recoveryFence: {
+          version: 1,
+          state: "fenced",
+          profile: "default",
+          recipientInstanceId: "follower-a",
+          recipientRegistrationGeneration: "stale-generation",
+          fenceGeneration: "fence-a",
+        },
+      };
+    },
+  });
+  const follower = {
+    instanceId: "follower-a",
+    registrationGeneration: "generation-a",
+    sessionGeneration: 1,
+    busSocketPath: socketPath,
+    connectedAtMs: 1,
+    lastHeartbeatMs: 1,
+  };
+  const downgrade = createTelegramRecoveryDowngradeCoordinator<string>({
+    canCoordinate: () => true,
+    getCoordinationGeneration: () => "leader-epoch-1",
+    getProfile: () => "default",
+    getFollowers: () => [follower],
+    getAuthSecret: () => "secret",
+    createRequestId: () => "leader:1",
+    gate,
+    preflight: () => ({ safe: true, blockerCount: 0 }),
+    beginStoreExclusive() {
+      assert.fail("stale follower ACK must abort before store exclusive");
+    },
+    quarantineStore: () => "never",
+    cancelStoreExclusive() {},
+    stopPolling() {},
+    suspendRuntime() {},
+    resumeRuntime() {},
+    createFenceGeneration: () => "fence-a",
+  });
+  try {
+    await server.start();
+    await assert.rejects(() => downgrade("ctx"), /acknowledgement mismatch/);
+    assert.equal(gate.getState("default").phase, "fencing");
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Recovery downgrade coordinator aborts when a follower fence times out", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-fence-timeout-"));
+  const socketPath = join(dir, "follower.sock");
+  const gate = new RecoveryProfileOperationGate();
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: () => new Promise(() => undefined),
+  });
+  const follower = {
+    instanceId: "follower-a",
+    registrationGeneration: "generation-a",
+    sessionGeneration: 1,
+    busSocketPath: socketPath,
+    connectedAtMs: 1,
+    lastHeartbeatMs: 1,
+  };
+  const downgrade = createTelegramRecoveryDowngradeCoordinator<string>({
+    canCoordinate: () => true,
+    getCoordinationGeneration: () => "leader-epoch-1",
+    getProfile: () => "default",
+    getFollowers: () => [follower],
+    getAuthSecret: () => "secret",
+    createRequestId: () => "leader:timeout",
+    gate,
+    preflight: () => ({ safe: true, blockerCount: 0 }),
+    beginStoreExclusive() {
+      assert.fail("timed out follower must abort before store exclusive");
+    },
+    quarantineStore: () => "never",
+    cancelStoreExclusive() {},
+    stopPolling() {},
+    suspendRuntime() {},
+    resumeRuntime() {},
+    timeoutMs: 20,
+    createFenceGeneration: () => "fence-a",
+  });
+  try {
+    await server.start();
+    await assert.rejects(() => downgrade("ctx"), /Timed out/);
+    assert.equal(gate.getState("default").phase, "fencing");
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Recovery downgrade coordinator resumes a begin-exclusive blocker", async () => {
+  const gate = new RecoveryProfileOperationGate();
+  let resumed = 0;
+  const downgrade = createTelegramRecoveryDowngradeCoordinator<string>({
+    canCoordinate: () => true,
+    getCoordinationGeneration: () => "leader-epoch-1",
+    getProfile: () => "default",
+    getFollowers: () => [],
+    getAuthSecret: () => undefined,
+    createRequestId: () => "leader:1",
+    gate,
+    preflight: () => ({ safe: true, blockerCount: 0 }),
+    beginStoreExclusive() {
+      throw new Error("new nonterminal blocker");
+    },
+    quarantineStore: () => "never",
+    cancelStoreExclusive() {
+      assert.fail("unchanged store exclusive must not be cancelled");
+    },
+    stopPolling() {},
+    suspendRuntime() {},
+    resumeRuntime() {
+      resumed += 1;
+    },
+    createFenceGeneration: () => "fence-a",
+  });
+
+  await assert.rejects(() => downgrade("ctx"), /new nonterminal blocker/);
+  assert.equal(resumed, 1);
+  assert.equal(gate.getState("default").phase, "active");
+});
 
 test("Bus leader preserves a binding through follower reload handoff", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-gap-"));
@@ -1036,6 +1337,7 @@ test("Bus leader envelope handler registers and heartbeats followers", async () 
         cwd: "/repo",
         connectedAtMs: 1000,
         registrationGeneration: "inst-a:1",
+        sessionGeneration: 1,
         slot: "C",
       },
     }),
@@ -1047,6 +1349,7 @@ test("Bus leader envelope handler registers and heartbeats followers", async () 
     connectedAtMs: 2000,
     lastHeartbeatMs: 2000,
     registrationGeneration: "inst-a:1",
+    sessionGeneration: 1,
     target: undefined,
     slot: "C",
   });
@@ -1074,6 +1377,7 @@ test("Bus leader rejects generationless registration and disconnect envelopes", 
     instanceId: "inst-a",
     connectedAtMs: 1000,
     registrationGeneration: "inst-a:1",
+    sessionGeneration: 1,
   });
   let disconnects = 0;
   const handleEnvelope = createTelegramBusLeaderEnvelopeHandler({
@@ -1121,6 +1425,7 @@ test("Bus leader serializes disconnect cleanup before cross-session registration
     profileKey: "manual:owner-a",
     connectedAtMs: 1000,
     registrationGeneration: "inst-a:A",
+    sessionGeneration: 1,
     target: { chatId: 7, threadId: 42 },
   });
   let releaseCleanup: (() => void) | undefined;
@@ -1354,6 +1659,9 @@ test("Bus leader records ownership for follower-sent messages", async () => {
   const registry = createTelegramBusFollowerRegistry();
   registry.register({
     instanceId: "inst-a",
+    manualFollowerOwnerId: "owner-a",
+    registrationGeneration: "generation-a",
+    sessionGeneration: 1,
     connectedAtMs: 1000,
     target: { chatId: 1, threadId: 42 },
   });
@@ -1377,7 +1685,12 @@ test("Bus leader records ownership for follower-sent messages", async () => {
   await handleEnvelope({
     kind: "follower.callApi",
     requestId: "inst-a:4",
+    profile: "default",
+    target: { chatId: 1, threadId: 42 },
     instanceId: "inst-a",
+    manualFollowerOwnerId: "owner-a",
+    registrationGeneration: "generation-a",
+    followerSessionGeneration: 1,
     method: "call",
     args: ["sendMessage", { chat_id: 1, text: "Menu" }],
     sentAtMs: 4000,
@@ -1395,7 +1708,14 @@ test("Bus leader records ownership for follower-sent messages", async () => {
 
 test("Bus leader handles follower API call envelopes for registered followers", async () => {
   const registry = createTelegramBusFollowerRegistry();
-  registry.register({ instanceId: "inst-a", connectedAtMs: 1000 });
+  registry.register({
+    instanceId: "inst-a",
+    manualFollowerOwnerId: "owner-a",
+    registrationGeneration: "generation-a",
+    sessionGeneration: 1,
+    connectedAtMs: 1000,
+    target: { chatId: 1 },
+  });
   const calls: unknown[] = [];
   const handleEnvelope = createTelegramBusLeaderEnvelopeHandler({
     followerRegistry: registry,
@@ -1410,7 +1730,12 @@ test("Bus leader handles follower API call envelopes for registered followers", 
     await handleEnvelope({
       kind: "follower.callApi",
       requestId: "inst-a:4",
+      profile: "default",
+      target: { chatId: 1 },
       instanceId: "inst-a",
+      manualFollowerOwnerId: "owner-a",
+      registrationGeneration: "generation-a",
+      followerSessionGeneration: 1,
       method: "sendRichMessage",
       args: [{ chat_id: 1 }],
       sentAtMs: 4000,
@@ -1430,7 +1755,12 @@ test("Bus leader handles follower API call envelopes for registered followers", 
     await handleEnvelope({
       kind: "follower.callApi",
       requestId: "missing:1",
+      profile: "default",
+      target: { chatId: 1 },
       instanceId: "missing",
+      manualFollowerOwnerId: "owner-missing",
+      registrationGeneration: "generation-missing",
+      followerSessionGeneration: 1,
       method: "sendRichMessage",
       args: [],
       sentAtMs: 5000,
@@ -1449,7 +1779,10 @@ test("Bus leader rejects delayed API calls from a replaced follower generation",
   registry.register({
     instanceId: "inst-a",
     connectedAtMs: 2000,
+    manualFollowerOwnerId: "owner-a",
     registrationGeneration: "generation-new",
+    sessionGeneration: 1,
+    target: { chatId: 1 },
   });
   let apiCalls = 0;
   const handleEnvelope = createTelegramBusLeaderEnvelopeHandler({
@@ -1464,8 +1797,12 @@ test("Bus leader rejects delayed API calls from a replaced follower generation",
     await handleEnvelope({
       kind: "follower.callApi",
       requestId: "inst-a:old:1",
+      profile: "default",
+      target: { chatId: 1 },
       instanceId: "inst-a",
+      manualFollowerOwnerId: "owner-a",
       registrationGeneration: "generation-old",
+      followerSessionGeneration: 1,
       method: "call",
       args: ["sendMessage", { chat_id: 1 }],
       sentAtMs: 3000,
@@ -1474,7 +1811,7 @@ test("Bus leader rejects delayed API calls from a replaced follower generation",
       kind: "bus.ack",
       requestId: "inst-a:old:1",
       ok: false,
-      message: "Stale Telegram bus follower registration generation.",
+      message: "Stale Telegram bus follower target or registration generation.",
     },
   );
   assert.equal(apiCalls, 0);
@@ -1482,7 +1819,14 @@ test("Bus leader rejects delayed API calls from a replaced follower generation",
 
 test("Bus leader encodes commit-unknown API failures structurally", async () => {
   const registry = createTelegramBusFollowerRegistry();
-  registry.register({ instanceId: "inst-a", connectedAtMs: 1000 });
+  registry.register({
+    instanceId: "inst-a",
+    manualFollowerOwnerId: "owner-a",
+    registrationGeneration: "generation-a",
+    sessionGeneration: 1,
+    connectedAtMs: 1000,
+    target: { chatId: 1 },
+  });
   const handleEnvelope = createTelegramBusLeaderEnvelopeHandler({
     followerRegistry: registry,
     async callApi() {
@@ -1497,7 +1841,12 @@ test("Bus leader encodes commit-unknown API failures structurally", async () => 
     await handleEnvelope({
       kind: "follower.callApi",
       requestId: "inst-a:ambiguous:1",
+      profile: "default",
+      target: { chatId: 1 },
       instanceId: "inst-a",
+      manualFollowerOwnerId: "owner-a",
+      registrationGeneration: "generation-a",
+      followerSessionGeneration: 1,
       method: "call",
       args: ["sendMessage", { chat_id: 1 }],
       sentAtMs: 4000,
@@ -1539,7 +1888,12 @@ test("Bus leader rejects unauthenticated envelopes when a secret is configured",
     {
       kind: "follower.callApi" as const,
       requestId: "inst-a:3",
+      profile: "default",
+      target: { chatId: 1 },
       instanceId: "inst-a",
+      manualFollowerOwnerId: "owner-a",
+      registrationGeneration: "generation-a",
+      followerSessionGeneration: 1,
       method: "call",
       args: ["sendMessage", {}],
       sentAtMs: 3000,
@@ -1565,6 +1919,9 @@ test("Bus leader authorizes scoped follower API calls", async () => {
   const registry = createTelegramBusFollowerRegistry();
   registry.register({
     instanceId: "inst-a",
+    manualFollowerOwnerId: "owner-a",
+    registrationGeneration: "generation-a",
+    sessionGeneration: 1,
     connectedAtMs: 1000,
     target: { chatId: 100, threadId: 42 },
   });
@@ -1591,7 +1948,12 @@ test("Bus leader authorizes scoped follower API calls", async () => {
     await handleEnvelope({
       kind: "follower.callApi",
       requestId: "inst-a:allowed",
+      profile: "default",
+      target: { chatId: 100, threadId: 42 },
       instanceId: "inst-a",
+      manualFollowerOwnerId: "owner-a",
+      registrationGeneration: "generation-a",
+      followerSessionGeneration: 1,
       method: "call",
       args: ["sendMessage", { chat_id: 100, message_thread_id: 42 }],
       sentAtMs: 2000,
@@ -1607,7 +1969,12 @@ test("Bus leader authorizes scoped follower API calls", async () => {
     await handleEnvelope({
       kind: "follower.callApi",
       requestId: "inst-a:denied",
+      profile: "default",
+      target: { chatId: 100, threadId: 42 },
       instanceId: "inst-a",
+      manualFollowerOwnerId: "owner-a",
+      registrationGeneration: "generation-a",
+      followerSessionGeneration: 1,
       method: "call",
       args: ["deleteMessage", { chat_id: 999 }],
       sentAtMs: 3000,
@@ -1850,5 +2217,251 @@ test("Bus leader runtime stops the local server if polling startup fails", async
   } finally {
     await runtime.stopPolling();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+interface BusProcessMessage {
+  type?: string;
+  faultId?: string;
+  faultAsserted?: boolean;
+  seed?: string;
+  response?: { kind?: string; ok?: boolean; result?: unknown; error?: { code?: string } };
+  busState?: string | null;
+  busCount?: number;
+  statusJson?: string;
+}
+
+const BUS_PROCESS_FIXTURE = fileURLToPath(
+  new URL("./fixtures/bus-recovery-process.ts", import.meta.url),
+);
+const BUS_PROCESS_FAULTS = ["BUS-01", "BUS-02", "BUS-03", "BUS-04"] as const;
+const configuredBusProcessRuns = Number.parseInt(
+  process.env.PI_BUS_PROCESS_RUNS ?? "1",
+  10,
+);
+const busProcessRuns = Number.isSafeInteger(configuredBusProcessRuns) &&
+    configuredBusProcessRuns >= 1 && configuredBusProcessRuns <= 50
+  ? configuredBusProcessRuns
+  : 1;
+
+function startBusProcessFixture(args: string[]): ChildProcess {
+  return fork(BUS_PROCESS_FIXTURE, args, {
+    stdio: ["ignore", "ignore", "inherit", "ipc"],
+    execArgv: ["--experimental-strip-types"],
+  });
+}
+
+function waitForBusProcessMessage(
+  child: ChildProcess,
+  predicate: (message: BusProcessMessage) => boolean,
+): Promise<BusProcessMessage> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("Timed out waiting for bus process fixture"));
+    }, 10_000);
+    const onMessage = (message: unknown) => {
+      if (!message || typeof message !== "object") return;
+      const parsed = message as BusProcessMessage;
+      if (!predicate(parsed)) return;
+      cleanup();
+      resolve(parsed);
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      reject(new Error(`Bus process fixture exited early (${code ?? signal})`));
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.off("message", onMessage);
+      child.off("exit", onExit);
+    };
+    child.on("message", onMessage);
+    child.on("exit", onExit);
+  });
+}
+
+async function stopBusProcessFixture(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill("SIGKILL");
+  await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+}
+
+test(
+  "hard-kill/reopen BUS-01..04 executes each unsafe follower mutation at most once and replays durable ACKs",
+  { timeout: Math.max(30_000, busProcessRuns * 20_000) },
+  async () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-telegram-bus-process-"));
+    const children = new Set<ChildProcess>();
+    try {
+      for (let iteration = 0; iteration < busProcessRuns; iteration += 1) {
+        for (const faultId of BUS_PROCESS_FAULTS) {
+          const rootPath = join(directory, `${iteration}-${faultId}`);
+          const seed = `${process.env.PI_RELIABILITY_SEED ?? "2026072206"}:${iteration}:${faultId}`;
+          let mutationCalls = 0;
+          const countMutation = (message: unknown) => {
+            if (
+              message &&
+              typeof message === "object" &&
+              (message as BusProcessMessage).type === "mutation"
+            ) mutationCalls += 1;
+          };
+          const crash = startBusProcessFixture([
+            "crash",
+            rootPath,
+            faultId,
+            seed,
+          ]);
+          children.add(crash);
+          crash.on("message", countMutation);
+          await waitForBusProcessMessage(
+            crash,
+            (message) => message.type === "ready" && message.faultId === faultId,
+          );
+          const boundary = await waitForBusProcessMessage(
+            crash,
+            (message) =>
+              message.type === "fault-boundary" && message.faultId === faultId,
+          );
+          assert.equal(boundary.faultAsserted, true, faultId);
+          assert.equal(boundary.seed, seed, faultId);
+          await stopBusProcessFixture(crash);
+          children.delete(crash);
+
+          const reopened = startBusProcessFixture([
+            "reopen",
+            rootPath,
+            faultId,
+            seed,
+          ]);
+          children.add(reopened);
+          reopened.on("message", countMutation);
+          const evidence = await waitForBusProcessMessage(
+            reopened,
+            (message) =>
+              message.type === "reopened" && message.faultId === faultId,
+          );
+          await stopBusProcessFixture(reopened);
+          children.delete(reopened);
+
+          assert.equal(mutationCalls, 1, `${iteration}:${faultId}`);
+          assert.equal(evidence.busCount, faultId === "BUS-01" ? 1 : 1);
+          assert.equal(
+            evidence.busState,
+            faultId === "BUS-03" ? "bus-uncertain" : "completed",
+            faultId,
+          );
+          if (faultId === "BUS-03") {
+            assert.equal(evidence.response?.ok, false);
+            assert.equal(evidence.response?.error?.code, "commit-unknown");
+          } else {
+            assert.equal(evidence.response?.ok, true);
+            assert.deepEqual(evidence.response?.result, { message_id: 909 });
+          }
+          assert.equal(typeof evidence.statusJson, "string");
+          assert.doesNotMatch(evidence.statusJson!, /PRIVATE-BUS-PAYLOAD|707707/);
+        }
+      }
+    } finally {
+      await Promise.all([...children].map(stopBusProcessFixture));
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test("durable unsafe follower calls replay stored responses and reject payload, generation, and target drift", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-telegram-bus-durable-"));
+  try {
+    const target = { chatId: 100, threadId: 42 };
+    const store = openRecoveryStore({
+      profile: "default",
+      rootPath: join(directory, "recovery-v1"),
+      isIdentityAuthenticated: (candidate) =>
+        candidate.profile === "default" &&
+        candidate.owner.kind === "manual-follower" &&
+        candidate.owner.ownerId === "owner-a",
+    });
+    const registry = createTelegramBusFollowerRegistry();
+    registry.register({
+      instanceId: "inst-a",
+      manualFollowerOwnerId: "owner-a",
+      registrationGeneration: "generation-a",
+      sessionGeneration: 3,
+      target,
+      connectedAtMs: 1,
+    });
+    let calls = 0;
+    const handler = createTelegramBusLeaderEnvelopeHandler({
+      followerRegistry: registry,
+      getCurrentLeaderEpoch: () => "epoch-a",
+      callApi() {
+        calls += 1;
+        return { message_id: 44 };
+      },
+      durableBus: {
+        getStore: () => store,
+        getProfile: () => "default",
+        getLeaderSessionGeneration: () => 9,
+      },
+    });
+    const envelope = {
+      kind: "follower.callApi" as const,
+      requestId: "inst-a:durable:1",
+      profile: "default",
+      target,
+      instanceId: "inst-a",
+      manualFollowerOwnerId: "owner-a",
+      registrationGeneration: "generation-a",
+      followerSessionGeneration: 3,
+      method: "call",
+      args: ["sendMessage", { chat_id: 100, message_thread_id: 42, text: "one" }],
+      sentAtMs: 1,
+    };
+    const first = await handler(envelope);
+    assert.equal(first.kind, "bus.ack");
+    if (first.kind !== "bus.ack") assert.fail("expected bus ack");
+    assert.equal(first.ok, true);
+    assert.deepEqual(await handler(envelope), {
+      kind: "bus.ack",
+      requestId: envelope.requestId,
+      ok: true,
+      result: { message_id: 44 },
+    });
+    assert.equal(calls, 1);
+
+    const collision = await handler({
+      ...envelope,
+      args: ["sendMessage", { chat_id: 100, message_thread_id: 42, text: "changed" }],
+    });
+    assert.equal(collision.kind, "bus.ack");
+    if (collision.kind !== "bus.ack") assert.fail("expected bus ack");
+    assert.equal(collision.ok, false);
+    assert.equal(collision.error?.code, "request-id-collision");
+    assert.equal(calls, 1);
+
+    registry.register({
+      instanceId: "inst-a",
+      manualFollowerOwnerId: "owner-a",
+      registrationGeneration: "generation-b",
+      sessionGeneration: 4,
+      target: { chatId: 100, threadId: 43 },
+      connectedAtMs: 2,
+    });
+    const stale = await handler(envelope);
+    assert.equal(stale.kind, "bus.ack");
+    if (stale.kind !== "bus.ack") assert.fail("expected bus ack");
+    assert.equal(stale.ok, false);
+    const changedTarget = await handler({
+      ...envelope,
+      target: { chatId: 100, threadId: 43 },
+      registrationGeneration: "generation-b",
+      followerSessionGeneration: 4,
+    });
+    assert.equal(changedTarget.kind, "bus.ack");
+    if (changedTarget.kind !== "bus.ack") assert.fail("expected bus ack");
+    assert.equal(changedTarget.ok, false);
+    assert.equal(calls, 1);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });

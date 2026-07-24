@@ -31,6 +31,13 @@ class TelegramDeliveryTransportGenerationError extends Error {
   }
 }
 
+class TelegramDeliveryAuthorityLostAfterStartError extends Error {
+  constructor() {
+    super("Telegram Delivery authority was lost after mutation start.");
+    this.name = "TelegramDeliveryAuthorityLostAfterStartError";
+  }
+}
+
 export type TelegramDeliveryParseMode = "plain" | "html" | "markdown";
 
 export interface TelegramDeliveryView {
@@ -475,11 +482,12 @@ export function createTelegramDeliveryRuntime(
     if (error instanceof TelegramDeliveryTransportGenerationError) {
       return inactive();
     }
+    const commitUnknown =
+      error instanceof TelegramDeliveryAuthorityLostAfterStartError ||
+      isTelegramApiCommitUnknownError(error);
     return failure(
-      isTelegramApiCommitUnknownError(error)
-        ? "commit-unknown"
-        : "transport-failed",
-      isTelegramApiCommitUnknownError(error)
+      commitUnknown ? "commit-unknown" : "transport-failed",
+      commitUnknown
         ? `Telegram delivery ${operation} may have committed before transport failed.`
         : `Telegram delivery ${operation} failed.`,
       partial,
@@ -558,7 +566,10 @@ export function createTelegramDeliveryRuntime(
           }
           return { ok: true, value: createHandle(target, messageIds) };
         } catch (error) {
-          return active
+          return (
+              active ||
+              error instanceof TelegramDeliveryAuthorityLostAfterStartError
+            )
             ? transportFailure(
                 "send",
                 error,
@@ -687,9 +698,11 @@ export function createTelegramBridgeDeliveryRuntime(
   deps: TelegramBridgeDeliveryRuntimeDeps,
 ): TelegramDeliveryRuntime {
   const getPolicyView = deps.getTargetPolicyView;
-  const assertTransportActive = (): void => {
+  const assertTransportActive = (mutationStarted = false): void => {
     if (deps.isTransportActive?.() === false) {
-      throw new TelegramDeliveryTransportGenerationError();
+      throw mutationStarted
+        ? new TelegramDeliveryAuthorityLostAfterStartError()
+        : new TelegramDeliveryTransportGenerationError();
     }
   };
   return createTelegramDeliveryRuntime({
@@ -738,12 +751,16 @@ export function createTelegramBridgeDeliveryRuntime(
           ? markTelegramBusAggregateDelivery(body)
           : body,
       );
-      assertTransportActive();
-      deps.recordOwnership({
-        chatId: target.chatId,
-        messageId: sent.message_id,
-        target,
-      });
+      assertTransportActive(true);
+      try {
+        deps.recordOwnership({
+          chatId: target.chatId,
+          messageId: sent.message_id,
+          target,
+        });
+      } catch (error) {
+        deps.recordFailure?.("send", error, target);
+      }
       return sent.message_id;
     },
     async editChunk(target, messageId, chunk, options) {
