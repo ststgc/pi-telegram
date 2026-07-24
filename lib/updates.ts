@@ -5,17 +5,27 @@
  */
 
 import {
+  isTelegramFollowerDurableAdmissionAckV1,
+  type TelegramFollowerDurableAdmissionAckV1,
+} from "./bus.ts";
+import {
   createTelegramPrivateTarget,
   createTelegramThreadTarget,
   type TelegramTarget,
 } from "./target.ts";
 import type { TelegramMessageOwnershipStore } from "./ownership.ts";
 import {
-  createTelegramUserPairingRuntime,
   getTelegramAuthorizationState,
+  isValidTelegramAllowedUserId,
   type TelegramAuthorizationState,
-  type TelegramUserPairingRuntimeDeps,
 } from "./config.ts";
+import {
+  isTelegramPairingProofShapedUpdate,
+  parseTelegramPairingCandidate,
+  TELEGRAM_PAIRING_RESPONSE,
+  type TelegramPairingClaimInput,
+  type TelegramPairingClaimResult,
+} from "./pairing.ts";
 
 // --- Extraction ---
 
@@ -53,7 +63,16 @@ export const TELEGRAM_REMOVAL_REACTION_EMOJIS = TELEGRAM_REMOVAL_REACTIONS.map(
 );
 
 export interface TelegramUpdateDeletion {
-  deleted_business_messages?: { message_ids?: unknown };
+  deleted_business_messages?: {
+    business_connection_id?: unknown;
+    chat?: { id?: unknown };
+    message_ids?: unknown;
+  };
+}
+
+export interface TelegramDeletedMessagesScope {
+  chatId?: number;
+  businessConnectionId?: string;
 }
 
 function isTelegramMessageIdList(value: unknown): value is number[] {
@@ -250,6 +269,7 @@ export function getAuthorizedTelegramGuestMessage(
 export interface TelegramMessageOwnershipView {
   instanceId: string;
   ownerGeneration?: string;
+  target?: TelegramTarget;
 }
 
 export type TelegramMessageOwnershipLookup = (
@@ -266,6 +286,10 @@ export type TelegramTargetOwnershipLookup = (
   target: TelegramTarget,
 ) => TelegramTargetOwnershipView | undefined;
 
+export type TelegramFollowerForwardingResult =
+  | boolean
+  | TelegramFollowerDurableAdmissionAckV1;
+
 export interface TelegramForeignOwnedUpdateForwarder<
   TContext,
   TReactionUpdate extends TelegramMessageReactionUpdated =
@@ -277,22 +301,22 @@ export interface TelegramForeignOwnedUpdateForwarder<
     query: TCallbackQuery;
     ownership: TelegramMessageOwnershipView;
     ctx: TContext;
-  }) => Promise<boolean> | boolean;
+  }) => Promise<TelegramFollowerForwardingResult> | TelegramFollowerForwardingResult;
   forwardReaction?: (input: {
     reactionUpdate: TReactionUpdate;
     ownership: TelegramMessageOwnershipView;
     ctx: TContext;
-  }) => Promise<boolean> | boolean;
+  }) => Promise<TelegramFollowerForwardingResult> | TelegramFollowerForwardingResult;
   forwardMessage?: (input: {
     message: TMessage;
     ownership: TelegramTargetOwnershipView;
     ctx: TContext;
-  }) => Promise<boolean> | boolean;
+  }) => Promise<TelegramFollowerForwardingResult> | TelegramFollowerForwardingResult;
   forwardEditedMessage?: (input: {
     message: TMessage;
     ownership: TelegramTargetOwnershipView;
     ctx: TContext;
-  }) => Promise<boolean> | boolean;
+  }) => Promise<TelegramFollowerForwardingResult> | TelegramFollowerForwardingResult;
 }
 
 export interface TelegramMessageReactionUpdated {
@@ -305,6 +329,7 @@ export interface TelegramMessageReactionUpdated {
 
 export interface TelegramUpdateFlow
   extends TelegramUpdateRouting, TelegramUpdateDeletion {
+  update_id?: number;
   message_reaction?: TelegramMessageReactionUpdated;
 }
 
@@ -316,7 +341,11 @@ export type TelegramUpdateFlowAction<
   TGuestMessage extends TelegramGuestMessage = TelegramGuestMessage,
 > =
   | { kind: "ignore" }
-  | { kind: "deleted"; messageIds: number[] }
+  | {
+      kind: "deleted";
+      messageIds: number[];
+      scope: TelegramDeletedMessagesScope;
+    }
   | { kind: "reaction"; reactionUpdate: TReactionUpdate }
   | {
       kind: "topic-lifecycle";
@@ -356,7 +385,19 @@ export function buildTelegramUpdateFlowAction<
 > {
   const deletedMessageIds = extractDeletedTelegramMessageIds(update);
   if (deletedMessageIds.length > 0) {
-    return { kind: "deleted", messageIds: deletedMessageIds };
+    const deleted = update.deleted_business_messages;
+    return {
+      kind: "deleted",
+      messageIds: deletedMessageIds,
+      scope: {
+        ...(typeof deleted?.chat?.id === "number"
+          ? { chatId: deleted.chat.id }
+          : {}),
+        ...(typeof deleted?.business_connection_id === "string"
+          ? { businessConnectionId: deleted.business_connection_id }
+          : {}),
+      },
+    };
   }
   if (update.message_reaction) {
     return { kind: "reaction", reactionUpdate: update.message_reaction };
@@ -431,7 +472,11 @@ export type TelegramUpdateExecutionPlan<
   TGuestMessage extends TelegramGuestMessage = TelegramGuestMessage,
 > =
   | { kind: "ignore" }
-  | { kind: "deleted"; messageIds: number[] }
+  | {
+      kind: "deleted";
+      messageIds: number[];
+      scope: TelegramDeletedMessagesScope;
+    }
   | {
       kind: "reaction";
       reactionUpdate: TReactionUpdate;
@@ -443,20 +488,16 @@ export type TelegramUpdateExecutionPlan<
   | {
       kind: "callback";
       query: TCallbackQuery;
-      shouldPair: boolean;
       shouldDeny: boolean;
     }
   | {
       kind: "message";
       message: TMessage & { from: TelegramUser };
-      shouldPair: boolean;
-      shouldNotifyPaired: boolean;
       shouldDeny: boolean;
     }
   | {
       kind: "edited-message";
       message: TMessage & { from: TelegramUser };
-      shouldPair: boolean;
       shouldDeny: boolean;
     }
   | {
@@ -487,7 +528,11 @@ export function buildTelegramUpdateExecutionPlan<
     case "ignore":
       return { kind: "ignore" };
     case "deleted":
-      return { kind: "deleted", messageIds: action.messageIds };
+      return {
+        kind: "deleted",
+        messageIds: action.messageIds,
+        scope: action.scope,
+      };
     case "reaction":
       return { kind: "reaction", reactionUpdate: action.reactionUpdate };
     case "topic-lifecycle":
@@ -496,22 +541,18 @@ export function buildTelegramUpdateExecutionPlan<
       return {
         kind: "callback",
         query: action.query,
-        shouldPair: action.authorization.kind === "pair",
         shouldDeny: action.authorization.kind === "deny",
       };
     case "message":
       return {
         kind: "message",
         message: action.message,
-        shouldPair: action.authorization.kind === "pair",
-        shouldNotifyPaired: action.authorization.kind === "pair",
         shouldDeny: action.authorization.kind === "deny",
       };
     case "edited-message":
       return {
         kind: "edited-message",
         message: action.message,
-        shouldPair: action.authorization.kind === "pair",
         shouldDeny: action.authorization.kind === "deny",
       };
     case "guest":
@@ -541,6 +582,157 @@ export function buildTelegramUpdateExecutionPlanFromUpdate<
 
 // --- Runtime ---
 
+export type TelegramInboundHandlingOutcome =
+  | { kind: "prompt-materialized"; turnId: string; recordIds: string[] }
+  | {
+      kind: "deferred";
+      reason:
+        | "text-group"
+        | "media-group"
+        | "operator-reroute"
+        | "follower-admission-pending"
+        | "session-replay";
+      key: string;
+    }
+  | {
+      kind: "completed";
+      reason:
+        | "ignored"
+        | "deleted"
+        | "reaction"
+        | "topic-lifecycle"
+        | "callback"
+        | "guest"
+        | "command"
+        | "menu"
+        | "public-handler"
+        | "unauthorized"
+        | "unsupported";
+    }
+  | {
+      kind: "follower-admitted";
+      admission: TelegramFollowerDurableAdmissionAckV1;
+    };
+
+export const TELEGRAM_UNTARGETED_RECOVERY_CHAT_ID = Number.MIN_SAFE_INTEGER;
+
+export type TelegramDurableInboundResponsibility =
+  | { kind: "local"; target: TelegramTarget }
+  | {
+      kind: "follower";
+      target: TelegramTarget;
+      instanceId: string;
+      registrationGeneration: string;
+    }
+  | {
+      kind: "terminal";
+      target: TelegramTarget;
+      reason: "ignored" | "unauthorized" | "unsupported";
+      pairingProof: boolean;
+    };
+
+function getTelegramDurableUpdateTarget(
+  update: TelegramUpdateFlow,
+  fallbackChatId: number | undefined,
+): TelegramTarget | undefined {
+  const message =
+    update.message ??
+    update.edited_message ??
+    update.callback_query?.message ??
+    update.message_reaction;
+  const deleted = update.deleted_business_messages as
+    | { chat?: { id?: number } }
+    | undefined;
+  const chatId =
+    message?.chat?.id ??
+    deleted?.chat?.id ??
+    update.guest_message?.chat?.id ??
+    fallbackChatId;
+  if (typeof chatId !== "number") return undefined;
+  const threadId =
+    (message as { message_thread_id?: unknown } | undefined)
+      ?.message_thread_id ??
+    (update.guest_message as { message_thread_id?: unknown } | undefined)
+      ?.message_thread_id;
+  return typeof threadId === "number" ? { chatId, threadId } : { chatId };
+}
+
+/** Side-effect-free owner decision used before admission and public handlers. */
+export function planTelegramDurableInboundResponsibility(
+  update: TelegramUpdateFlow,
+  input: {
+    allowedUserId?: number;
+    currentInstanceId?: string;
+    getMessageOwnership?: TelegramMessageOwnershipLookup;
+    getTargetOwnership?: TelegramTargetOwnershipLookup;
+  },
+): TelegramDurableInboundResponsibility {
+  const resolvedTarget = getTelegramDurableUpdateTarget(
+    update,
+    input.allowedUserId,
+  );
+  const target = resolvedTarget ?? {
+    chatId: TELEGRAM_UNTARGETED_RECOVERY_CHAT_ID,
+  };
+  const pairingProof = isTelegramPairingProofShapedUpdate(update);
+  const senderId = getTelegramUpdateSenderId(update);
+  const supported = Boolean(
+    update.message ||
+      update.edited_message ||
+      update.callback_query ||
+      update.message_reaction ||
+      update.deleted_business_messages ||
+      update.guest_message,
+  );
+  const unauthorized =
+    !isValidTelegramAllowedUserId(input.allowedUserId) ||
+    (senderId !== undefined && senderId !== input.allowedUserId);
+  const botAuthored = Boolean(
+    update.message?.from?.is_bot ||
+      update.edited_message?.from?.is_bot ||
+      update.callback_query?.from?.is_bot,
+  );
+  if (!resolvedTarget || pairingProof || unauthorized || !supported || botAuthored) {
+    return {
+      kind: "terminal",
+      target,
+      pairingProof,
+      reason: !resolvedTarget || !supported
+        ? "unsupported"
+        : unauthorized
+          ? "unauthorized"
+          : "ignored",
+    };
+  }
+  const ownedMessage = update.callback_query?.message ?? update.message_reaction;
+  const messageOwnership =
+    typeof ownedMessage?.chat?.id === "number" &&
+    typeof ownedMessage.message_id === "number"
+      ? input.getMessageOwnership?.(
+          ownedMessage.chat.id,
+          ownedMessage.message_id,
+        )
+      : undefined;
+  const ownership = messageOwnership ?? input.getTargetOwnership?.(target);
+  if (ownership && ownership.instanceId !== input.currentInstanceId) {
+    if (!ownership.ownerGeneration) {
+      return {
+        kind: "terminal",
+        target,
+        pairingProof: false,
+        reason: "unsupported",
+      };
+    }
+    return {
+      kind: "follower",
+      target,
+      instanceId: ownership.instanceId,
+      registrationGeneration: ownership.ownerGeneration,
+    };
+  }
+  return { kind: "local", target };
+}
+
 export type TelegramMessageOwnershipRecorderInput = Parameters<
   TelegramMessageOwnershipStore["record"]
 >[0];
@@ -557,6 +749,7 @@ export interface TelegramUpdateRuntimeDeps<
   TMessage extends TelegramUpdateMessage = TelegramUpdateMessage,
 > {
   ctx: TContext;
+  getEffectiveProfile?: () => string;
   getCurrentInstanceId?: () => string | undefined;
   getMessageOwnership?: TelegramMessageOwnershipLookup;
   getTargetOwnership?: TelegramTargetOwnershipLookup;
@@ -567,20 +760,37 @@ export interface TelegramUpdateRuntimeDeps<
     TCallbackQuery,
     TMessage
   >;
-  removePendingMediaGroupMessages: (messageIds: number[]) => void;
+  removePendingMediaGroupMessages: (
+    messageIds: number[],
+    scope?: { chatId?: number; threadId?: number },
+  ) => void;
   removeQueuedTelegramTurnsByMessageIds: (
     messageIds: number[],
     ctx: TContext,
+    scope?: {
+      profile?: string;
+      chatId?: number;
+      threadId?: number;
+      exactThreadId?: number | null;
+      businessConnectionId?: string;
+    },
   ) => number;
+  resolveQueuedTelegramMessageThreadId?: (
+    messageId: number,
+    scope: {
+      profile?: string;
+      chatId?: number;
+      businessConnectionId?: string;
+    },
+  ) => number | null | undefined;
   handleAuthorizedTelegramReactionUpdate: (
     reactionUpdate: TReactionUpdate,
     ctx: TContext,
-  ) => Promise<void>;
+  ) => Promise<TelegramInboundHandlingOutcome>;
   handleTelegramTopicLifecycleUpdate?: (
     lifecycle: TelegramTopicLifecycleUpdate<TMessage>,
     ctx: TContext,
-  ) => Promise<void> | void;
-  pairTelegramUserIfNeeded: (userId: number, ctx: TContext) => Promise<boolean>;
+  ) => Promise<TelegramInboundHandlingOutcome> | TelegramInboundHandlingOutcome;
   answerCallbackQuery: (
     callbackQueryId: string,
     text?: string,
@@ -589,7 +799,7 @@ export interface TelegramUpdateRuntimeDeps<
   handleAuthorizedTelegramCallbackQuery: (
     query: TCallbackQuery,
     ctx: TContext,
-  ) => Promise<void>;
+  ) => Promise<TelegramInboundHandlingOutcome>;
   sendTextReply: (
     chatId: number,
     replyToMessageId: number,
@@ -599,20 +809,20 @@ export interface TelegramUpdateRuntimeDeps<
   handleAuthorizedTelegramMessage: (
     message: TMessage,
     ctx: TContext,
-  ) => Promise<void>;
+  ) => Promise<TelegramInboundHandlingOutcome>;
   handleAuthorizedTelegramEditedMessage: (
     message: TMessage,
     ctx: TContext,
-  ) => unknown;
+  ) => TelegramInboundHandlingOutcome | Promise<TelegramInboundHandlingOutcome>;
   handleAuthorizedTelegramGuestMessage?: (
     guestMessage: TelegramGuestMessage & { from: TelegramUser },
     ctx: TContext,
-  ) => Promise<void>;
+  ) => Promise<TelegramInboundHandlingOutcome>;
   /** Called when the owner writes in an unbound thread no live instance owns. */
   handleUnboundTelegramTopicMessage?: (
     message: TMessage & { from: TelegramUser },
     ctx: TContext,
-  ) => Promise<void>;
+  ) => Promise<TelegramInboundHandlingOutcome>;
 }
 
 export interface TelegramUpdateRuntimeControllerDeps<
@@ -621,6 +831,7 @@ export interface TelegramUpdateRuntimeControllerDeps<
   TMessage extends TelegramUpdateMessage = TelegramUpdateMessage,
 > {
   getAllowedUserId: () => number | undefined;
+  getEffectiveProfile?: () => string;
   getCurrentInstanceId?: () => string | undefined;
   getMessageOwnership?: TelegramMessageOwnershipLookup;
   getTargetOwnership?: TelegramTargetOwnershipLookup;
@@ -631,12 +842,29 @@ export interface TelegramUpdateRuntimeControllerDeps<
     TCallbackQuery,
     TMessage
   >;
-  removePendingMediaGroupMessages: (messageIds: number[]) => void;
+  removePendingMediaGroupMessages: (
+    messageIds: number[],
+    scope?: { chatId?: number; threadId?: number },
+  ) => void;
   removeQueuedTelegramTurnsByMessageIds: (
     messageIds: number[],
     ctx: TContext,
-    scope?: { chatId?: number; threadId?: number },
+    scope?: {
+      profile?: string;
+      chatId?: number;
+      threadId?: number;
+      exactThreadId?: number | null;
+      businessConnectionId?: string;
+    },
   ) => number;
+  resolveQueuedTelegramMessageThreadId?: (
+    messageId: number,
+    scope: {
+      profile?: string;
+      chatId?: number;
+      businessConnectionId?: string;
+    },
+  ) => number | null | undefined;
   clearQueuedTelegramTurnPriorityByMessageId: (
     messageId: number,
     ctx: TContext,
@@ -648,7 +876,6 @@ export interface TelegramUpdateRuntimeControllerDeps<
     priorityEmoji?: string,
     scope?: { chatId?: number; threadId?: number },
   ) => boolean;
-  pairTelegramUserIfNeeded: (userId: number, ctx: TContext) => Promise<boolean>;
   answerCallbackQuery: (
     callbackQueryId: string,
     text?: string,
@@ -657,7 +884,7 @@ export interface TelegramUpdateRuntimeControllerDeps<
   handleAuthorizedTelegramCallbackQuery: (
     query: TCallbackQuery,
     ctx: TContext,
-  ) => Promise<void>;
+  ) => Promise<TelegramInboundHandlingOutcome>;
   sendTextReply: (
     chatId: number,
     replyToMessageId: number,
@@ -667,24 +894,24 @@ export interface TelegramUpdateRuntimeControllerDeps<
   handleAuthorizedTelegramMessage: (
     message: TMessage,
     ctx: TContext,
-  ) => Promise<void>;
+  ) => Promise<TelegramInboundHandlingOutcome>;
   handleAuthorizedTelegramEditedMessage: (
     message: TMessage,
     ctx: TContext,
-  ) => unknown;
+  ) => TelegramInboundHandlingOutcome | Promise<TelegramInboundHandlingOutcome>;
   handleAuthorizedTelegramGuestMessage?: (
     guestMessage: TelegramGuestMessage & { from: TelegramUser },
     ctx: TContext,
-  ) => Promise<void>;
+  ) => Promise<TelegramInboundHandlingOutcome>;
   handleTelegramTopicLifecycleUpdate?: (
     lifecycle: TelegramTopicLifecycleUpdate<TMessage>,
     ctx: TContext,
-  ) => Promise<void> | void;
+  ) => Promise<TelegramInboundHandlingOutcome> | TelegramInboundHandlingOutcome;
   /** Called when the owner writes in an unbound thread no live instance owns. */
   handleUnboundTelegramTopicMessage?: (
     message: TMessage & { from: TelegramUser },
     ctx: TContext,
-  ) => Promise<void>;
+  ) => Promise<TelegramInboundHandlingOutcome>;
 }
 
 export interface TelegramUpdateRuntimeController<
@@ -694,8 +921,11 @@ export interface TelegramUpdateRuntimeController<
   handleAuthorizedReactionUpdate: (
     reactionUpdate: NonNullable<TUpdate["message_reaction"]>,
     ctx: TContext,
-  ) => Promise<void>;
-  handleUpdate: (update: TUpdate, ctx: TContext) => Promise<void>;
+  ) => Promise<TelegramInboundHandlingOutcome>;
+  handleUpdate: (
+    update: TUpdate,
+    ctx: TContext,
+  ) => Promise<TelegramInboundHandlingOutcome>;
 }
 
 function getTelegramCallbackQueryId(
@@ -806,25 +1036,22 @@ export async function executeTelegramUpdate<
     NonNullable<TUpdate["callback_query"]>,
     NonNullable<TUpdate["message"] | TUpdate["edited_message"]>
   >,
-): Promise<void> {
-  await executeTelegramUpdatePlan(
+): Promise<TelegramInboundHandlingOutcome> {
+  return executeTelegramUpdatePlan(
     buildTelegramUpdateExecutionPlanFromUpdate(update, allowedUserId),
     deps,
+    { updateId: update.update_id },
   );
 }
 
 export type TelegramPairedUpdateRuntimeControllerDeps<
   TContext = unknown,
   TUpdate extends TelegramUpdateFlow = TelegramUpdateFlow,
-> = Omit<
-  TelegramUpdateRuntimeControllerDeps<
-    TContext,
-    NonNullable<TUpdate["callback_query"]>,
-    NonNullable<TUpdate["message"] | TUpdate["edited_message"]>
-  >,
-  "pairTelegramUserIfNeeded"
-> &
-  TelegramUserPairingRuntimeDeps<TContext>;
+> = TelegramUpdateRuntimeControllerDeps<
+  TContext,
+  NonNullable<TUpdate["callback_query"]>,
+  NonNullable<TUpdate["message"] | TUpdate["edited_message"]>
+>;
 
 export function createTelegramPairedUpdateRuntime<
   TContext = unknown,
@@ -834,6 +1061,7 @@ export function createTelegramPairedUpdateRuntime<
 ): TelegramUpdateRuntimeController<TContext, TUpdate> {
   return createTelegramUpdateRuntime({
     getAllowedUserId: deps.getAllowedUserId,
+    getEffectiveProfile: deps.getEffectiveProfile,
     getCurrentInstanceId: deps.getCurrentInstanceId,
     getMessageOwnership: deps.getMessageOwnership,
     getTargetOwnership: deps.getTargetOwnership,
@@ -843,16 +1071,12 @@ export function createTelegramPairedUpdateRuntime<
     removePendingMediaGroupMessages: deps.removePendingMediaGroupMessages,
     removeQueuedTelegramTurnsByMessageIds:
       deps.removeQueuedTelegramTurnsByMessageIds,
+    resolveQueuedTelegramMessageThreadId:
+      deps.resolveQueuedTelegramMessageThreadId,
     clearQueuedTelegramTurnPriorityByMessageId:
       deps.clearQueuedTelegramTurnPriorityByMessageId,
     prioritizeQueuedTelegramTurnByMessageId:
       deps.prioritizeQueuedTelegramTurnByMessageId,
-    pairTelegramUserIfNeeded: createTelegramUserPairingRuntime({
-      getAllowedUserId: deps.getAllowedUserId,
-      setAllowedUserId: deps.setAllowedUserId,
-      persistConfig: deps.persistConfig,
-      updateStatus: deps.updateStatus,
-    }).pairIfNeeded,
     answerCallbackQuery: deps.answerCallbackQuery,
     answerGuestQuery: deps.answerGuestQuery,
     handleAuthorizedTelegramCallbackQuery:
@@ -880,8 +1104,8 @@ export function createTelegramUpdateRuntime<
   const handleAuthorizedReactionUpdate = async (
     reactionUpdate: NonNullable<TUpdate["message_reaction"]>,
     ctx: TContext,
-  ): Promise<void> => {
-    await handleAuthorizedTelegramReactionUpdate(reactionUpdate, {
+  ): Promise<TelegramInboundHandlingOutcome> => {
+    return handleAuthorizedTelegramReactionUpdate(reactionUpdate, {
       allowedUserId: deps.getAllowedUserId(),
       ctx,
       removePendingMediaGroupMessages: deps.removePendingMediaGroupMessages,
@@ -901,6 +1125,7 @@ export function createTelegramUpdateRuntime<
     handleUpdate: (update, ctx) =>
       executeTelegramUpdate(update, deps.getAllowedUserId(), {
         ctx,
+        getEffectiveProfile: deps.getEffectiveProfile,
         getCurrentInstanceId: deps.getCurrentInstanceId,
         getMessageOwnership: deps.getMessageOwnership,
         getTargetOwnership: deps.getTargetOwnership,
@@ -909,10 +1134,11 @@ export function createTelegramUpdateRuntime<
         removePendingMediaGroupMessages: deps.removePendingMediaGroupMessages,
         removeQueuedTelegramTurnsByMessageIds:
           deps.removeQueuedTelegramTurnsByMessageIds,
+        resolveQueuedTelegramMessageThreadId:
+          deps.resolveQueuedTelegramMessageThreadId,
         handleAuthorizedTelegramReactionUpdate: handleAuthorizedReactionUpdate,
         handleTelegramTopicLifecycleUpdate:
           deps.handleTelegramTopicLifecycleUpdate,
-        pairTelegramUserIfNeeded: deps.pairTelegramUserIfNeeded,
         answerCallbackQuery: deps.answerCallbackQuery,
         answerGuestQuery: deps.answerGuestQuery,
         handleAuthorizedTelegramCallbackQuery:
@@ -957,26 +1183,33 @@ export interface AuthorizedTelegramReactionUpdateDeps<TContext> {
 export async function handleAuthorizedTelegramReactionUpdate<TContext>(
   reactionUpdate: TelegramMessageReactionUpdated,
   deps: AuthorizedTelegramReactionUpdateDeps<TContext>,
-): Promise<void> {
+): Promise<TelegramInboundHandlingOutcome> {
+  const reactionTarget = getTelegramReactionMessageTarget(reactionUpdate);
   const foreignOwnership = getForeignTelegramMessageOwnership(
-    getTelegramReactionMessageTarget(reactionUpdate),
+    reactionTarget,
     deps,
   );
   if (foreignOwnership) {
-    await deps.foreignOwnedUpdateForwarder?.forwardReaction?.({
+    const forwardingResult = await deps.foreignOwnedUpdateForwarder?.forwardReaction?.({
       reactionUpdate,
       ownership: foreignOwnership,
       ctx: deps.ctx,
     });
-    return;
+    return followerForwardingOutcome(
+      forwardingResult,
+      reactionTarget ? { chatId: reactionTarget.chatId } : undefined,
+      reactionUpdate.message_id,
+    );
   }
   const reactionUser = reactionUpdate.user;
-  if (!reactionUser || reactionUser.is_bot) return;
+  if (!reactionUser || reactionUser.is_bot) {
+    return { kind: "completed", reason: "reaction" };
+  }
   if (
     reactionUpdate.chat.type !== "private" &&
     reactionUser.id !== deps.allowedUserId
   ) {
-    return;
+    return { kind: "completed", reason: "reaction" };
   }
   const reactionScope =
     typeof reactionUpdate.chat.id === "number"
@@ -997,7 +1230,7 @@ export async function handleAuthorizedTelegramReactionUpdate<TContext>(
       deps.ctx,
       reactionScope,
     );
-    return;
+    return { kind: "completed", reason: "reaction" };
   }
   const hadPriorityReaction = hasAnyTelegramReactionEmoji(
     oldEmojis,
@@ -1019,13 +1252,15 @@ export async function handleAuthorizedTelegramReactionUpdate<TContext>(
     newEmojis,
     TELEGRAM_PRIORITY_REACTION_EMOJIS,
   );
-  if (!addedPriorityEmoji) return;
-  deps.prioritizeQueuedTelegramTurnByMessageId(
-    reactionUpdate.message_id,
-    deps.ctx,
-    addedPriorityEmoji,
-    reactionScope,
-  );
+  if (addedPriorityEmoji) {
+    deps.prioritizeQueuedTelegramTurnByMessageId(
+      reactionUpdate.message_id,
+      deps.ctx,
+      addedPriorityEmoji,
+      reactionScope,
+    );
+  }
+  return { kind: "completed", reason: "reaction" };
 }
 
 function isTelegramStaleContextError(error: unknown): boolean {
@@ -1034,6 +1269,66 @@ function isTelegramStaleContextError(error: unknown): boolean {
     (error.message.includes("stale after session") ||
       error.message.includes("stale ctx"))
   );
+}
+
+function stableUpdateIdentityKey(
+  plan: TelegramUpdateExecutionPlan,
+  updateId?: number,
+): string {
+  if (Number.isSafeInteger(updateId) && updateId !== undefined && updateId >= 0) {
+    return `update:${updateId}`;
+  }
+  switch (plan.kind) {
+    case "message":
+    case "edited-message":
+    case "topic-lifecycle": {
+      const message = plan.kind === "topic-lifecycle" ? plan.lifecycle.message : plan.message;
+      const target = getTelegramMessageTarget(message);
+      return `message:${target?.chatId ?? "unknown"}:${target?.threadId ?? 0}:${message.message_id ?? "unknown"}`;
+    }
+    case "callback": {
+      const target = plan.query.message
+        ? getTelegramMessageTarget(plan.query.message)
+        : undefined;
+      return `callback:${target?.chatId ?? "unknown"}:${target?.threadId ?? 0}:${plan.query.message?.message_id ?? plan.query.id ?? "unknown"}`;
+    }
+    case "reaction":
+      return `reaction:${plan.reactionUpdate.chat.id ?? "unknown"}:${plan.reactionUpdate.message_id}`;
+    case "guest":
+      return `guest:${plan.guestMessage.chat.id ?? "unknown"}:${plan.guestMessage.message_id ?? plan.guestMessage.guest_query_id}`;
+    case "deleted":
+      return `deleted:${plan.messageIds.join(",") || "unknown"}`;
+    case "ignore":
+      return "ignored:update";
+  }
+}
+
+function followerForwardingOutcome(
+  result: TelegramFollowerForwardingResult | undefined,
+  target: TelegramTarget | undefined,
+  messageId: number | undefined,
+  updateId?: number,
+): TelegramInboundHandlingOutcome {
+  if (
+    isTelegramFollowerDurableAdmissionAckV1(result) &&
+    (!target ||
+      (result.target.chatId === target.chatId &&
+        result.target.threadId === target.threadId)) &&
+    (updateId === undefined || result.updateId === updateId)
+  ) {
+    return { kind: "follower-admitted", admission: result };
+  }
+  const targetKey = target
+    ? `${target.chatId}:${target.threadId ?? 0}`
+    : "unknown:0";
+  const sourceKey = Number.isSafeInteger(updateId)
+    ? `update:${updateId}`
+    : `message:${messageId ?? "unknown"}`;
+  return {
+    kind: "deferred",
+    reason: "follower-admission-pending",
+    key: `follower:${targetKey}:${sourceKey}`,
+  };
 }
 
 export async function executeTelegramUpdatePlan<
@@ -1050,172 +1345,232 @@ export async function executeTelegramUpdatePlan<
     TCallbackQuery,
     TMessage
   >,
-): Promise<void> {
+  executionIdentity: { updateId?: number } = {},
+): Promise<TelegramInboundHandlingOutcome> {
   try {
-    if (plan.kind === "ignore") return;
-    if (plan.kind === "deleted") {
-      deps.removePendingMediaGroupMessages(plan.messageIds);
-      deps.removeQueuedTelegramTurnsByMessageIds(plan.messageIds, deps.ctx);
-      return;
-    }
-    if (plan.kind === "reaction") {
-      await deps.handleAuthorizedTelegramReactionUpdate(
-        plan.reactionUpdate,
-        deps.ctx,
-      );
-      return;
-    }
-    if (plan.kind === "topic-lifecycle") {
-      await deps.handleTelegramTopicLifecycleUpdate?.(plan.lifecycle, deps.ctx);
-      return;
-    }
-    if (plan.kind === "callback") {
-      const foreignOwnership = getForeignTelegramCallbackOwnership(
-        plan.query,
-        deps,
-      );
-      if (foreignOwnership) {
-        const forwarded =
-          (await deps.foreignOwnedUpdateForwarder?.forwardCallback?.({
-            query: plan.query,
-            ownership: foreignOwnership,
-            ctx: deps.ctx,
-          })) ?? false;
-        if (!forwarded) {
+    switch (plan.kind) {
+      case "ignore":
+        return { kind: "completed", reason: "ignored" };
+      case "deleted": {
+        if (
+          plan.scope.chatId === undefined &&
+          plan.scope.businessConnectionId === undefined
+        ) {
+          deps.removePendingMediaGroupMessages(plan.messageIds);
+          deps.removeQueuedTelegramTurnsByMessageIds(plan.messageIds, deps.ctx);
+          return { kind: "completed", reason: "deleted" };
+        }
+        const profile = deps.getEffectiveProfile?.() ?? "default";
+        for (const messageId of plan.messageIds) {
+          const ownership =
+            plan.scope.chatId === undefined
+              ? undefined
+              : deps.getMessageOwnership?.(plan.scope.chatId, messageId);
+          const queueScope = {
+            profile,
+            ...(plan.scope.chatId !== undefined
+              ? { chatId: plan.scope.chatId }
+              : {}),
+            ...(plan.scope.businessConnectionId
+              ? { businessConnectionId: plan.scope.businessConnectionId }
+              : {}),
+          };
+          const representedThreadId = ownership
+            ? (ownership.target?.threadId ?? null)
+            : deps.resolveQueuedTelegramMessageThreadId?.(
+                messageId,
+                queueScope,
+              );
+          const targetScope = {
+            ...(plan.scope.chatId !== undefined
+              ? { chatId: plan.scope.chatId }
+              : {}),
+            ...(typeof representedThreadId === "number"
+              ? { threadId: representedThreadId }
+              : {}),
+          };
+          if (!plan.scope.businessConnectionId) {
+            deps.removePendingMediaGroupMessages([messageId], targetScope);
+          }
+          deps.removeQueuedTelegramTurnsByMessageIds([messageId], deps.ctx, {
+            ...queueScope,
+            ...targetScope,
+            ...(representedThreadId !== undefined
+              ? { exactThreadId: representedThreadId }
+              : {}),
+          });
+        }
+        return { kind: "completed", reason: "deleted" };
+      }
+      case "reaction":
+        return deps.handleAuthorizedTelegramReactionUpdate(
+          plan.reactionUpdate,
+          deps.ctx,
+        );
+      case "topic-lifecycle":
+        return (
+          (await deps.handleTelegramTopicLifecycleUpdate?.(
+            plan.lifecycle,
+            deps.ctx,
+          )) ?? { kind: "completed", reason: "topic-lifecycle" }
+        );
+      case "callback": {
+        const foreignOwnership = getForeignTelegramCallbackOwnership(
+          plan.query,
+          deps,
+        );
+        if (foreignOwnership) {
+          const forwardingResult =
+            await deps.foreignOwnedUpdateForwarder?.forwardCallback?.({
+              query: plan.query,
+              ownership: foreignOwnership,
+              ctx: deps.ctx,
+            });
+          if (!forwardingResult) {
+            const callbackQueryId = getTelegramCallbackQueryId(plan.query);
+            if (callbackQueryId) {
+              await deps.answerCallbackQuery(
+                callbackQueryId,
+                "This Telegram message belongs to another Pi instance.",
+              );
+            }
+          }
+          const callbackTarget = plan.query.message
+            ? getTelegramMessageTarget(plan.query.message)
+            : undefined;
+          return followerForwardingOutcome(
+            forwardingResult,
+            callbackTarget,
+            plan.query.message?.message_id,
+            executionIdentity.updateId,
+          );
+        }
+        if (plan.shouldDeny) {
           const callbackQueryId = getTelegramCallbackQueryId(plan.query);
           if (callbackQueryId) {
             await deps.answerCallbackQuery(
               callbackQueryId,
-              "This Telegram message belongs to another Pi instance.",
+              "This bot is not authorized for your account.",
             );
           }
+          return { kind: "completed", reason: "unauthorized" };
         }
-        return;
-      }
-      if (plan.shouldPair) {
-        await deps.pairTelegramUserIfNeeded(plan.query.from.id, deps.ctx);
-      }
-      if (plan.shouldDeny) {
-        const callbackQueryId = getTelegramCallbackQueryId(plan.query);
-        if (callbackQueryId) {
-          await deps.answerCallbackQuery(
-            callbackQueryId,
-            "This bot is not authorized for your account.",
-          );
-        }
-        return;
-      }
-      await deps.handleAuthorizedTelegramCallbackQuery(plan.query, deps.ctx);
-      return;
-    }
-    if (plan.kind === "guest") {
-      if (plan.shouldDeny) {
-        await deps.answerGuestQuery(
-          plan.guestMessage.guest_query_id,
-          "🚫 Access denied.",
-        );
-        return;
-      }
-      if (deps.handleAuthorizedTelegramGuestMessage) {
-        await deps.handleAuthorizedTelegramGuestMessage(
-          plan.guestMessage,
+        return await deps.handleAuthorizedTelegramCallbackQuery(
+          plan.query,
           deps.ctx,
         );
       }
-      return;
-    }
-    const foreignMessageOwnership = getForeignTelegramMessageOwnership(
-      getTelegramMessageReplyTarget(plan.message),
-      deps,
-    );
-    if (foreignMessageOwnership) {
-      if (plan.kind === "edited-message") {
-        await deps.foreignOwnedUpdateForwarder?.forwardEditedMessage?.({
-          message: plan.message,
-          ownership: foreignMessageOwnership,
-          ctx: deps.ctx,
-        });
-      } else {
-        await deps.foreignOwnedUpdateForwarder?.forwardMessage?.({
-          message: plan.message,
-          ownership: foreignMessageOwnership,
-          ctx: deps.ctx,
-        });
-      }
-      return;
-    }
-    const messageTarget = getTelegramMessageTarget(plan.message);
-    const foreignTargetOwnership = getForeignTelegramTargetOwnership(
-      messageTarget,
-      deps,
-    );
-    if (foreignTargetOwnership) {
-      if (typeof plan.message.message_id === "number") {
-        deps.recordMessageOwnership?.({
-          chatId: messageTarget!.chatId,
-          messageId: plan.message.message_id,
-          target: messageTarget,
-          instanceId: foreignTargetOwnership.instanceId,
-        });
-      }
-      if (plan.kind === "edited-message") {
-        await deps.foreignOwnedUpdateForwarder?.forwardEditedMessage?.({
-          message: plan.message,
-          ownership: foreignTargetOwnership,
-          ctx: deps.ctx,
-        });
-      } else {
-        await deps.foreignOwnedUpdateForwarder?.forwardMessage?.({
-          message: plan.message,
-          ownership: foreignTargetOwnership,
-          ctx: deps.ctx,
-        });
-      }
-      return;
-    }
-    if (
-      plan.kind === "message" &&
-      messageTarget?.threadId != null &&
-      deps.handleUnboundTelegramTopicMessage
-    ) {
-      await deps.handleUnboundTelegramTopicMessage(plan.message, deps.ctx);
-      return;
-    }
-    const pairedNow = plan.shouldPair
-      ? await deps.pairTelegramUserIfNeeded(plan.message.from.id, deps.ctx)
-      : false;
-    const replyTarget = getTelegramMessageReplyTarget(plan.message);
-    if (
-      plan.kind === "message" &&
-      pairedNow &&
-      plan.shouldNotifyPaired &&
-      replyTarget
-    ) {
-      await deps.sendTextReply(
-        replyTarget.chatId,
-        replyTarget.messageId,
-        "Telegram bridge paired with this account.",
-        { target: replyTarget },
-      );
-    }
-    if (plan.shouldDeny) {
-      if (replyTarget) {
-        await deps.sendTextReply(
-          replyTarget.chatId,
-          replyTarget.messageId,
-          "This bot is not authorized for your account.",
-          { target: replyTarget },
+      case "guest":
+        if (plan.shouldDeny) {
+          await deps.answerGuestQuery(
+            plan.guestMessage.guest_query_id,
+            "🚫 Access denied.",
+          );
+          return { kind: "completed", reason: "unauthorized" };
+        }
+        return deps.handleAuthorizedTelegramGuestMessage
+          ? await deps.handleAuthorizedTelegramGuestMessage(
+              plan.guestMessage,
+              deps.ctx,
+            )
+          : { kind: "completed", reason: "guest" };
+      case "message":
+      case "edited-message": {
+        const foreignMessageOwnership = getForeignTelegramMessageOwnership(
+          getTelegramMessageReplyTarget(plan.message),
+          deps,
         );
+        if (foreignMessageOwnership) {
+          const forwardingResult = plan.kind === "edited-message"
+            ? await deps.foreignOwnedUpdateForwarder?.forwardEditedMessage?.({
+                message: plan.message,
+                ownership: foreignMessageOwnership,
+                ctx: deps.ctx,
+              })
+            : await deps.foreignOwnedUpdateForwarder?.forwardMessage?.({
+                message: plan.message,
+                ownership: foreignMessageOwnership,
+                ctx: deps.ctx,
+              });
+          return followerForwardingOutcome(
+            forwardingResult,
+            getTelegramMessageTarget(plan.message),
+            plan.message.message_id,
+            executionIdentity.updateId,
+          );
+        }
+        const messageTarget = getTelegramMessageTarget(plan.message);
+        const foreignTargetOwnership = getForeignTelegramTargetOwnership(
+          messageTarget,
+          deps,
+        );
+        if (foreignTargetOwnership) {
+          if (typeof plan.message.message_id === "number") {
+            deps.recordMessageOwnership?.({
+              chatId: messageTarget!.chatId,
+              messageId: plan.message.message_id,
+              target: messageTarget,
+              instanceId: foreignTargetOwnership.instanceId,
+            });
+          }
+          const forwardingResult = plan.kind === "edited-message"
+            ? await deps.foreignOwnedUpdateForwarder?.forwardEditedMessage?.({
+                message: plan.message,
+                ownership: foreignTargetOwnership,
+                ctx: deps.ctx,
+              })
+            : await deps.foreignOwnedUpdateForwarder?.forwardMessage?.({
+                message: plan.message,
+                ownership: foreignTargetOwnership,
+                ctx: deps.ctx,
+              });
+          return followerForwardingOutcome(
+            forwardingResult,
+            messageTarget,
+            plan.message.message_id,
+            executionIdentity.updateId,
+          );
+        }
+        if (
+          plan.kind === "message" &&
+          messageTarget?.threadId != null &&
+          deps.handleUnboundTelegramTopicMessage
+        ) {
+          return await deps.handleUnboundTelegramTopicMessage(
+            plan.message,
+            deps.ctx,
+          );
+        }
+        const replyTarget = getTelegramMessageReplyTarget(plan.message);
+        if (plan.shouldDeny) {
+          if (replyTarget) {
+            await deps.sendTextReply(
+              replyTarget.chatId,
+              replyTarget.messageId,
+              "This bot is not authorized for your account.",
+              { target: replyTarget },
+            );
+          }
+          return { kind: "completed", reason: "unauthorized" };
+        }
+        return plan.kind === "edited-message"
+          ? await deps.handleAuthorizedTelegramEditedMessage(
+              plan.message,
+              deps.ctx,
+            )
+          : await deps.handleAuthorizedTelegramMessage(
+              plan.message,
+              deps.ctx,
+            );
       }
-      return;
     }
-    if (plan.kind === "edited-message") {
-      await deps.handleAuthorizedTelegramEditedMessage(plan.message, deps.ctx);
-      return;
-    }
-    await deps.handleAuthorizedTelegramMessage(plan.message, deps.ctx);
   } catch (error) {
     if (!isTelegramStaleContextError(error)) throw error;
+    return {
+      kind: "deferred",
+      reason: "session-replay",
+      key: `session-replay:${stableUpdateIdentityKey(plan, executionIdentity.updateId)}`,
+    };
   }
 }
 
@@ -1253,7 +1608,10 @@ export interface TelegramUpdateHandlerRegistry {
    * Used by pi-telegram's polling runtime; extension consumers should call
    * {@link registerTelegramUpdateHandler} or `add` instead of dispatching directly.
    */
-  dispatch: (update: unknown) => Promise<TelegramUpdateHandlerVerdict>;
+  dispatch: (
+    update: unknown,
+    recordFailure?: (handlerId: string, handlerCategory: string) => void,
+  ) => Promise<TelegramUpdateHandlerVerdict>;
 }
 
 const UPDATE_HANDLER_REGISTRY_KEY = "__piTelegramUpdateHandlerRegistry__";
@@ -1274,20 +1632,28 @@ function getOrCreateUpdateHandlerRegistry(): TelegramUpdateHandlerRegistry {
   const g = globalThis as Record<string, unknown>;
   const existing = g[UPDATE_HANDLER_REGISTRY_KEY];
   if (isValidV1UpdateHandlerRegistry(existing)) return existing;
-  const handlers = new Set<TelegramUpdateHandler>();
+  const handlers = new Map<
+    TelegramUpdateHandler,
+    { id: string; handler: TelegramUpdateHandler }
+  >();
+  let nextHandlerId = 0;
   const registry: TelegramUpdateHandlerRegistry = {
     version: 1,
     add(handler) {
-      handlers.add(handler);
+      const entry = {
+        id: `update-${nextHandlerId++}`,
+        handler,
+      };
+      handlers.set(handler, entry);
       return () => handlers.delete(handler);
     },
-    async dispatch(update) {
-      for (const handler of handlers) {
+    async dispatch(update, recordFailure) {
+      for (const entry of handlers.values()) {
         try {
-          const result = await handler(update);
+          const result = await entry.handler(update);
           if (result === "consume") return "consume";
         } catch {
-          // Update handler errors must not break polling.
+          recordFailure?.(entry.id, "update");
         }
       }
       return "pass";
@@ -1306,23 +1672,145 @@ export function getTelegramUpdateHandlerRegistry(): TelegramUpdateHandlerRegistr
   return getOrCreateUpdateHandlerRegistry();
 }
 
+export interface TelegramUnpairedUpdateGateDeps<TContext> {
+  getAllowedUserId: () => number | undefined;
+  claim: (input: TelegramPairingClaimInput) => Promise<TelegramPairingClaimResult>;
+  sendGenericResponse: (target: {
+    chatId: number;
+    messageId: number;
+    threadId?: number;
+    text: typeof TELEGRAM_PAIRING_RESPONSE;
+  }) => Promise<void>;
+  onPaired: (ctx: TContext) => Promise<void> | void;
+  recordSideEffectFailure: (
+    phase: "response" | "on-paired",
+    error: unknown,
+  ) => void;
+}
+
 export interface TelegramUpdateHandlerWrapDeps<TUpdate, TContext> {
-  defaultHandle: (update: TUpdate, ctx: TContext) => Promise<void>;
+  defaultHandle: (
+    update: TUpdate,
+    ctx: TContext,
+  ) => Promise<TelegramInboundHandlingOutcome>;
+  pairingGate: TelegramUnpairedUpdateGateDeps<TContext>;
   registry?: TelegramUpdateHandlerRegistry;
+  recordRuntimeEvent?: (
+    category: string,
+    error: unknown,
+    details?: Record<string, unknown>,
+  ) => void;
+}
+
+function getTelegramUpdateSenderId(update: unknown): number | undefined {
+  if (!update || typeof update !== "object" || Array.isArray(update)) {
+    return undefined;
+  }
+  const value = update as Record<string, unknown>;
+  const candidates = [
+    value.message,
+    value.edited_message,
+    value.callback_query,
+    value.message_reaction,
+    value.guest_message,
+  ];
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+      continue;
+    }
+    const from = (candidate as Record<string, unknown>).from ??
+      (candidate as Record<string, unknown>).user;
+    if (!from || typeof from !== "object" || Array.isArray(from)) continue;
+    const senderId = (from as Record<string, unknown>).id;
+    if (typeof senderId === "number" && Number.isSafeInteger(senderId)) {
+      return senderId;
+    }
+  }
+  return undefined;
 }
 
 /**
- * Wrap a default polling `handleUpdate` with the public update handler registry.
+ * Wrap default polling with the pairing proof gate, authorization boundary, and public registry.
+ * Proof-shaped and unauthorized updates never cross the public handler membrane;
+ * paired authorized handler ordering remains unchanged.
  */
 export function createTelegramUpdateHandle<TUpdate, TContext>(
   deps: TelegramUpdateHandlerWrapDeps<TUpdate, TContext>,
-): (update: TUpdate, ctx: TContext) => Promise<void> {
+): (
+  update: TUpdate,
+  ctx: TContext,
+) => Promise<TelegramInboundHandlingOutcome> {
   const registry = deps.registry ?? getOrCreateUpdateHandlerRegistry();
-  const { defaultHandle } = deps;
+  const { defaultHandle, pairingGate } = deps;
   return async (update, ctx) => {
-    const verdict = await registry.dispatch(update);
-    if (verdict === "consume") return;
-    await defaultHandle(update, ctx);
+    const proofShaped = isTelegramPairingProofShapedUpdate(update);
+    const pairingCandidate = proofShaped
+      ? parseTelegramPairingCandidate(update)
+      : undefined;
+    if (proofShaped) {
+      if (isValidTelegramAllowedUserId(pairingGate.getAllowedUserId())) {
+        return { kind: "completed", reason: "ignored" };
+      }
+      if (!pairingCandidate) {
+        return { kind: "completed", reason: "unauthorized" };
+      }
+      const result = await pairingGate.claim({
+        senderId: pairingCandidate.senderId,
+        code: pairingCandidate.code,
+      });
+      try {
+        await pairingGate.sendGenericResponse({
+          chatId: pairingCandidate.chatId,
+          messageId: pairingCandidate.messageId,
+          ...(pairingCandidate.threadId !== undefined
+            ? { threadId: pairingCandidate.threadId }
+            : {}),
+          text: TELEGRAM_PAIRING_RESPONSE,
+        });
+      } catch (error) {
+        try {
+          pairingGate.recordSideEffectFailure("response", error);
+        } catch {
+          // Diagnostics must not reject an already admitted pairing claim.
+        }
+      }
+      if (result.kind === "claimed") {
+        try {
+          await pairingGate.onPaired(ctx);
+        } catch (error) {
+          try {
+            pairingGate.recordSideEffectFailure("on-paired", error);
+          } catch {
+            // Diagnostics must not reject an already admitted pairing claim.
+          }
+        }
+      }
+      return { kind: "completed", reason: "unauthorized" };
+    }
+    const allowedUserId = pairingGate.getAllowedUserId();
+    if (!isValidTelegramAllowedUserId(allowedUserId)) {
+      return { kind: "completed", reason: "unauthorized" };
+    }
+    const senderId = getTelegramUpdateSenderId(update);
+    if (senderId !== undefined && senderId !== allowedUserId) {
+      return { kind: "completed", reason: "unauthorized" };
+    }
+    if (senderId === allowedUserId) {
+      const verdict = await registry.dispatch(
+        update,
+        (handlerId, handlerCategory) => {
+          deps.recordRuntimeEvent?.(
+            "public-handler",
+            new Error("Public handler failed"),
+            { handlerId, handlerCategory },
+          );
+        },
+      );
+      if (verdict === "consume") {
+        return { kind: "completed", reason: "public-handler" };
+      }
+    }
+    return defaultHandle(update, ctx);
   };
 }
 

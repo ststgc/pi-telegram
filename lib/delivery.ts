@@ -10,8 +10,8 @@ import {
   type TelegramInlineKeyboardMarkup,
 } from "./keyboard.ts";
 import {
-  buildTelegramReplyParameters,
   renderTelegramMessage,
+  reserveTelegramReplyParameters,
 } from "./replies.ts";
 import {
   getTelegramTargetThreadParams,
@@ -28,6 +28,13 @@ class TelegramDeliveryTransportGenerationError extends Error {
   constructor() {
     super("Telegram Delivery transport generation is no longer active.");
     this.name = "TelegramDeliveryTransportGenerationError";
+  }
+}
+
+class TelegramDeliveryAuthorityLostAfterStartError extends Error {
+  constructor() {
+    super("Telegram Delivery authority was lost after mutation start.");
+    this.name = "TelegramDeliveryAuthorityLostAfterStartError";
   }
 }
 
@@ -475,11 +482,12 @@ export function createTelegramDeliveryRuntime(
     if (error instanceof TelegramDeliveryTransportGenerationError) {
       return inactive();
     }
+    const commitUnknown =
+      error instanceof TelegramDeliveryAuthorityLostAfterStartError ||
+      isTelegramApiCommitUnknownError(error);
     return failure(
-      isTelegramApiCommitUnknownError(error)
-        ? "commit-unknown"
-        : "transport-failed",
-      isTelegramApiCommitUnknownError(error)
+      commitUnknown ? "commit-unknown" : "transport-failed",
+      commitUnknown
         ? `Telegram delivery ${operation} may have committed before transport failed.`
         : `Telegram delivery ${operation} failed.`,
       partial,
@@ -558,7 +566,10 @@ export function createTelegramDeliveryRuntime(
           }
           return { ok: true, value: createHandle(target, messageIds) };
         } catch (error) {
-          return active
+          return (
+              active ||
+              error instanceof TelegramDeliveryAuthorityLostAfterStartError
+            )
             ? transportFailure(
                 "send",
                 error,
@@ -687,9 +698,11 @@ export function createTelegramBridgeDeliveryRuntime(
   deps: TelegramBridgeDeliveryRuntimeDeps,
 ): TelegramDeliveryRuntime {
   const getPolicyView = deps.getTargetPolicyView;
-  const assertTransportActive = (): void => {
+  const assertTransportActive = (mutationStarted = false): void => {
     if (deps.isTransportActive?.() === false) {
-      throw new TelegramDeliveryTransportGenerationError();
+      throw mutationStarted
+        ? new TelegramDeliveryAuthorityLostAfterStartError()
+        : new TelegramDeliveryTransportGenerationError();
     }
   };
   return createTelegramDeliveryRuntime({
@@ -720,7 +733,7 @@ export function createTelegramBridgeDeliveryRuntime(
     },
     async sendChunk(target, chunk, options) {
       assertTransportActive();
-      const replyParameters = buildTelegramReplyParameters(
+      const reservation = reserveTelegramReplyParameters(
         target.chatId,
         options.replyToMessageId,
         target,
@@ -730,21 +743,36 @@ export function createTelegramBridgeDeliveryRuntime(
         text: chunk.text,
         ...(chunk.parseMode === "html" ? { parse_mode: "HTML" as const } : {}),
         ...getTelegramTargetThreadParams(target),
-        ...(replyParameters ? { reply_parameters: replyParameters } : {}),
+        ...(reservation.parameters
+          ? { reply_parameters: reservation.parameters }
+          : {}),
         ...(options.replyMarkup ? { reply_markup: options.replyMarkup } : {}),
       };
-      const sent = await deps.api.sendMessage(
-        target.threadId === undefined
-          ? markTelegramBusAggregateDelivery(body)
-          : body,
-      );
-      assertTransportActive();
-      deps.recordOwnership({
-        chatId: target.chatId,
-        messageId: sent.message_id,
-        target,
-      });
-      return sent.message_id;
+      try {
+        const sent = await deps.api.sendMessage(
+          target.threadId === undefined
+            ? markTelegramBusAggregateDelivery(body)
+            : body,
+        );
+        assertTransportActive(true);
+        if (!Number.isSafeInteger(sent.message_id) || sent.message_id <= 0) {
+          throw new Error("Telegram sendMessage returned an invalid message_id");
+        }
+        reservation.confirm();
+        try {
+          deps.recordOwnership({
+            chatId: target.chatId,
+            messageId: sent.message_id,
+            target,
+          });
+        } catch (error) {
+          deps.recordFailure?.("send", error, target);
+        }
+        return sent.message_id;
+      } catch (error) {
+        reservation.releaseKnownFailure(error);
+        throw error;
+      }
     },
     async editChunk(target, messageId, chunk, options) {
       assertTransportActive();

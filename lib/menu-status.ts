@@ -43,12 +43,14 @@ export interface TelegramStatusMenuOpenDeps<
   getActiveModel: () => TModel | undefined;
   getThinkingLevel: () => ThinkingLevel;
   getQueueItemCount?: () => number;
+  getRecoveryItemCount?: () => number;
   sendStatusMenu: (
     state: TelegramModelMenuState<TModel>,
     statusHtml: string,
     activeModel: TModel | undefined,
     thinkingLevel: ThinkingLevel,
     queueItemCount: number,
+    recoveryItemCount: number,
   ) => Promise<number | undefined>;
   storeModelMenuState: (state: TelegramModelMenuState<TModel>) => void;
 }
@@ -110,6 +112,7 @@ export async function openTelegramStatusMenu<
     deps.getActiveModel(),
     deps.getThinkingLevel(),
     deps.getQueueItemCount?.() ?? 0,
+    deps.getRecoveryItemCount?.() ?? 0,
   );
   if (messageId === undefined) return;
   state.messageId = messageId;
@@ -158,6 +161,7 @@ export function buildStatusReplyMarkup(
   activeModel: MenuModel | undefined,
   currentThinkingLevel: ThinkingLevel,
   queueItemCount = 0,
+  recoveryItemCount = 0,
   sectionRegistry?: TelegramSectionRegistry,
   isVoiceReplyActive?: boolean,
 ): TelegramReplyMarkup {
@@ -188,6 +192,12 @@ export function buildStatusReplyMarkup(
       callback_data: "menu:queue",
     },
   ]);
+  rows.push([
+    {
+      text: `🛟 Recovery: ${recoveryItemCount}`,
+      callback_data: "menu:recovery",
+    },
+  ]);
   if (sectionRegistry) {
     const sectionRows = getTelegramSectionMainMenuRows(sectionRegistry);
     for (const row of sectionRows) {
@@ -208,6 +218,7 @@ export function buildTelegramStatusMenuRenderPayload(
   activeModel: MenuModel | undefined,
   currentThinkingLevel: ThinkingLevel,
   queueItemCount = 0,
+  recoveryItemCount = 0,
   sectionRegistry?: TelegramSectionRegistry,
   isVoiceReplyActive?: boolean,
 ): TelegramMenuRenderPayload {
@@ -219,6 +230,7 @@ export function buildTelegramStatusMenuRenderPayload(
       activeModel,
       currentThinkingLevel,
       queueItemCount,
+      recoveryItemCount,
       sectionRegistry,
       isVoiceReplyActive,
     ),
@@ -232,6 +244,7 @@ export async function updateTelegramStatusMessage(
   currentThinkingLevel: ThinkingLevel,
   deps: TelegramMenuMessageRuntimeDeps,
   queueItemCount = 0,
+  recoveryItemCount = 0,
   sectionRegistry?: TelegramSectionRegistry,
   isVoiceReplyActive?: boolean,
 ): Promise<void> {
@@ -242,6 +255,7 @@ export async function updateTelegramStatusMessage(
       activeModel,
       currentThinkingLevel,
       queueItemCount,
+      recoveryItemCount,
       sectionRegistry,
       isVoiceReplyActive,
     ),
@@ -256,6 +270,7 @@ export function sendTelegramStatusMessage(
   currentThinkingLevel: ThinkingLevel,
   deps: TelegramMenuMessageRuntimeDeps,
   queueItemCount = 0,
+  recoveryItemCount = 0,
   sectionRegistry?: TelegramSectionRegistry,
   isVoiceReplyActive?: boolean,
 ): Promise<number | undefined> {
@@ -266,6 +281,7 @@ export function sendTelegramStatusMessage(
       activeModel,
       currentThinkingLevel,
       queueItemCount,
+      recoveryItemCount,
       sectionRegistry,
       isVoiceReplyActive,
     ),

@@ -4,12 +4,10 @@
  * Owns Telegram slash-command normalization, bot command metadata, and pi-side command registration behind runtime ports
  */
 
-import {
-  pairTelegramUserIfNeeded,
-  TELEGRAM_DEFAULT_PROFILE_NAME,
-} from "./config.ts";
+import { TELEGRAM_DEFAULT_PROFILE_NAME } from "./config.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "./pi.ts";
 import type { TelegramBridgeStatusLineOptions } from "./status.ts";
+import type { TelegramInboundHandlingOutcome } from "./updates.ts";
 import {
   createTelegramControlItemBuilder,
   createTelegramControlQueueController,
@@ -302,6 +300,7 @@ export interface TelegramBridgeCommandRegistrationDeps {
   getStatusLines: (options?: TelegramBridgeStatusLineOptions) => string[];
   reloadConfig: () => Promise<void>;
   hasBotToken: () => boolean;
+  getPairingInstructions?: () => Promise<string | undefined>;
   startPolling: (
     ctx: ExtensionCommandContext,
     options?: TelegramBridgeCommandStartPollingOptions,
@@ -390,6 +389,8 @@ export function registerTelegramBridgeCommands(
         await deps.promptForConfig(ctx, profileName);
         return;
       }
+      const pairingInstructions = await deps.getPairingInstructions?.();
+      if (pairingInstructions) ctx.ui.notify(pairingInstructions, "info");
       let result = await deps.startPolling(ctx, {
         forceFreshLeaderThread: true,
       });
@@ -502,7 +503,10 @@ export interface TelegramCommandActionDeps<TMessage, TContext> {
   handleStop: (message: TMessage, ctx: TContext) => Promise<void>;
   handleAbort: (message: TMessage, ctx: TContext) => Promise<void>;
   handleNext: (message: TMessage, ctx: TContext) => Promise<void>;
-  handleContinue: (message: TMessage, ctx: TContext) => Promise<void>;
+  handleContinue: (
+    message: TMessage,
+    ctx: TContext,
+  ) => Promise<TelegramInboundHandlingOutcome>;
   handleQueue: (message: TMessage, ctx: TContext) => Promise<void>;
   handleCompact: (message: TMessage, ctx: TContext) => Promise<void>;
   handleStatus: (message: TMessage, ctx: TContext) => Promise<void>;
@@ -616,12 +620,6 @@ export interface TelegramCommandMessageTarget {
   chatId: number;
   threadId?: number;
   replyToMessageId: number;
-}
-
-function canPairTelegramUserFromCommandMessage(
-  message: TelegramCommandRuntimeMessage,
-): boolean {
-  return message.chat.type === undefined || message.chat.type === "private";
 }
 
 export interface TelegramCommandTargetRuntimeDeps<TContext> {
@@ -835,18 +833,21 @@ export interface TelegramCommandOrPromptRuntimeDeps<TMessage, TContext> {
     commandName: string | undefined,
     message: TMessage,
     ctx: TContext,
-  ) => Promise<boolean>;
+  ) => Promise<boolean | TelegramInboundHandlingOutcome>;
   executeExtensionCommand?: (
     command: ParsedTelegramCommand,
     message: TMessage,
     ctx: TContext,
-  ) => Promise<boolean>;
+  ) => Promise<TelegramInboundHandlingOutcome | undefined>;
   expandPromptTemplateCommand?: (
     commandName: string,
     args: string,
   ) => string | undefined;
   replaceMessageText: (message: TMessage, text: string) => TMessage;
-  enqueueTurn: (messages: TMessage[], ctx: TContext) => Promise<void>;
+  enqueueTurn: (
+    messages: TMessage[],
+    ctx: TContext,
+  ) => Promise<TelegramInboundHandlingOutcome>;
 }
 
 export interface TelegramCommandRuntimeDeps<
@@ -876,7 +877,10 @@ export interface TelegramCommandRuntimeDeps<
     options?: { target?: { chatId: number; threadId?: number } },
   ) => void;
   stopTypingLoop?: () => void;
-  enqueueContinueTurn: (message: TMessage, ctx: TContext) => Promise<void>;
+  enqueueContinueTurn: (
+    message: TMessage,
+    ctx: TContext,
+  ) => Promise<TelegramInboundHandlingOutcome>;
   compact: (
     ctx: TContext,
     callbacks: { onComplete: () => void; onError: (error: unknown) => void },
@@ -898,10 +902,8 @@ export interface TelegramCommandRuntimeDeps<
   openQueueMenu: (message: TMessage, ctx: TContext) => Promise<void>;
   openSettingsMenu?: (message: TMessage, ctx: TContext) => Promise<void>;
   getAllowedUserId: () => number | undefined;
-  setAllowedUserId: (userId: number) => void;
   registerBotCommands: () => Promise<void>;
   getPromptTemplateCommands?: () => readonly TelegramPromptTemplateMenuCommand[];
-  persistConfig: () => Promise<void>;
   sendTextReply: (message: TMessage, text: string) => Promise<void>;
   sendInteractiveMessage?: TelegramCompactConfirmationDeps["sendInteractiveMessage"];
 }
@@ -1113,10 +1115,13 @@ export async function handleTelegramContinueCommand<TMessage, TContext>(
   message: TMessage,
   ctx: TContext,
   deps: {
-    enqueueContinueTurn: (message: TMessage, ctx: TContext) => Promise<void>;
+    enqueueContinueTurn: (
+      message: TMessage,
+      ctx: TContext,
+    ) => Promise<TelegramInboundHandlingOutcome>;
   },
-): Promise<void> {
-  await deps.enqueueContinueTurn(message, ctx);
+): Promise<TelegramInboundHandlingOutcome> {
+  return deps.enqueueContinueTurn(message, ctx);
 }
 
 function dispatchNextQueuedTelegramTurnAfterCompact(
@@ -1297,7 +1302,7 @@ export async function executeTelegramCommandAction<TMessage, TContext>(
   message: TMessage,
   ctx: TContext,
   deps: TelegramCommandActionDeps<TMessage, TContext>,
-): Promise<boolean> {
+): Promise<boolean | TelegramInboundHandlingOutcome> {
   switch (action.kind) {
     case "ignore":
       return false;
@@ -1311,8 +1316,7 @@ export async function executeTelegramCommandAction<TMessage, TContext>(
       await deps.handleNext(message, ctx);
       return true;
     case "continue":
-      await deps.handleContinue(message, ctx);
-      return true;
+      return deps.handleContinue(message, ctx);
     case "queue":
       await deps.handleQueue(message, ctx);
       return true;
@@ -1367,7 +1371,7 @@ export function createTelegramCommandHandlerTargetRuntime<
   commandName: string | undefined,
   message: TMessage,
   ctx: TContext,
-) => Promise<boolean> {
+) => Promise<boolean | TelegramInboundHandlingOutcome> {
   const commandTargetRuntime = createTelegramCommandTargetQueueRuntime<
     TMessage,
     TContext
@@ -1411,11 +1415,9 @@ export function createTelegramCommandHandlerTargetRuntime<
     openSettingsMenu: commandTargetRuntime.openSettingsMenu,
     handleForumBootstrap: deps.handleForumBootstrap,
     getAllowedUserId: deps.getAllowedUserId,
-    setAllowedUserId: deps.setAllowedUserId,
     registerBotCommands: createTelegramBotCommandRegistrar({
       setMyCommands: deps.setMyCommands,
     }),
-    persistConfig: deps.persistConfig,
     sendTextReply: commandTargetRuntime.sendTextReply,
     recordRuntimeEvent: deps.recordRuntimeEvent,
   });
@@ -1429,7 +1431,7 @@ export function createTelegramCommandHandler<
     commandName: string | undefined,
     message: TMessage,
     ctx: TContext,
-  ): Promise<boolean> => {
+  ): Promise<boolean | TelegramInboundHandlingOutcome> => {
     return handleTelegramCommandRuntime(commandName, message, ctx, deps);
   };
 }
@@ -1441,24 +1443,26 @@ export function createTelegramCommandOrPromptRuntime<TMessage, TContext>(
     dispatchMessages: async (
       messages: TMessage[],
       ctx: TContext,
-    ): Promise<void> => {
+    ): Promise<TelegramInboundHandlingOutcome> => {
       const firstMessage = messages[0];
-      if (!firstMessage) return;
-      if (deps.shouldIgnoreMessages?.(messages)) return;
+      if (!firstMessage || deps.shouldIgnoreMessages?.(messages)) {
+        return { kind: "completed", reason: "ignored" };
+      }
       const command = parseTelegramCommand(deps.extractRawText(messages));
       const handled = await deps.handleCommand(
         command?.name,
         firstMessage,
         ctx,
       );
-      if (handled) return;
+      if (typeof handled !== "boolean") return handled;
+      if (handled) return { kind: "completed", reason: "command" };
       if (command && deps.executeExtensionCommand) {
-        const handledByExtension = await deps.executeExtensionCommand(
+        const extensionOutcome = await deps.executeExtensionCommand(
           command,
           messages[0]!,
           ctx,
         );
-        if (handledByExtension) return;
+        if (extensionOutcome) return extensionOutcome;
       }
       if (command?.name && deps.expandPromptTemplateCommand) {
         const expanded = deps.expandPromptTemplateCommand(
@@ -1466,17 +1470,16 @@ export function createTelegramCommandOrPromptRuntime<TMessage, TContext>(
           command.args,
         );
         if (expanded !== undefined) {
-          await deps.enqueueTurn(
+          return deps.enqueueTurn(
             [
               deps.replaceMessageText(firstMessage, expanded),
               ...messages.slice(1),
             ],
             ctx,
           );
-          return;
         }
       }
-      await deps.enqueueTurn(messages, ctx);
+      return deps.enqueueTurn(messages, ctx);
     },
   };
 }
@@ -1489,7 +1492,7 @@ async function handleTelegramCommandRuntime<
   message: TMessage,
   ctx: TContext,
   deps: TelegramCommandRuntimeDeps<TMessage, TContext>,
-): Promise<boolean> {
+): Promise<boolean | TelegramInboundHandlingOutcome> {
   const sendReplyFor = (nextMessage: TMessage) => (text: string) =>
     deps.sendTextReply(nextMessage, text);
   const updateStatusFor = (commandCtx: TContext) => () =>
@@ -1537,11 +1540,10 @@ async function handleTelegramCommandRuntime<
           sendTextReply: sendReplyFor(nextMessage),
         });
       },
-      handleContinue: async (nextMessage, commandCtx) => {
-        await handleTelegramContinueCommand(nextMessage, commandCtx, {
+      handleContinue: (nextMessage, commandCtx) =>
+        handleTelegramContinueCommand(nextMessage, commandCtx, {
           enqueueContinueTurn: deps.enqueueContinueTurn,
-        });
-      },
+        }),
       handleQueue: async (nextMessage, commandCtx) => {
         await deps.openQueueMenu(nextMessage, commandCtx);
       },
@@ -1610,18 +1612,6 @@ async function handleTelegramCommandRuntime<
             nextMessage,
             `Warning: failed to register bot commands menu: ${errorMessage}`,
           );
-        }
-        if (
-          nextMessage.from?.id !== undefined &&
-          canPairTelegramUserFromCommandMessage(nextMessage)
-        ) {
-          await pairTelegramUserIfNeeded(nextMessage.from.id, {
-            allowedUserId: deps.getAllowedUserId(),
-            ctx: undefined,
-            setAllowedUserId: deps.setAllowedUserId,
-            persistConfig: deps.persistConfig,
-            updateStatus: updateStatusFor(commandCtx),
-          });
         }
         const forumBootstrapMessage =
           nextCommandName === "start"

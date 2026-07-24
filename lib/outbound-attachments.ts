@@ -11,8 +11,9 @@ import { Type } from "@sinclair/typebox";
 
 import type { ExtensionAPI } from "./pi.ts";
 import {
-  buildTelegramMultipartReplyParameters,
   normalizeTelegramNativeMarkdown,
+  reserveTelegramReplyParameters,
+  type TelegramReplyParametersReservation,
 } from "./replies.ts";
 import {
   getTelegramTargetThreadParams,
@@ -110,12 +111,15 @@ class TelegramRichAttachmentCommitUnknownError extends Error {
   }
 }
 
-function isTelegramRichAttachmentCommitUnknownError(error: unknown): boolean {
+export function isTelegramRichAttachmentCommitUnknownError(
+  error: unknown,
+): boolean {
   return (
     error instanceof TelegramRichAttachmentCommitUnknownError ||
     (typeof error === "object" &&
       error !== null &&
-      (error as { kind?: unknown }).kind === "commit-unknown")
+      "kind" in error &&
+      Reflect.get(error, "kind") === "commit-unknown")
   );
 }
 
@@ -137,6 +141,27 @@ export interface TelegramRichOutboundAttachmentSenderDeps extends TelegramOutbou
   }) => void;
 }
 
+export type TelegramRichOutboundAttachmentMediaKind =
+  | "photo"
+  | "video"
+  | "audio";
+
+export function getTelegramRichOutboundAttachmentMediaKind(
+  path: string,
+): TelegramRichOutboundAttachmentMediaKind | undefined {
+  const normalized = path.toLowerCase();
+  if (
+    normalized.endsWith(".jpg") ||
+    normalized.endsWith(".jpeg") ||
+    normalized.endsWith(".png")
+  ) {
+    return "photo";
+  }
+  if (normalized.endsWith(".mp4")) return "video";
+  if (normalized.endsWith(".mp3")) return "audio";
+  return undefined;
+}
+
 export function planTelegramRichOutboundAttachment(options: {
   turn: TelegramQueuedOutboundAttachmentTurnView;
   markdown: string;
@@ -147,16 +172,7 @@ export function planTelegramRichOutboundAttachment(options: {
   if (!options.markdown.trim()) return undefined;
   if (options.turn.queuedAttachments.length !== 1) return undefined;
   const attachment = options.turn.queuedAttachments[0]!;
-  const normalizedPath = attachment.path.toLowerCase();
-  const mediaType = normalizedPath.endsWith(".jpg") ||
-      normalizedPath.endsWith(".jpeg") ||
-      normalizedPath.endsWith(".png")
-    ? "photo"
-    : normalizedPath.endsWith(".mp4")
-      ? "video"
-      : normalizedPath.endsWith(".mp3")
-        ? "audio"
-        : undefined;
+  const mediaType = getTelegramRichOutboundAttachmentMediaKind(attachment.path);
   if (!mediaType) return undefined;
   const mediaId = "artifact";
   const richMessage = {
@@ -282,7 +298,7 @@ interface TelegramGuestStagingMessage {
   voice?: { file_id?: string };
 }
 
-function isTelegramOutboundPhotoAttachmentPath(path: string): boolean {
+export function isTelegramOutboundPhotoAttachmentPath(path: string): boolean {
   const normalized = path.toLowerCase();
   return (
     normalized.endsWith(".jpg") ||
@@ -293,7 +309,7 @@ function isTelegramOutboundPhotoAttachmentPath(path: string): boolean {
   );
 }
 
-function getTelegramGuestAttachmentTransport(path: string): {
+export function getTelegramGuestAttachmentTransport(path: string): {
   method: "sendDocument" | "sendPhoto" | "sendAudio" | "sendVoice";
   fileField: "document" | "photo" | "audio" | "voice";
 } {
@@ -336,7 +352,7 @@ function formatTelegramOutboundMessageToolResultText(chatId: number): string {
   return ["", `Sent Telegram message to ${chatId}.`].join("\n");
 }
 
-function getTelegramMultipartTargetFields(
+export function getTelegramMultipartTargetFields(
   target: TelegramTarget | undefined,
 ): Record<string, string> {
   if (!target) return {};
@@ -536,6 +552,108 @@ export function registerTelegramOutboundMessageTool(
       }
     },
   });
+}
+
+export interface TelegramOutboundBinaryReplyUnitOptions {
+  method: "sendRichMessage" | "sendPhoto" | "sendDocument" | "sendVoice";
+  chatId: number;
+  target?: TelegramTarget;
+  replyToMessageId?: number;
+  replyMarkup?: unknown;
+  bytes: Uint8Array;
+  fileName: string;
+  mediaKind: TelegramRichOutboundAttachmentMediaKind | "document" | "voice";
+  caption?: string;
+}
+
+export interface TelegramOutboundBinaryReplyUnitDeps {
+  sendMultipartBytes: (
+    method: string,
+    fields: Record<string, string>,
+    fileField: string,
+    bytes: Uint8Array,
+    fileName: string,
+  ) => Promise<unknown>;
+}
+
+export interface TelegramOutboundBinaryReplyUnitReceipt {
+  method: "sendRichMessage" | "sendPhoto" | "sendDocument" | "sendVoice";
+  messageId: number;
+}
+
+function readTelegramMutationMessageId(result: unknown): number {
+  if (typeof result !== "object" || result === null || !("message_id" in result)) {
+    throw new TelegramRichAttachmentCommitUnknownError(
+      new Error("Successful Telegram upload omitted message_id."),
+    );
+  }
+  const messageId = Reflect.get(result, "message_id");
+  if (
+    typeof messageId !== "number" ||
+    !Number.isSafeInteger(messageId) ||
+    messageId <= 0
+  ) {
+    throw new TelegramRichAttachmentCommitUnknownError(
+      new Error("Successful Telegram upload returned an invalid message_id."),
+    );
+  }
+  return messageId;
+}
+
+/** Sends exactly one verified-byte multipart reply mutation. */
+export async function sendTelegramOutboundBinaryReplyUnit(
+  options: TelegramOutboundBinaryReplyUnitOptions,
+  deps: TelegramOutboundBinaryReplyUnitDeps,
+): Promise<TelegramOutboundBinaryReplyUnitReceipt> {
+  const replyParameters = options.replyToMessageId !== undefined &&
+      options.replyToMessageId > 0
+    ? JSON.stringify({
+        message_id: options.replyToMessageId,
+        allow_sending_without_reply: true,
+      })
+    : undefined;
+  const fields: Record<string, string> = {
+    chat_id: String(options.chatId),
+    ...getTelegramMultipartTargetFields(options.target),
+    ...(replyParameters ? { reply_parameters: replyParameters } : {}),
+    ...(options.replyMarkup
+      ? { reply_markup: JSON.stringify(options.replyMarkup) }
+      : {}),
+  };
+  let fileField: string;
+  if (options.method === "sendRichMessage") {
+    const mediaId = "artifact";
+    fields.rich_message = JSON.stringify({
+      markdown: `${options.caption ?? ""}\n\n![](tg://${options.mediaKind}?id=${mediaId})`,
+      media: [{
+        id: mediaId,
+        media: {
+          type: options.mediaKind,
+          media: "attach://rich_media_upload",
+        },
+      }],
+      skip_entity_detection: true,
+    });
+    fileField = "rich_media_upload";
+  } else {
+    fileField = options.method === "sendPhoto"
+      ? "photo"
+      : options.method === "sendVoice"
+        ? "voice"
+        : "document";
+    if (options.caption !== undefined) fields.caption = options.caption;
+  }
+  const result = await deps.sendMultipartBytes(
+    options.method,
+    fields,
+    fileField,
+    options.bytes,
+    options.fileName,
+  );
+  return {
+    method: options.method,
+    messageId: readTelegramMutationMessageId(result),
+  };
 }
 
 export interface TelegramQueuedOutboundAttachmentDeliveryDeps {
@@ -859,6 +977,7 @@ export async function sendQueuedTelegramOutboundAttachments(
   deps: TelegramQueuedOutboundAttachmentDeliveryDeps,
 ): Promise<void> {
   for (const attachment of turn.queuedAttachments) {
+    let reservation: TelegramReplyParametersReservation | undefined;
     try {
       if (deps.maxAttachmentSizeBytes !== undefined) {
         const stats = await (deps.statPath ?? stat)(attachment.path);
@@ -874,7 +993,7 @@ export async function sendQueuedTelegramOutboundAttachments(
       const isPhoto = isTelegramOutboundPhotoAttachmentPath(attachment.path);
       const method = isPhoto ? "sendPhoto" : "sendDocument";
       const fieldName = isPhoto ? "photo" : "document";
-      const replyParameters = buildTelegramMultipartReplyParameters(
+      reservation = reserveTelegramReplyParameters(
         turn.chatId,
         turn.replyToMessageId,
         turn.target,
@@ -883,14 +1002,18 @@ export async function sendQueuedTelegramOutboundAttachments(
         method,
         {
           chat_id: String(turn.chatId),
-          ...(replyParameters ? { reply_parameters: replyParameters } : {}),
+          ...(reservation.multipartParameters
+            ? { reply_parameters: reservation.multipartParameters }
+            : {}),
           ...getTelegramMultipartTargetFields(turn.target),
         },
         fieldName,
         attachment.path,
         attachment.fileName,
       );
+      reservation.confirm();
     } catch (error) {
+      reservation?.releaseKnownFailure(error);
       const message = error instanceof Error ? error.message : String(error);
       deps.recordRuntimeEvent?.("attachment", error, {
         fileName: attachment.fileName,

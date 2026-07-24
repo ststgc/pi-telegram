@@ -216,6 +216,12 @@ export function createTelegramSessionGenerationFence(
 }
 
 export interface TelegramBridgeSessionServiceRuntime {
+  recovery: {
+    onSessionStart(
+      event: SessionStartEvent,
+      ctx: ExtensionContext,
+    ): Promise<void>;
+  };
   resumeGroupedInput(ctx: ExtensionContext): void;
   suspendGroupedInput(): void;
   delivery: {
@@ -273,8 +279,27 @@ export function createTelegramBridgeSessionLifecycleAssembly<
     stopPolling: suspendForReplacement,
     clearPendingMediaGroups: deps.services.suspendGroupedInput,
   });
-  const servicesLifecycle = appendTelegramLifecycleHooks(
+  const followerLifecycle = appendTelegramLifecycleHooks(
     queueLifecycle,
+    {
+      onSessionStart: BusFollower.createTelegramBusFollowerSessionRefreshHook({
+        registrationState: deps.follower.registrationState,
+        registrationRuntime: deps.follower.registrationRuntime,
+        getLeaderState: deps.follower.getLeaderState,
+        isSessionActive,
+        updateStatus: deps.follower.updateStatus,
+        recordRuntimeEvent: deps.follower.recordRuntimeEvent,
+      }),
+    },
+    isSessionActive,
+  );
+  const recoveryLifecycle = appendTelegramLifecycleHooks(
+    followerLifecycle,
+    { onSessionStart: deps.services.recovery.onSessionStart },
+    isSessionActive,
+  );
+  const servicesLifecycle = appendTelegramLifecycleHooks(
+    recoveryLifecycle,
     {
       async onSessionStart(event, ctx) {
         deps.services.resumeGroupedInput(ctx);
@@ -291,23 +316,9 @@ export function createTelegramBridgeSessionLifecycleAssembly<
     },
     isSessionActive,
   );
-  const followerLifecycle = appendTelegramLifecycleHooks(
-    servicesLifecycle,
-    {
-      onSessionStart: BusFollower.createTelegramBusFollowerSessionRefreshHook({
-        registrationState: deps.follower.registrationState,
-        registrationRuntime: deps.follower.registrationRuntime,
-        getLeaderState: deps.follower.getLeaderState,
-        isSessionActive,
-        updateStatus: deps.follower.updateStatus,
-        recordRuntimeEvent: deps.follower.recordRuntimeEvent,
-      }),
-    },
-    isSessionActive,
-  );
   return createTelegramSessionGenerationFence(
     deps.contextStore,
-    followerLifecycle,
+    servicesLifecycle,
   );
 }
 

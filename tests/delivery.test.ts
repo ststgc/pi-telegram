@@ -499,6 +499,52 @@ test("Bridge delivery runtime rejects work after transport generation replacemen
   assert.equal(apiCalls, 0);
 });
 
+test("Bridge delivery runtime distinguishes authority loss after mutation start", async () => {
+  let transportActive = true;
+  let apiCalls = 0;
+  let ownershipCalls = 0;
+  const runtime = createTelegramBridgeDeliveryRuntime({
+    generation: "generation-one",
+    isTransportActive: () => transportActive,
+    getTargetPolicyView: () => ({
+      canDeliver: true,
+      ownsDirect: true,
+      allowedChatId: 42,
+      leaderTarget: target,
+    }),
+    getActiveTurnTarget: () => target,
+    api: {
+      async sendMessage() {
+        apiCalls += 1;
+        transportActive = false;
+        return { message_id: 101 };
+      },
+      async editMessageText() {
+        return "edited";
+      },
+      async deleteMessage() {},
+      async sendChatAction() {
+        return true;
+      },
+    },
+    recordOwnership() {
+      ownershipCalls += 1;
+    },
+  });
+
+  const result = await runtime.sendView(
+    { text: "racing authority" },
+    { scope: { kind: "instance" } },
+  );
+  assert.deepEqual(result, {
+    ok: false,
+    reason: "commit-unknown",
+    message: "Telegram delivery send may have committed before transport failed.",
+  });
+  assert.equal(apiCalls, 1);
+  assert.equal(ownershipCalls, 0);
+});
+
 test("Concrete delivery runtime resolves scopes and rejects unauthorized targets", async () => {
   const { runtime, events } = createConcreteRuntimeHarness();
   const sent = await runtime.sendView(

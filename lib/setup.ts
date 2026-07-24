@@ -19,7 +19,26 @@ export interface TelegramBotTokenPromptSpec {
 
 export interface TelegramSetupUser {
   id: number;
+  is_bot: boolean;
+  first_name: string;
   username?: string;
+}
+
+export function isValidTelegramBotIdentity(
+  value: unknown,
+): value is TelegramSetupUser {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const user = value as Record<string, unknown>;
+  return (
+    Number.isSafeInteger(user.id) &&
+    (user.id as number) > 0 &&
+    user.is_bot === true &&
+    typeof user.first_name === "string" &&
+    user.first_name.trim().length > 0 &&
+    (user.username === undefined ||
+      (typeof user.username === "string" &&
+        /^[A-Za-z][A-Za-z0-9_]{0,31}$/u.test(user.username)))
+  );
 }
 
 export interface TelegramPollingStartResult {
@@ -44,6 +63,7 @@ export interface TelegramSetupDeps {
     description?: string;
   }>;
   persistConfig: (config: TelegramSetupConfig) => Promise<void>;
+  getPairingInstructions?: () => Promise<string | undefined>;
   notify: (message: string, level: "info" | "error") => void;
   startPolling: () => unknown | Promise<unknown>;
   updateStatus: () => void;
@@ -72,6 +92,7 @@ export interface TelegramSetupPromptRuntimeDeps<
   setupGuard: TelegramSetupGuard;
   getMe: TelegramSetupDeps["getMe"];
   persistConfig: (config: TelegramSetupConfig) => Promise<void>;
+  getPairingInstructions?: () => Promise<string | undefined>;
   startPolling: (ctx: TContext) => unknown | Promise<unknown>;
   updateStatus: (ctx: TContext) => void;
   recordRuntimeEvent?: (
@@ -135,10 +156,11 @@ export async function runTelegramSetup(
     tokenPrompt.method === "editor"
       ? await deps.promptEditor("Telegram bot token", tokenPrompt.value)
       : await deps.promptInput("Telegram bot token", tokenPrompt.value);
-  if (!token) return { status: "cancelled" };
+  const configuredToken = token?.trim();
+  if (!configuredToken) return { status: "cancelled" };
   const nextConfig: TelegramSetupConfig = {
     ...deps.config,
-    botToken: token.trim(),
+    botToken: configuredToken,
   };
   let data: Awaited<ReturnType<TelegramSetupDeps["getMe"]>>;
   try {
@@ -148,7 +170,7 @@ export async function runTelegramSetup(
     deps.notify(`Telegram API check failed: ${message}`, "error");
     return { status: "validation-failed" };
   }
-  if (!data.ok || !data.result) {
+  if (data.ok !== true || !isValidTelegramBotIdentity(data.result)) {
     deps.notify(data.description || "Invalid Telegram bot token", "error");
     return { status: "validation-failed" };
   }
@@ -159,10 +181,8 @@ export async function runTelegramSetup(
     `Telegram bot connected: @${nextConfig.botUsername ?? "unknown"}`,
     "info",
   );
-  deps.notify(
-    "Send /start to your bot in Telegram to pair this extension with your account.",
-    "info",
-  );
+  const pairingInstructions = await deps.getPairingInstructions?.();
+  if (pairingInstructions) deps.notify(pairingInstructions, "info");
   let startResult: unknown;
   try {
     startResult = await deps.startPolling();
@@ -206,6 +226,7 @@ export function createTelegramSetupPromptRuntime<
             throw error;
           }
         },
+        getPairingInstructions: deps.getPairingInstructions,
         notify: (message, level) => ctx.ui.notify(message, level),
         startPolling: () => deps.startPolling(ctx),
         updateStatus: () => deps.updateStatus(ctx),

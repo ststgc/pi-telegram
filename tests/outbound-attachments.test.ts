@@ -13,12 +13,17 @@ import {
   createTelegramQueuedOutboundAttachmentSender,
   createTelegramRichOutboundAttachmentSender,
   deliverTelegramGuestCachedAttachment,
+  getTelegramGuestAttachmentTransport,
   getTelegramOutboundAttachmentByteLimitFromEnv,
+  getTelegramRichOutboundAttachmentMediaKind,
+  isTelegramOutboundPhotoAttachmentPath,
+  isTelegramRichAttachmentCommitUnknownError,
   planTelegramRichOutboundAttachment,
   queueTelegramOutboundAttachments,
   registerTelegramOutboundAttachmentTool,
   registerTelegramOutboundMessageTool,
   sendQueuedTelegramOutboundAttachments,
+  sendTelegramOutboundBinaryReplyUnit,
   sendTelegramOutboundFiles,
   sendTelegramOutboundMessage,
   TELEGRAM_OUTBOUND_ATTACHMENT_DEFAULT_MAX_BYTES,
@@ -61,6 +66,22 @@ type RegisteredAnyTool = {
     params: Record<string, unknown>,
   ) => Promise<unknown>;
 };
+
+test("Outbound attachment classifiers preserve Rich, ordinary, and Guest transports", () => {
+  assert.equal(getTelegramRichOutboundAttachmentMediaKind("report.PNG"), "photo");
+  assert.equal(getTelegramRichOutboundAttachmentMediaKind("clip.mp4"), "video");
+  assert.equal(getTelegramRichOutboundAttachmentMediaKind("audio.mp3"), "audio");
+  assert.equal(getTelegramRichOutboundAttachmentMediaKind("notes.txt"), undefined);
+  assert.equal(isTelegramOutboundPhotoAttachmentPath("animation.GIF"), true);
+  assert.deepEqual(getTelegramGuestAttachmentTransport("voice.opus"), {
+    method: "sendVoice",
+    fileField: "voice",
+  });
+  assert.deepEqual(getTelegramGuestAttachmentTransport("archive.zip"), {
+    method: "sendDocument",
+    fileField: "document",
+  });
+});
 
 test("Rich outbound attachment planner builds one target-scoped media result", () => {
   const turn = {
@@ -177,6 +198,69 @@ test("Rich outbound attachment sender records exact message ownership", async ()
   assert.deepEqual(ownership, [
     { chatId: 1, messageId: 91, target: { chatId: 1, threadId: 42 } },
   ]);
+});
+
+test("binary reply unit uses verified bytes in exactly one multipart mutation", async () => {
+  const calls: unknown[] = [];
+  assert.deepEqual(
+    await sendTelegramOutboundBinaryReplyUnit(
+      {
+        method: "sendRichMessage",
+        chatId: 1,
+        target: createTelegramThreadTarget(1, 42),
+        replyToMessageId: 2,
+        replyMarkup: {
+          inline_keyboard: [[{ text: "Open", callback_data: "open" }]],
+        },
+        bytes: Buffer.from("verified image"),
+        fileName: "result.png",
+        mediaKind: "photo",
+        caption: "Result",
+      },
+      {
+        sendMultipartBytes: async (...args) => {
+          calls.push(args);
+          return { message_id: 77 };
+        },
+      },
+    ),
+    { method: "sendRichMessage", messageId: 77 },
+  );
+  assert.equal(calls.length, 1);
+  const [method, fields, fileField, bytes, fileName] = calls[0] as [
+    string,
+    Record<string, string>,
+    string,
+    Uint8Array,
+    string,
+  ];
+  assert.equal(method, "sendRichMessage");
+  assert.equal(fields.message_thread_id, "42");
+  assert.equal(fields.reply_parameters, JSON.stringify({
+    message_id: 2,
+    allow_sending_without_reply: true,
+  }));
+  assert.equal(fields.reply_markup, JSON.stringify({
+    inline_keyboard: [[{ text: "Open", callback_data: "open" }]],
+  }));
+  assert.match(fields.rich_message ?? "", /attach:\/\/rich_media_upload/);
+  assert.equal(fileField, "rich_media_upload");
+  assert.equal(Buffer.from(bytes).toString(), "verified image");
+  assert.equal(fileName, "result.png");
+
+  await assert.rejects(
+    sendTelegramOutboundBinaryReplyUnit(
+      {
+        method: "sendVoice",
+        chatId: 1,
+        bytes: Buffer.from("voice"),
+        fileName: "voice.ogg",
+        mediaKind: "voice",
+      },
+      { sendMultipartBytes: async () => ({ ok: true }) },
+    ),
+    isTelegramRichAttachmentCommitUnknownError,
+  );
 });
 
 test("Rich outbound attachment sender falls back only after known failure", async () => {

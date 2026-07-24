@@ -9,6 +9,10 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { TelegramAssistantSegmentEvent } from "./activity.ts";
+import {
+  claimTelegramOperationOwnedPrivateFile,
+  type TelegramOperationOwnedPrivateFile,
+} from "./operation-files.ts";
 import { resolveTelegramTempDir } from "./paths.ts";
 import * as Replies from "./replies.ts";
 import type {
@@ -29,6 +33,7 @@ import {
 } from "./outbound-markup.ts";
 import { createTelegramVoiceReplySender as createTelegramVoiceReplySenderWithPorts } from "./outbound-voice.ts";
 import type { TelegramTarget } from "./target.ts";
+import * as Voice from "./voice.ts";
 
 const OUTBOUND_HANDLER_REGISTRY_KEY = "__piTelegramOutboundHandlers__";
 const VOICE_EVENT_RECORDER_KEY = "__piTelegramVoiceEventRecorder__";
@@ -152,8 +157,14 @@ export type TelegramOutboundProgrammaticHandler = (
   options?: { lang?: string; rate?: string },
 ) => Promise<string>;
 
+interface TelegramOutboundProgrammaticHandlerEntry {
+  id: string;
+  handler: TelegramOutboundProgrammaticHandler;
+}
+
 export interface TelegramOutboundHandlerRegistry {
-  handlers: Map<string, TelegramOutboundProgrammaticHandler[]>;
+  handlers: Map<string, TelegramOutboundProgrammaticHandlerEntry[]>;
+  nextId: number;
 }
 
 // --- Programmatic Outbound Handler Registry Runtime ---
@@ -169,10 +180,13 @@ function getOrCreateOutboundHandlerRegistry(): TelegramOutboundHandlerRegistry {
     "handlers" in existing &&
     existing.handlers instanceof Map
   ) {
-    return existing as TelegramOutboundHandlerRegistry;
+    const registry = existing as TelegramOutboundHandlerRegistry;
+    if (!Number.isSafeInteger(registry.nextId)) registry.nextId = 0;
+    return registry;
   }
   const registry: TelegramOutboundHandlerRegistry = {
     handlers: new Map(),
+    nextId: 0,
   };
   (globalThis as Record<string, unknown>)[OUTBOUND_HANDLER_REGISTRY_KEY] =
     registry;
@@ -185,11 +199,12 @@ export function registerTelegramOutboundHandler(
 ): () => void {
   const registry = getOrCreateOutboundHandlerRegistry();
   const list = registry.handlers.get(kind) ?? [];
-  list.push(handler);
+  const entry = { id: `outbound-${kind}-${registry.nextId++}`, handler };
+  list.push(entry);
   registry.handlers.set(kind, list);
   return () => {
     const updated = registry.handlers.get(kind) ?? [];
-    const index = updated.indexOf(handler);
+    const index = updated.indexOf(entry);
     if (index !== -1) {
       updated.splice(index, 1);
       registry.handlers.set(kind, updated);
@@ -200,6 +215,13 @@ export function registerTelegramOutboundHandler(
 export function getTelegramOutboundProgrammaticHandlers(
   kind: string,
 ): TelegramOutboundProgrammaticHandler[] {
+  const registry = getOrCreateOutboundHandlerRegistry();
+  return [...(registry.handlers.get(kind) ?? [])].map((entry) => entry.handler);
+}
+
+function getTelegramOutboundProgrammaticHandlerEntries(
+  kind: string,
+): TelegramOutboundProgrammaticHandlerEntry[] {
   const registry = getOrCreateOutboundHandlerRegistry();
   return [...(registry.handlers.get(kind) ?? [])];
 }
@@ -453,6 +475,11 @@ function getDefaultTelegramVoiceTempDir(): string {
   return resolveTelegramTempDir();
 }
 
+interface TelegramGeneratedVoiceReplySource {
+  path: string;
+  operationFile?: TelegramOperationOwnedPrivateFile;
+}
+
 async function generateTelegramVoiceReplyFileWithHandler(
   text: string,
   options: {
@@ -464,14 +491,25 @@ async function generateTelegramVoiceReplyFileWithHandler(
     timeout: number;
     execCommand: TelegramVoiceReplySenderDeps["execCommand"];
   },
-): Promise<string> {
-  await mkdir(options.tempDir, { recursive: true });
+): Promise<TelegramGeneratedVoiceReplySource> {
+  await mkdir(options.tempDir, { recursive: true, mode: 0o700 });
   const artifactId = randomUUID();
   const values = getVoiceReplyTemplateValues(text, {
     lang: options.lang,
     rate: options.rate,
     mp3Path: join(options.tempDir, `${artifactId}-voice.mp3`),
     oggPath: join(options.tempDir, `${artifactId}-voice.ogg`),
+  });
+  const finish = (path: string): TelegramGeneratedVoiceReplySource => ({
+    path,
+    ...(path === values.mp3 || path === values.ogg
+      ? {
+          operationFile: claimTelegramOperationOwnedPrivateFile(
+            path,
+            path.split(/[\\/]/u).at(-1) ?? "voice.ogg",
+          ),
+        }
+      : {}),
   });
   const steps = getTelegramVoiceHandlerCompositionSteps(options.handler);
   if (steps.length > 0) {
@@ -500,7 +538,7 @@ async function generateTelegramVoiceReplyFileWithHandler(
         stdout = "";
       }
     }
-    return getVoiceReplyOutputPath(options.handler, values, stdout);
+    return finish(getVoiceReplyOutputPath(options.handler, values, stdout));
   }
   const result = await runVoiceReplyCommand(
     "Outbound voice template",
@@ -513,7 +551,31 @@ async function generateTelegramVoiceReplyFileWithHandler(
       stdin: text,
     },
   );
-  return getVoiceReplyOutputPath(options.handler, values, result.stdout);
+  return finish(getVoiceReplyOutputPath(options.handler, values, result.stdout));
+}
+
+async function generateTelegramVoiceReplySource(
+  text: string,
+  options: {
+    lang?: string;
+    rate?: string;
+    handler?: TelegramOutboundHandlerConfig;
+    tempDir?: string;
+    cwd?: string;
+    execCommand: TelegramVoiceReplySenderDeps["execCommand"];
+  },
+): Promise<TelegramGeneratedVoiceReplySource | undefined> {
+  const handler = options.handler;
+  if (!handler?.template) return undefined;
+  return generateTelegramVoiceReplyFileWithHandler(text, {
+    lang: options.lang,
+    rate: options.rate,
+    handler,
+    tempDir: options.tempDir ?? getDefaultTelegramVoiceTempDir(),
+    cwd: options.cwd ?? process.cwd(),
+    timeout: getVoiceReplyTimeout(handler),
+    execCommand: options.execCommand,
+  });
 }
 
 export async function generateTelegramVoiceReplyFile(
@@ -527,17 +589,7 @@ export async function generateTelegramVoiceReplyFile(
     execCommand: TelegramVoiceReplySenderDeps["execCommand"];
   },
 ): Promise<string | undefined> {
-  const handler = options.handler;
-  if (!handler?.template) return undefined;
-  return generateTelegramVoiceReplyFileWithHandler(text, {
-    lang: options.lang,
-    rate: options.rate,
-    handler,
-    tempDir: options.tempDir ?? getDefaultTelegramVoiceTempDir(),
-    cwd: options.cwd ?? process.cwd(),
-    timeout: getVoiceReplyTimeout(handler),
-    execCommand: options.execCommand,
-  });
+  return (await generateTelegramVoiceReplySource(text, options))?.path;
 }
 
 function getOutboundTextTemplateValues(text: string): Record<string, string> {
@@ -765,6 +817,188 @@ export interface TelegramOutboundReplyPlan<TReplyMarkup = unknown> {
   rate?: string;
 }
 
+export interface TelegramDurableOutboundButton {
+  label: string;
+  prompt: string;
+}
+
+export interface TelegramDurableOutboundReplyPlan {
+  markdown: string;
+  buttons: TelegramDurableOutboundButton[];
+  voiceReplies: TelegramVoiceReplyItem[];
+  voiceText?: string;
+  lang?: string;
+  rate?: string;
+  automaticVoice: boolean;
+}
+
+/**
+ * Produce the semantic reply plan stored by durable outbound recovery. Unlike
+ * the live reply planner, this does not register ephemeral callback tokens.
+ */
+export function planTelegramDurableOutboundReply(
+  markdown: string,
+  options: { automaticVoice?: boolean } = {},
+): TelegramDurableOutboundReplyPlan {
+  const buttons: TelegramDurableOutboundButton[] = [];
+  const buttonReply = planTelegramButtonReply(markdown, {
+    registerAction: (action) => {
+      buttons.push({ label: action.text, prompt: action.prompt });
+      return `durable-button-${buttons.length}`;
+    },
+  });
+  const explicitVoice = planTelegramVoiceReply(buttonReply.markdown);
+  const explicitReplies = explicitVoice.voiceReplies ?? [];
+  const automaticText = explicitVoice.markdown.trim();
+  if (
+    options.automaticVoice === true &&
+    explicitReplies.length === 0 &&
+    automaticText
+  ) {
+    return {
+      markdown: "",
+      buttons,
+      voiceReplies: [{ text: automaticText }],
+      voiceText: automaticText,
+      automaticVoice: true,
+    };
+  }
+  return {
+    markdown: explicitVoice.markdown,
+    buttons,
+    voiceReplies: explicitReplies,
+    ...(explicitVoice.voiceText ? { voiceText: explicitVoice.voiceText } : {}),
+    ...(explicitVoice.lang ? { lang: explicitVoice.lang } : {}),
+    ...(explicitVoice.rate ? { rate: explicitVoice.rate } : {}),
+    automaticVoice: false,
+  };
+}
+
+export interface TelegramDurableGeneratedVoiceSource {
+  path: string;
+  fileName: string;
+  caption?: string;
+  cleanup?: () => void | Promise<void>;
+}
+
+export interface TelegramDurableVoiceGenerationDeps {
+  execCommand: TelegramVoiceReplySenderDeps["execCommand"];
+  getHandlers?: () => unknown[] | undefined;
+  cwd?: string;
+  tempDir?: string;
+  recordRuntimeEvent?: TelegramVoiceReplySenderDeps["recordRuntimeEvent"];
+}
+
+function readTelegramVoiceProviderSource(
+  result: Exclude<Voice.TelegramVoiceSynthesisProviderResult, undefined>,
+): { path: string; caption?: string; cleanup?: () => void | Promise<void> } {
+  return typeof result === "string"
+    ? { path: result }
+    : {
+        path: result.audioPath,
+        ...(result.transcriptText ? { caption: result.transcriptText } : {}),
+        ...(result.cleanup ? { cleanup: result.cleanup } : {}),
+      };
+}
+
+/**
+ * Generates one durable source per semantic voice reply using the same provider
+ * precedence as live delivery. It performs no Telegram mutation.
+ */
+export async function generateTelegramDurableVoiceSources(
+  reply: TelegramDurableOutboundReplyPlan,
+  deps: TelegramDurableVoiceGenerationDeps,
+): Promise<TelegramDurableGeneratedVoiceSource[]> {
+  const sources: TelegramDurableGeneratedVoiceSource[] = [];
+  for (const item of reply.voiceReplies) {
+    let generated: TelegramDurableGeneratedVoiceSource | undefined;
+    const lang = item.lang ?? reply.lang;
+    const rate = item.rate ?? reply.rate;
+    for (const handler of findTelegramOutboundHandlers(
+      deps.getHandlers?.() as TelegramOutboundHandlerConfig[] | undefined,
+      "voice",
+    )) {
+      try {
+        const source = await generateTelegramVoiceReplySource(item.text, {
+          lang,
+          rate,
+          handler,
+          tempDir: deps.tempDir,
+          cwd: deps.cwd,
+          execCommand: deps.execCommand,
+        });
+        if (source) {
+          generated = {
+            path: source.path,
+            fileName: source.path.split(/[\\/]/u).at(-1) ?? "voice.ogg",
+            ...(source.operationFile
+              ? { cleanup: () => source.operationFile!.cleanup() }
+              : {}),
+          };
+          break;
+        }
+      } catch (error) {
+        deps.recordRuntimeEvent?.("voice", error, {
+          phase: "durable-template-generation",
+        });
+      }
+    }
+    if (!generated) {
+      for (const entry of getTelegramOutboundProgrammaticHandlerEntries("voice")) {
+        try {
+          const path = await entry.handler(item.text, { lang, rate });
+          if (path) {
+            generated = { path, fileName: path.split(/[\\/]/u).at(-1) ?? "voice.ogg" };
+            break;
+          }
+        } catch {
+          deps.recordRuntimeEvent?.(
+            "public-handler",
+            new Error("Public handler failed"),
+            {
+              handlerId: entry.id,
+              handlerCategory: "outbound:voice",
+            },
+          );
+        }
+      }
+    }
+    if (!generated) {
+      for (const entry of Voice.getTelegramVoiceSynthesisProviderEntries()) {
+        if (typeof entry.provider !== "function") continue;
+        try {
+          const result = await entry.provider(item.text, { lang, rate });
+          if (!result) continue;
+          const source = readTelegramVoiceProviderSource(result);
+          generated = {
+            path: source.path,
+            fileName: source.path.split(/[\\/]/u).at(-1) ?? "voice.ogg",
+            ...(source.caption ? { caption: source.caption } : {}),
+            ...(source.cleanup ? { cleanup: source.cleanup } : {}),
+          };
+          break;
+        } catch {
+          deps.recordRuntimeEvent?.(
+            "public-handler",
+            new Error("Public handler failed"),
+            {
+              handlerId: entry.id,
+              handlerCategory: "voice:synthesis",
+            },
+          );
+        }
+      }
+    }
+    if (!generated) {
+      throw new Error(
+        "Failed to generate durable voice reply: every voice synthesis provider failed.",
+      );
+    }
+    sources.push(generated);
+  }
+  return sources;
+}
+
 // --- Voice Policy Re-Exports ---
 export {
   clearTelegramVoiceSynthesisProviders,
@@ -798,17 +1032,26 @@ export function createTelegramVoiceReplySender(
         handlers as TelegramOutboundHandlerConfig[] | undefined,
         "voice",
       ),
-    generateVoiceFile: (text, options) =>
-      generateTelegramVoiceReplyFile(text, {
+    generateVoiceFile: async (text, options) => {
+      const source = await generateTelegramVoiceReplySource(text, {
         lang: options.lang,
         rate: options.rate,
         handler: options.handler,
         tempDir: options.tempDir,
         cwd: options.cwd,
         execCommand: options.execCommand,
-      }),
-    getProgrammaticVoiceHandlers: () =>
-      getTelegramOutboundProgrammaticHandlers("voice"),
+      });
+      return source
+        ? {
+            path: source.path,
+            ...(source.operationFile
+              ? { cleanup: () => source.operationFile!.cleanup() }
+              : {}),
+          }
+        : undefined;
+    },
+    getProgrammaticVoiceHandlerEntries: () =>
+      getTelegramOutboundProgrammaticHandlerEntries("voice"),
   });
 }
 

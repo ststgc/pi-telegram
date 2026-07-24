@@ -42,6 +42,7 @@ export interface TelegramModelMenuState<TModel extends MenuModel = MenuModel> {
     | "model-detail"
     | "thinking"
     | "queue"
+    | "recovery"
     | "settings";
 }
 
@@ -529,10 +530,6 @@ export function buildTelegramModelMenuState<
 >(
   params: BuildTelegramModelMenuStateParams<TModel>,
 ): TelegramModelMenuState<TModel> {
-  const allModels = sortScopedModels(
-    params.availableModels.map((model) => ({ model })),
-    params.activeModel,
-  );
   const scopedModels =
     params.configuredScopedModelPatterns.length > 0
       ? sortScopedModels(
@@ -543,6 +540,23 @@ export function buildTelegramModelMenuState<
           params.activeModel,
         )
       : [];
+  const scopedByCanonicalId = new Map(
+    scopedModels.map((entry) => [
+      getCanonicalModelId(entry.model).toLowerCase(),
+      entry,
+    ]),
+  );
+  const allModels = sortScopedModels(
+    params.availableModels.map((model) => {
+      const scoped = scopedByCanonicalId.get(
+        getCanonicalModelId(model).toLowerCase(),
+      );
+      return scoped?.thinkingLevel
+        ? { model, thinkingLevel: scoped.thinkingLevel }
+        : { model };
+    }),
+    params.activeModel,
+  );
   let note: string | undefined;
   if (
     params.configuredScopedModelPatterns.length > 0 &&
@@ -557,7 +571,7 @@ export function buildTelegramModelMenuState<
     threadId: params.threadId,
     messageId: 0,
     page: 0,
-    scope: scopedModels.length > 0 ? "scoped" : "all",
+    scope: "all",
     scopedModels,
     allModels,
     note,

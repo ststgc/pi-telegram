@@ -10,21 +10,17 @@ It is a **runtime adapter**, not a remote terminal. Start or supervise work in t
 
 Proactive push is enabled by default. `assistant.proactivePush` projects every completed public assistant text block from local or autonomous work—including visible checkpoints and the final answer—to the authorized Telegram target once and in order; set it explicitly to `false` to disable projection. It never mirrors local prompts, hidden reasoning, tool traffic, token deltas, Telegram-owned turns, or stale-generation work. See [Outbound](docs/outbound.md#proactive-public-output) and the [configuration reference](docs/public-api.md#configuration-api).
 
-This repository is an actively maintained fork of [`badlogic/pi-telegram`](https://github.com/badlogic/pi-telegram). It started from upstream commit [`cb34008`](https://github.com/badlogic/pi-telegram/commit/cb34008460b6c1ca036d92322f69d87f626be0fc) and has since diverged substantially.
+This repository is the independently maintained `ststgc/pi-telegram` fork of [`badlogic/pi-telegram`](https://github.com/badlogic/pi-telegram). Its lineage started from upstream commit [`cb34008`](https://github.com/badlogic/pi-telegram/commit/cb34008460b6c1ca036d92322f69d87f626be0fc), passed through the `llblab` fork, and now develops and releases from this repository as its canonical source.
 
 ## Install
 
-From npm:
+Install from the canonical GitHub repository:
 
 ```bash
-pi install npm:@llblab/pi-telegram
+pi install git:github.com/ststgc/pi-telegram
 ```
 
-From git:
-
-```bash
-pi install git:github.com/llblab/pi-telegram
-```
+The package manifest and public import namespace are `@ststgc/pi-telegram`. This release line is distributed through GitHub rather than npm; no `npm:@ststgc/pi-telegram` publication is claimed.
 
 The 0.21 extension platform requires Pi `0.80.6` or newer. Its Activity API uses the public `agent_settled` lifecycle event to keep retries/continuations under one activity identity and release that identity only after the run fully settles.
 
@@ -57,13 +53,13 @@ The connected Pi instance owns Telegram polling. Use `/telegram-connect <name>` 
 
 ### 4. Pair your Telegram account
 
-Open the bot DM and send:
+When the bot is not yet paired, `/telegram-setup` and `/telegram-connect` display a one-time pairing code only in the local Pi UI. Open the private bot DM and send the exact command shown locally:
 
 ```text
-/start
+/start <code>
 ```
 
-The first Telegram user to message the bot becomes the allowed owner. Other users are ignored.
+The code expires after 10 minutes and is single-use. The bridge stores only a strictly validated salted verifier; the raw code never enters `telegram.json`, diagnostics, status, or public update handlers. Re-running setup/connect in the creating process redisplays the same unexpired code; another process or a restarted runtime reports a pending claim without rotating or revealing it. Proof-shaped updates remain private even if replayed after pairing. Every other update is ignored until pairing succeeds. Existing `allowedUserId` profiles remain paired and do not generate a code.
 
 ## What It Feels Like
 
@@ -110,7 +106,7 @@ The first Telegram user to message the bot becomes the allowed owner. Other user
 | Threaded Mode | Run one leader plus visible follower Pi instances through named private-chat threads. | One bot can host a local multi-instance Pi organism without hidden process spawning. |
 | Reroute and restore | Preserve unknown threads and offer explicit target choices. | Telegram client state can be repaired without silently deleting or hijacking prompts. |
 | Extension sections | Add menu sections, commands, status rows, settings, callbacks, and delivery helpers from companion extensions. | `pi-telegram` becomes a platform surface for other Pi extensions. |
-| Runtime diagnostics | Use `/telegram-status` and recent runtime events for connection, role, queue, transport, and failure evidence. | Debugging lives in the operator surface instead of hidden logs only. |
+| Runtime diagnostics | Use `/telegram-status`, the Recovery submenu, recent runtime events, and append-only profile/instance diagnostic segments for connection, role, queue, transport, durable-work controls, and failure evidence. Pending delivery is a metadata-only aggregate; delivery-uncertain and bus-uncertain work expose only an opaque handle, family, state, and required action. | Debugging and confirmed recovery actions live in the operator surface instead of hidden logs only. |
 | Safety and ownership | Pair one owner, lock transport, scope targets, and reject fake terminal behavior. | Remote access remains explicit, bounded, and understandable. |
 
 ## Core Loop
@@ -161,7 +157,7 @@ Named profile identifiers contain only lowercase ASCII letters and digits (maxim
 
 ### Operator Menu
 
-`/start` opens the Telegram-native control panel: status, prompt-template commands, model selection, thinking level, settings, queue controls, and extension sections. It is the primary Telegram UI; reaction shortcuts are secondary queue affordances.
+`/start` opens the Telegram-native control panel: status, prompt-template commands, model selection, thinking level, settings, queue controls, and extension sections. It is the primary Telegram UI; reaction shortcuts are secondary queue affordances. The model picker opens on all authenticated models by default, with configured scoped models available as an optional view. Pi's terminal `telegram` status key stays clear; connection and runtime diagnostics remain available in this menu and `/telegram-status`.
 
 ### Queue Runtime
 
@@ -169,7 +165,7 @@ Messages sent while Pi is busy become queued turns. Priority lanes support contr
 
 ### Native Rich Markdown
 
-Rich Markdown is the default model-answer membrane. Complete assistant and guest model replies use Telegram's native Rich Message APIs, while tool-call rows, reasoning/thinking blocks, menus, status rows, queue controls, settings, diagnostics, and other harness-owned surfaces use explicit Telegram HTML/plain rendering. This keeps meaningful model-authored answers visually distinct from bridge-owned operational UI. Two Settings controls keep the layers separate: `Draft previews` toggles live `sendRichMessageDraft` frames, while `Assistant rendering` chooses final-answer delivery (`rich` Native Rich Markdown or `html` legacy Markdown-to-HTML).
+Rich Markdown is the default model-answer membrane. Complete assistant and guest model replies use Telegram's native Rich Message APIs, while tool-call rows, reasoning/thinking blocks, menus, status rows, queue controls, settings, diagnostics, and other harness-owned surfaces use explicit Telegram HTML/plain rendering. This keeps meaningful model-authored answers visually distinct from bridge-owned operational UI. Two Settings controls keep the layers separate: `Draft previews` toggles live `sendRichMessageDraft` frames, while `Assistant rendering` chooses final-answer delivery (`rich` Native Rich Markdown or `html` legacy Markdown-to-HTML). A text-only Guest answer that exceeds one inline Rich result is delivered as a complete `full-response.md` document captioned `Full response attached.` instead of truncating the first chunk.
 
 ### Files And Artifacts
 
@@ -241,9 +237,13 @@ Stable public entrypoints are documented in [Public API](./docs/public-api.md), 
 - Replace Pi session lifecycle without an official Pi API.
 - Let non-owner Telegram users control the bridge.
 
-Telegram is a companion surface around a live Pi runtime, not a second runtime. It can compact the current session, but it cannot create, resume, fork, browse, or switch sessions until Pi exposes safe public extension APIs for those operations.
+Telegram is a companion surface around a live Pi runtime, not a second runtime. It can compact the current session, but it cannot create, resume, fork, browse, or switch sessions until Pi exposes safe public extension APIs for those operations. In particular, Telegram `/new` is intentionally unavailable in `0.25.0`; no hidden process, synthetic input, unsafe cast, or raw TTY fallback is used.
 
 A Telegram prompt is a normal model turn in the active Pi session and therefore inherits that session's active post-compaction context; the bridge does not make token cost proportional only to the new mobile message. Current releases keep per-turn guidance small and transient, with detailed bridge instructions available on demand through `telegram_help` instead of persisted in every user turn. Pi session JSONL contains model history; profile-scoped pi-telegram `logs*.jsonl` contains redacted operational events and is never model context.
+
+Durable recovery primitives may retain the minimum full prompt payload and operation-owned attachment spool needed to recover admitted work under the private profile-scoped `tmp/telegram/recovery-v1*` store. Directories use `0700`, files use `0600`, binary references and private rematerialized attachment caches are size- and SHA-256-verified, and each profile has a hard 512 MiB physical-byte quota that includes those caches. Unresolved or uncertain work is never TTL-deleted; retention runs when the runtime opens the store and at a bounded hourly cadence, completed payload compacts after 24 hours, terminal inbound/outbound/bus metadata (including bus dedup) after 7 days within count/full-record-byte bounds, and downgrade quarantine requires zero nonterminal work. The `/start` Recovery submenu exposes collision-checked opaque metadata handles plus profile/mode, unresolved family/state counts, quota use/limit, oldest age, fixed incident labels, and required-action labels only—never retained prompt text, attachment bytes/paths, chat/thread/user ids, target/record/turn ids, tokens, secrets, or filesystem references. Confirmed controls can safely drain replayable work, explicitly retry uncertain inbound work with a duplicate-execution warning, durably discard it, or reassign orphaned work after exact current profile/target/owner/leader-or-follower/session-generation proof. Confirmed downgrade now runs a profile-wide barrier from the current leader: it snapshots every live follower generation, closes admission/forwarding/grouped-input/queue-dispatch gates, waits for all in-flight recovery operations to drain, rechecks every durable family under store-exclusive mode, then atomically quarantines the store and fsyncs its parent. Any unreachable, stale, mismatched, or newly blocked follower/store state aborts before quarantine; a pre-quarantine failure cancels only an exclusive mode this attempt actually changed and resumes the exact fenced generations. A successful or commit-uncertain quarantine never reopens the gates or recreates the store. Classic and leader-local inbound polling use the recovery committed prefix as the sole offset authority; admitted/pre-dispatch turns and non-image input files rehydrate through exact owner/session claims, and ambiguous Pi dispatch is never replayed automatically.
+
+Final replies and attachments use the same private store as a durable ordered outbox. The semantic answer and artifact bytes are committed before delivery starts; each confirmed Telegram unit gets a durable receipt before the next unit or queued turn advances. Restart automatically resumes only work known not to have started or known not to have committed. A send that may have reached Telegram, or a crash after Telegram confirmed it but before the receipt commit, becomes `delivery-uncertain` and is never auto-resent. This is deliberately not an exactly-once promise: confirmed Retry warns that Telegram may already contain the effect and can create a duplicate. Attachment spools remain private and quota-accounted until delivery, discard, or explicit linked retry resolves ownership; live downgrade remains blocked while any outbound record is nonterminal.
 
 ## Documentation Map
 
@@ -277,6 +277,8 @@ Full validation:
 ```bash
 npm run validate
 ```
+
+`npm run audit` executes raw npm audit and then applies a fail-closed temporary policy for two findings pinned inside Pi's published shrinkwrap: `brace-expansion@5.0.6` (`GHSA-3jxr-9vmj-r5cp`) and `protobufjs@7.6.4` (`GHSA-j3f2-48v5-ccww`). It verifies exact advisory sources, graph, installed paths/versions, and rejects every other finding. The exception expires after 2026-08-21 UTC; see [BACKLOG.md](./BACKLOG.md).
 
 Project context:
 

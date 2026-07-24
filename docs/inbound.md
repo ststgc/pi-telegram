@@ -88,9 +88,9 @@ If a matching handler fails with a non-zero exit code, the runtime records diagn
 
 ## Programmatic Inbound Handlers And STT Fallbacks
 
-Extensions can register programmatic inbound handlers with `registerTelegramInboundHandler(kind, handler)` from `@llblab/pi-telegram/inbound`. This is the code-level counterpart to configured `inboundHandlers`; use it for extension-owned transformations that are not voice-specific.
+Extensions can register programmatic inbound handlers with `registerTelegramInboundHandler(kind, handler)` from `@ststgc/pi-telegram/inbound`. This is the code-level counterpart to configured `inboundHandlers`; use it for extension-owned transformations that are not voice-specific.
 
-Voice extensions can register STT providers with `registerTelegramVoiceTranscriptionProvider()` from `@llblab/pi-telegram/voice`. This is the zero-config extension path for voice/audio input: a companion extension can transcribe Telegram voice notes without requiring the operator to write an `inboundHandlers` command template.
+Voice extensions can register STT providers with `registerTelegramVoiceTranscriptionProvider()` from `@ststgc/pi-telegram/voice`. This is the zero-config extension path for voice/audio input: a companion extension can transcribe Telegram voice notes without requiring the operator to write an `inboundHandlers` command template.
 
 Priority stays explicit and predictable:
 
@@ -101,8 +101,8 @@ Priority stays explicit and predictable:
 5. built-in text-file fallback for text attachments
 
 ```ts
-import { registerTelegramInboundHandler } from "@llblab/pi-telegram/inbound";
-import { registerTelegramVoiceTranscriptionProvider } from "@llblab/pi-telegram/voice";
+import { registerTelegramInboundHandler } from "@ststgc/pi-telegram/inbound";
+import { registerTelegramVoiceTranscriptionProvider } from "@ststgc/pi-telegram/voice";
 
 const disposeInbound = registerTelegramInboundHandler(
   "document",

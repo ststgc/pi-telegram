@@ -12,6 +12,14 @@ Proactive projection defaults on. With `assistant.proactivePush` omitted or set 
 
 Proactive blocks use `assistant.rendering` independently of voice policy. Rich mode sends native Rich Markdown and HTML mode keeps the established HTML renderer; proactive projection does not synthesize voice or attach queued files merely because Rich rendering is active. The queue revalidates exact target, profile/token transport generation, leader epoch or follower registration generation, and session generation before each send. Telegram-owned turns remain on their ordinary reply path, and `commit-unknown` never permits proactive replay.
 
+## Durable Final Delivery
+
+For a Telegram-owned turn, `agent_end` first commits the transformed semantic reply, deterministic ordered delivery units, and every attachment/voice source into the private profile-scoped recovery store. Only then does the active turn release its Pi dispatch lease and schedule Telegram delivery. Each unit is claimed separately; a confirmed Bot API result becomes a durable unit receipt before the next unit begins. The queue receives a terminal notification only after the outbound record is durably `delivered`, `delivery-uncertain`, or explicitly discarded. On restart, an already delivered record is not sent again, its completed inbound source lets the next safe turn advance once, and `planned`, `pending`, or bounded `retryable-pending` work resumes from its first unreceipted unit.
+
+The outbox does **not** promise exactly-once delivery across Telegram's non-transactional network boundary. A known-not-committed response may retry automatically under the bounded start policy. A response-lost/commit-unknown mutation becomes `delivery-uncertain` immediately; so does a process crash after Telegram confirms a unit but before its receipt commits. Neither case is auto-resent. Confirmed operator Retry creates a linked attempt and warns that the earlier effect may already exist, so duplication is possible by design; Discard records a terminal decision without sending.
+
+Outbound payloads and operation-owned attachment spools use private `0700` directories and `0600` files, required size/SHA-256 verification, and the profile's 512 MiB physical-byte quota. Uncertain payload/spool data has no TTL; confirmed delivered spools are released with the terminal receipt, completed payload compacts after 24 hours, and terminal metadata compacts after 7 days within the store bounds. Status exposes only aggregate states and opaque action handles, never answer text, artifact bytes or paths, Telegram identities, record ids, tokens, or secrets. Store downgrade is therefore allowed only after every outbound record is terminal and the profile-wide runtime/follower fence has drained in-flight delivery.
+
 ## Standard
 
 An outbound handler is selected by `type`. Text replies and assistant markup map to handler types:
@@ -38,7 +46,7 @@ Core assistant output accepts only the Markdown or HTML `InputRichMessage` forms
 
 A Guest Mode reply is one `answerGuestQuery` call carrying exactly one `InlineQueryResult`; it is not a normal chat target and cannot receive `sendDocument`/`sendVoice` multipart uploads through sentinel `chatId: 0`. `telegram_attach` therefore admits at most one file during a guest turn and rejects additional files before queue mutation.
 
-Telegram accepts public URLs or existing Telegram `file_id` values for inline media results, but pi-telegram does not publish local artifacts to external hosting. A local guest document, photo, MP3 audio, or OGG/OPUS voice therefore uses a temporary upload to the paired owner's bot chat, extraction of the returned `file_id`, one cached-media guest answer, and best-effort deletion of the staging message. That message can briefly appear or notify the owner. One guest query can carry only one media item, and its answer text must fit the media caption limit rather than a separate full Rich Markdown message.
+Telegram accepts public URLs or existing Telegram `file_id` values for inline media results, but pi-telegram does not publish local artifacts to external hosting. A local guest document, photo, MP3 audio, or OGG/OPUS voice therefore uses a temporary upload to the paired owner's bot chat, extraction of the returned `file_id`, one cached-media guest answer, and deletion of the staging message as a receipt-tracked durable phase. That message can briefly appear or notify the owner. When a text-only Guest answer exceeds the one-result Rich Markdown limit, the bridge creates one private operation-owned `full-response.md` containing the complete transformed Markdown, stages it through the same paired-owner upload/`file_id` pipeline, and answers with one cached document captioned exactly `Full response attached.` The source file is removed only after durable delivered, uncertain, or discarded resolution; the durable spool remains authoritative where uncertainty requires retention.
 
 Configured text handlers provide `template`. A string is one command; an array is ordered composition. Top-level `args` and `defaults` apply to all composed steps unless a step defines private values. The command-template default timeout applies automatically. Use `template: [...]` for composition; the old local `pipe` alias is removed in 0.13.0.
 
@@ -82,16 +90,16 @@ Voice replies use one fallback pipeline:
 
 1. configured `outboundHandlers` with `type: "voice"` in `telegram.json` order
 2. programmatic `registerTelegramOutboundHandler("voice", ...)` handlers
-3. registered voice synthesis providers from `@llblab/pi-telegram/voice`
+3. registered voice synthesis providers from `@ststgc/pi-telegram/voice`
 
 This makes provider extensions a zero-config convenience without overriding explicit operator-owned `telegram.json` handlers. If several synthesis providers are registered, they are tried in registration order; the first provider that returns a valid `.ogg`/`.opus` artifact handles the reply. Returning `undefined` passes to the next provider, while thrown errors or invalid files are recorded before the next fallback is tried.
 
 ## Voice Synthesis Provider API
 
-Voice replies can be delivered by synthesis providers registered through `@llblab/pi-telegram/voice`:
+Voice replies can be delivered by synthesis providers registered through `@ststgc/pi-telegram/voice`:
 
 ```ts
-import { registerTelegramVoiceSynthesisProvider } from "@llblab/pi-telegram/voice";
+import { registerTelegramVoiceSynthesisProvider } from "@ststgc/pi-telegram/voice";
 
 const dispose = registerTelegramVoiceSynthesisProvider(
   async (text, options) => {

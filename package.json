@@ -1,10 +1,7 @@
 {
-  "name": "@llblab/pi-telegram",
-  "version": "0.24.2",
-  "private": false,
-  "publishConfig": {
-    "access": "public"
-  },
+  "name": "@ststgc/pi-telegram",
+  "version": "0.25.0",
+  "private": true,
   "description": "Telegram runtime adapter for Pi",
   "keywords": [
     "pi-package",
@@ -17,11 +14,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/llblab/pi-telegram.git"
+    "url": "https://github.com/ststgc/pi-telegram.git"
   },
-  "homepage": "https://github.com/llblab/pi-telegram",
+  "homepage": "https://github.com/ststgc/pi-telegram",
   "bugs": {
-    "url": "https://github.com/llblab/pi-telegram/issues"
+    "url": "https://github.com/ststgc/pi-telegram/issues"
   },
   "engines": {
     "node": ">=22.19.0"
@@ -30,9 +27,11 @@
     "test": "node --experimental-strip-types --test --test-reporter=dot tests/*.test.ts",
     "test:verbose": "node --experimental-strip-types --test --test-reporter=spec tests/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "audit": "npm audit",
+    "audit": "node --experimental-strip-types scripts/audit-dependencies.ts",
     "pack:check": "npm pack --dry-run",
-    "validate": "npm run typecheck && npm test && npm run audit && npm run pack:check"
+    "pack:smoke": "node --experimental-strip-types scripts/smoke-package.ts",
+    "domain-dag": "bash -c \"SKILL_DIR=.agents/skills/domain-dag bash .agents/skills/domain-dag/scripts/validate-domain-dag.sh --root .\"",
+    "validate": "npm run typecheck && npm test && npm run audit && npm run domain-dag && npm run pack:check && npm run pack:smoke"
   },
   "files": [
     "index.ts",
@@ -43,6 +42,7 @@
     "BACKLOG.md",
     "CHANGELOG.md",
     "docs/",
+    "scripts/",
     "screenshot.png"
   ],
   "exports": {
@@ -62,7 +62,7 @@
     "extensions": [
       "./index.ts"
     ],
-    "image": "https://github.com/llblab/pi-telegram/raw/main/screenshot.png"
+    "image": "https://github.com/ststgc/pi-telegram/raw/main/screenshot.png"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": ">=0.80.6",
@@ -75,22 +75,24 @@
     "typescript": "latest"
   },
   "overrides": {
-    "protobufjs": "7.6.4",
+    "brace-expansion": "5.0.7",
+    "protobufjs": "7.6.5",
     "undici": "8.5.0",
     "ws": "8.21.0",
     "@earendil-works/pi-coding-agent": {
-      "protobufjs": "7.6.4",
+      "brace-expansion": "5.0.7",
+      "protobufjs": "7.6.5",
       "undici": "8.5.0",
       "ws": "8.21.0",
       "@google/genai": {
-        "protobufjs": "7.6.4",
+        "protobufjs": "7.6.5",
         "ws": "8.21.0"
       },
       "@earendil-works/pi-ai": {
-        "protobufjs": "7.6.4",
+        "protobufjs": "7.6.5",
         "ws": "8.21.0",
         "@google/genai": {
-          "protobufjs": "7.6.4",
+          "protobufjs": "7.6.5",
           "ws": "8.21.0"
         }
       }

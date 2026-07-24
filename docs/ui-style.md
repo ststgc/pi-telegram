@@ -34,6 +34,7 @@ Use emoji as stable semantic markers, not decoration. Emoji carry transportable 
 | `🕒` | Time injection / wall-clock context | Time injection settings row and detail card | Clock-face marker with hands; not a generic duration/progress marker. |
 | `📌` | Proactive push / pinned behavior | Proactive push settings row and detail card | Not generic active/selected state. |
 | `📎` | Attachment | Attachment summaries, queue rows for attachment-only turns | Not for thread binding. |
+| `🛟` | Durable recovery | Recovery main-menu row and recovery detail heading | Marks metadata-only durable-work status and controls, not general diagnostics. |
 
 ### Command And Control Actions
 
@@ -50,7 +51,9 @@ Use emoji as stable semantic markers, not decoration. Emoji carry transportable 
 | `↪️` | Reroute to an existing target | Thread chooser buttons that send a captured command/message from one thread to another live thread | Curved arrow means the message arrived here but bends to another target. |
 | `🔁` | Replace/restore mode | Thread replace/restore chooser entrypoints | Opens a second step for moving a Pi instance binding to the current source thread. |
 | `➡️` | Choose replacement target | Thread replace/restore target buttons that select which Pi instance should move to the current thread | Use inside the second replace/restore chooser, not for ordinary reroutes. |
-| `☑️` | Activate / choose this item | Model detail activation action | Positive action; use `🟢 Active` for already-current state. |
+| `☑️` | Activate / choose this item | Model detail activation and safe recovery drain actions | Positive action; use `🟢 Active` for already-current state. |
+| `⚠️` | Duplicate-risk retry | Recovery retry action and warnings | Signals that the original uncertain work may already have executed. |
+| `📦` | Quarantine for downgrade | Confirmed durable-recovery downgrade action | Signals that the private recovery store will be fenced and moved aside, not merely inspected. |
 | `❌` | No / cancel | Confirmation cancel buttons | Use for safe cancellation, not destructive removal. |
 | `🗑` | Delete / remove | Queue delete actions, destructive confirmations, remove reaction | Use only when something is removed/closed/deleted. |
 

@@ -27,6 +27,7 @@ import {
   createTelegramActiveTurnStore,
   createTelegramAgentEndHook,
   createTelegramAgentLifecycleHooks,
+  createTelegramDurableAgentLifecycleHooks,
   createTelegramAgentStartHook,
   createTelegramControlItemBuilder,
   createTelegramControlQueueController,
@@ -63,6 +64,7 @@ import {
   prioritizeTelegramQueuePromptRuntime,
   removeTelegramQueueItemsByMessageIds,
   removeTelegramQueueItemsByMessageIdsRuntime,
+  resolveTelegramQueueMessageThreadId,
   shouldDispatchAfterTelegramAgentEnd,
   shutdownTelegramSessionRuntime,
   startTelegramSessionRuntime,
@@ -2182,6 +2184,91 @@ test("Agent end uses rawFinalText when plannedReply is undefined", async () => {
   assert.ok(events.some((e) => e.includes("replyToPrompt=true")));
 });
 
+test("Agent end runtime ignores stale status after typing cleanup", async () => {
+  const events: string[] = [];
+  await handleTelegramAgentEndRuntime({
+    turn: undefined,
+    assistant: {},
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {
+      events.push("reset");
+    },
+    waitForTypingIdle: async () => {
+      events.push("typing-idle");
+    },
+    updateStatus: () => {
+      throw new Error("This extension ctx is stale after session replacement");
+    },
+    dispatchNextQueuedTelegramTurn: () => {
+      events.push("dispatch");
+    },
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => true,
+    sendMarkdownReply: async () => {},
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {},
+  });
+
+  assert.deepEqual(events, ["reset", "typing-idle", "dispatch"]);
+});
+
+test("Agent end runtime ignores stale status when session deactivates during typing cleanup", async () => {
+  const events: string[] = [];
+  let sessionActive = true;
+  await handleTelegramAgentEndRuntime({
+    turn: undefined,
+    assistant: {},
+    foldQueuedPromptsIntoHistory: false,
+    isSessionActive: () => sessionActive,
+    resetRuntimeState: () => {
+      events.push("reset");
+    },
+    waitForTypingIdle: async () => {
+      events.push("typing-idle");
+      sessionActive = false;
+    },
+    updateStatus: () => {
+      events.push("status");
+      throw new Error("This extension ctx is stale after session replacement");
+    },
+    dispatchNextQueuedTelegramTurn: () => {
+      events.push("dispatch");
+    },
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => true,
+    sendMarkdownReply: async () => {},
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {},
+  });
+
+  assert.deepEqual(events, ["reset", "typing-idle", "status", "dispatch"]);
+});
+
+test("Agent end runtime rejects non-stale status after typing cleanup", async () => {
+  await assert.rejects(
+    handleTelegramAgentEndRuntime({
+      turn: undefined,
+      assistant: {},
+      foldQueuedPromptsIntoHistory: false,
+      resetRuntimeState: () => {},
+      waitForTypingIdle: async () => {},
+      updateStatus: () => {
+        throw new Error("status update broke");
+      },
+      dispatchNextQueuedTelegramTurn: () => {},
+      clearPreview: async () => {},
+      setPreviewPendingText: () => {},
+      finalizeMarkdownPreview: async () => true,
+      sendMarkdownReply: async () => {},
+      sendTextReply: async () => {},
+      sendQueuedAttachments: async () => {},
+    }),
+    /status update broke/,
+  );
+});
+
 test("Agent end hook binds assistant extraction and runtime ports", async () => {
   const events: string[] = [];
   const turn: PendingTelegramTurn = createQueueTestPromptTurn();
@@ -2627,6 +2714,216 @@ test("Agent lifecycle retains retryable errors until recovery or settlement", as
     "error:WebSocket error",
     "dispatch",
   ]);
+});
+
+function createDurableLifecycleHarness(options: {
+  handoff?: (
+    turn: PendingTelegramTurn,
+    assistant: { text?: string; stopReason?: string },
+    ctx: string,
+  ) => Promise<{ startDelivery(): void }>;
+  extractAssistant?: (messages: readonly string[]) => {
+    text?: string;
+    stopReason?: "error" | "aborted";
+  };
+  completeTurnWithoutDelivery?: (turn: PendingTelegramTurn) => void;
+  markTurnExecutionUncertain?: (turn: PendingTelegramTurn) => void;
+} = {}) {
+  const events: string[] = [];
+  const turn = createQueueTestPromptTurn({
+    recovery: { turnId: "turn-durable", recordIds: ["record-durable"] },
+  });
+  let activeTurn: PendingTelegramTurn | undefined = turn;
+  let sessionActive = true;
+  const hooks = createTelegramDurableAgentLifecycleHooks<
+    PendingTelegramTurn,
+    string,
+    string
+  >({
+    setAbortHandler: () => {},
+    getQueuedItems: () => [],
+    hasPendingDispatch: () => false,
+    hasActiveTurn: () => activeTurn !== undefined,
+    resetToolExecutions: () => {},
+    resetPendingModelSwitch: () => {},
+    setQueuedItems: () => {},
+    clearDispatchPending: () => {},
+    setFoldQueuedPromptsIntoHistory: () => {},
+    setActiveTurn: (nextTurn) => {
+      activeTurn = nextTurn;
+    },
+    createPreviewState: () => {},
+    startTypingLoop: () => {},
+    updateStatus: () => {
+      events.push("status");
+    },
+    getActiveTurn: () => activeTurn,
+    extractAssistant: options.extractAssistant ?? (() => ({ text: "final" })),
+    resetRuntimeState: () => {
+      activeTurn = undefined;
+      events.push("reset");
+    },
+    isSessionActive: () => sessionActive,
+    waitForTypingIdle: async () => {
+      events.push("typing-idle");
+    },
+    dispatchNextQueuedTelegramTurn: () => {
+      events.push("dispatch");
+    },
+    requestDeferredDispatchNextQueuedTelegramTurn: (dispatch) => {
+      dispatch("ctx");
+    },
+    handoffActiveTurn: options.handoff ?? (async (_turn, assistant) => {
+      events.push(`commit:${assistant.text}`);
+      return {
+        startDelivery() {
+          events.push("delivery:start");
+        },
+      };
+    }),
+    completeTurnWithoutDelivery: options.completeTurnWithoutDelivery ?? (() => {
+      events.push("complete:no-delivery");
+    }),
+    markTurnExecutionUncertain: options.markTurnExecutionUncertain ?? (() => {
+      events.push("execution:uncertain");
+    }),
+    recordRuntimeEvent: (category, _error, details) => {
+      events.push(`event:${category}:${details?.phase}`);
+    },
+    getActiveToolExecutions: () => 0,
+    setActiveToolExecutions: () => {},
+    triggerPendingModelSwitchAbort: () => {},
+  });
+  return {
+    hooks,
+    events,
+    getActiveTurn: () => activeTurn,
+    setSessionActive: (active: boolean) => {
+      sessionActive = active;
+    },
+  };
+}
+
+test("Durable agent end commits before execution reset and starts no detached final", async () => {
+  const harness = createDurableLifecycleHarness();
+  await harness.hooks.onAgentEnd({ messages: ["answer"] }, "ctx");
+  assert.equal(harness.getActiveTurn(), undefined);
+  assert.deepEqual(harness.events, [
+    "commit:final",
+    "reset",
+    "typing-idle",
+    "status",
+    "delivery:start",
+  ]);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(
+    harness.events.filter((event) => event === "delivery:start").length,
+    1,
+  );
+  assert.equal(harness.events.includes("dispatch"), false);
+});
+
+test("Durable outbox commit failure retains active dispatch until settlement uncertainty", async () => {
+  const harness = createDurableLifecycleHarness({
+    handoff: async () => {
+      throw new Error("outbox unavailable");
+    },
+  });
+  await harness.hooks.onAgentEnd({ messages: ["answer"] }, "ctx");
+  assert.ok(harness.getActiveTurn());
+  assert.deepEqual(harness.events, [
+    "event:delivery:durable-outbox-handoff",
+  ]);
+
+  await harness.hooks.onAgentSettled({}, "ctx");
+  assert.equal(harness.getActiveTurn(), undefined);
+  assert.deepEqual(harness.events, [
+    "event:delivery:durable-outbox-handoff",
+    "execution:uncertain",
+    "event:recovery:agent-settled-without-outbox",
+    "reset",
+    "typing-idle",
+    "status",
+    "dispatch",
+  ]);
+});
+
+test("Durable disposition store failure retains the active turn and never advances the queue", async () => {
+  const completionFailure = createDurableLifecycleHarness({
+    extractAssistant: () => ({}),
+    completeTurnWithoutDelivery: () => {
+      throw new Error("disposition unavailable");
+    },
+  });
+  await assert.rejects(
+    completionFailure.hooks.onAgentEnd({ messages: [] }, "ctx"),
+    /disposition unavailable/,
+  );
+  assert.ok(completionFailure.getActiveTurn());
+  assert.deepEqual(completionFailure.events, []);
+
+  const uncertaintyFailure = createDurableLifecycleHarness({
+    handoff: async () => {
+      throw new Error("outbox unavailable");
+    },
+    markTurnExecutionUncertain: () => {
+      throw new Error("uncertainty unavailable");
+    },
+  });
+  await uncertaintyFailure.hooks.onAgentEnd({ messages: ["answer"] }, "ctx");
+  await assert.rejects(
+    uncertaintyFailure.hooks.onAgentSettled({}, "ctx"),
+    /uncertainty unavailable/,
+  );
+  assert.ok(uncertaintyFailure.getActiveTurn());
+  assert.deepEqual(uncertaintyFailure.events, [
+    "event:delivery:durable-outbox-handoff",
+  ]);
+});
+
+test("Durable agent settlement without final intent marks execution uncertain", async () => {
+  const harness = createDurableLifecycleHarness({
+    extractAssistant: () => ({ stopReason: "error" }),
+  });
+  await harness.hooks.onAgentEnd({ messages: ["provider error"] }, "ctx");
+  assert.ok(harness.getActiveTurn());
+  await harness.hooks.onAgentSettled({}, "ctx");
+  assert.equal(harness.getActiveTurn(), undefined);
+  assert.deepEqual(harness.events, [
+    "event:provider-retry:retained",
+    "execution:uncertain",
+    "event:recovery:agent-settled-without-outbox",
+    "reset",
+    "typing-idle",
+    "status",
+    "dispatch",
+  ]);
+});
+
+test("Durable handoff from a stale old session cannot reset or schedule replacement state", async () => {
+  let releaseCommit: (() => void) | undefined;
+  const commitBlocked = new Promise<void>((resolve) => {
+    releaseCommit = resolve;
+  });
+  const harness = createDurableLifecycleHarness({
+    handoff: async () => {
+      harness.events.push("commit:start");
+      await commitBlocked;
+      harness.events.push("commit:done");
+      return {
+        startDelivery() {
+          harness.events.push("delivery:start");
+        },
+      };
+    },
+  });
+  const ending = harness.hooks.onAgentEnd({ messages: ["answer"] }, "ctx");
+  await Promise.resolve();
+  harness.setSessionActive(false);
+  releaseCommit?.();
+  await ending;
+  assert.ok(harness.getActiveTurn());
+  assert.deepEqual(harness.events, ["commit:start", "commit:done"]);
 });
 
 test("Agent start hook binds abort handler and runtime ports", async () => {
@@ -3851,6 +4148,66 @@ test("Queue dispatch controller does not resume prompts after shutdown clears co
   ]);
 });
 
+test("Queue dispatch controller fences old control settlement after session replacement", async () => {
+  const events: string[] = [];
+  let releaseControl: () => void = () => {};
+  const controlSettled = new Promise<void>((resolve) => {
+    releaseControl = resolve;
+  });
+  let queuedItems: TelegramQueueItem<string>[] = [
+    createQueueTestControlItem<string>({
+      execute: async (ctx) => {
+        events.push(`control:start:${ctx}`);
+        await controlSettled;
+        events.push("control:end");
+      },
+    }),
+  ];
+  const deferredDispatch = createTelegramDeferredQueueDispatchRuntime<string>();
+  deferredDispatch.bind("old");
+  const controller = createTelegramQueueDispatchController<string>({
+    hasDispatchContext: deferredDispatch.isBound,
+    getDispatchGeneration: deferredDispatch.getGeneration,
+    isDispatchGenerationActive: deferredDispatch.isGenerationActive,
+    getQueuedItems: () => queuedItems,
+    setQueuedItems: (items) => {
+      queuedItems = items;
+      events.push(`items:${items.length}`);
+    },
+    canDispatch: () => true,
+    updateStatus: (ctx) => {
+      events.push(`status:${ctx}`);
+    },
+    sendTextReply: async () => undefined,
+    onPromptDispatchStart: (ctx, chatId) => {
+      events.push(`start:${ctx}:${chatId}`);
+    },
+    sendUserMessage: () => {
+      events.push("send");
+    },
+    onPromptDispatchFailure: () => {
+      events.push("unexpected:failure");
+    },
+  });
+
+  controller.dispatchNext("old");
+  deferredDispatch.unbind();
+  deferredDispatch.bind("new");
+  queuedItems = [createQueueTestPromptTurn({ chatId: 3 })];
+  releaseControl();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(events, [
+    "items:0",
+    "status:old",
+    "control:start:old",
+    "control:end",
+  ]);
+
+  controller.dispatchNext("new");
+  assert.deepEqual(events.slice(-3), ["items:1", "start:new:3", "send"]);
+});
+
 test("Session runtime helper resets session start state", () => {
   const currentModel = createQueueTestModel();
   const state = buildTelegramSessionStartState(currentModel);
@@ -4094,7 +4451,7 @@ test("Session lifecycle hooks bind start and shutdown runtime ports", async () =
 // the caller already confirmed the agent is ready via canDispatch.
 // Regression: followUp can queue idle prompts on some Pi-compatible runtimes.
 
-await test("executeTelegramQueueDispatchPlan sends ready prompts as normal user turns", async (t) => {
+test("executeTelegramQueueDispatchPlan sends ready prompts as normal user turns", async (t) => {
   await t.test(
     "sendUserMessage is called without followUp delivery option for prompt plan",
     () => {
@@ -4188,4 +4545,64 @@ await test("executeTelegramQueueDispatchPlan sends ready prompts as normal user 
       );
     },
   );
+});
+
+test("Queue message thread resolution distinguishes exact, threadless, and ambiguous evidence", () => {
+  const scope = {
+    profile: "work",
+    chatId: 7,
+    businessConnectionId: "business-a",
+  };
+  const threaded = createQueueTestPromptTurn({
+    sourceMessageIds: [99],
+    chatId: 7,
+    target: { chatId: 7, threadId: 3 },
+    transportStamp: { profile: "work", generation: "1" },
+    businessConnectionId: "business-a",
+  });
+  const threadless = createQueueTestPromptTurn({
+    ...threaded,
+    sourceMessageIds: [100],
+    target: { chatId: 7 },
+  });
+  assert.equal(
+    resolveTelegramQueueMessageThreadId([threaded], 99, scope),
+    3,
+  );
+  assert.equal(
+    resolveTelegramQueueMessageThreadId([threadless], 100, scope),
+    null,
+  );
+  assert.equal(
+    resolveTelegramQueueMessageThreadId(
+      [
+        threaded,
+        createQueueTestPromptTurn({ ...threaded, target: { chatId: 7, threadId: 4 } }),
+      ],
+      99,
+      scope,
+    ),
+    undefined,
+  );
+  assert.equal(resolveTelegramQueueMessageThreadId([], 99, scope), undefined);
+});
+
+test("Business deletion scopes preserve colliding ids across profile, chat, connection, and thread", () => {
+  const matching = createQueueTestPromptTurn({
+    sourceMessageIds: [99], chatId: 7, target: { chatId: 7, threadId: 3 },
+    transportStamp: { profile: "work", generation: "1" },
+    businessConnectionId: "business-a", statusSummary: "matching",
+  });
+  const collisions = [
+    createQueueTestPromptTurn({ ...matching, transportStamp: { profile: "other", generation: "1" }, statusSummary: "profile" }),
+    createQueueTestPromptTurn({ ...matching, chatId: 8, target: { chatId: 8, threadId: 3 }, statusSummary: "chat" }),
+    createQueueTestPromptTurn({ ...matching, businessConnectionId: "business-b", statusSummary: "business" }),
+    createQueueTestPromptTurn({ ...matching, target: { chatId: 7, threadId: 4 }, statusSummary: "thread" }),
+  ];
+  const result = removeTelegramQueueItemsByMessageIds(
+    [matching, ...collisions], [99],
+    { profile: "work", chatId: 7, businessConnectionId: "business-a", exactThreadId: 3 },
+  );
+  assert.equal(result.removedCount, 1);
+  assert.deepEqual(result.items.map((item) => item.statusSummary), ["profile", "chat", "business", "thread"]);
 });

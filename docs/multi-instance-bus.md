@@ -192,7 +192,7 @@ Manual smoke checklist:
 6. Close the follower terminal without an explicit disconnect; verify heartbeat pruning remains silent and preserves the follower tab/binding for recovery, matching Unix-like behavior. Then reconnect and run `/telegram-disconnect`; verify the leader confirms deletion of that follower's current tab before local polling stops.
 7. Reload the leader and verify status/debug output does not expose raw pipe internals except in explicit diagnostics.
 
-If any step fails, capture `telegram-status --debug`, `tmp/telegram/state.json`, `tmp/telegram/logs.jsonl`, and, after a reload, `tmp/telegram/logs._prev.jsonl`. Debug status prints local leader/follower endpoints with their active transport kind (`pipe` or `socket`), while the runtime log records request-scoped transport failures with envelope kind, request id, retry attempt, endpoint, and classified IPC error. Reloads preserve the prior JSONL log as `logs._prev.jsonl` so the evidence that caused the reload is not immediately overwritten.
+If any step fails, capture `telegram-status --debug`, `tmp/telegram/state.json`, and the current profile/instance `tmp/telegram/logs*.segment-*.jsonl` files. Debug status prints local leader/follower endpoints with their active transport kind (`pipe` or `socket`), while append-only runtime segments retain request-scoped transport failures and lifecycle boundary records without overwriting pre-reload evidence.
 
 ### Native Windows Assumption Audit
 
@@ -345,6 +345,7 @@ Rules:
 - The thread chat is the owner's private bot DM (`allowedUserId`); no `topics.chatId` config is needed. Thread names are assigned by the bridge from a baked compact per-slot palette. There is no agent-facing `telegram_rename_thread` tool and no separate user-facing slash command for manual thread renames.
 - Thread reuse is extension-owned through current live binding identity; there is no separate `topics` config surface in the active private-chat thread model. Manual followers use instance-scoped internal keys by default so multiple terminal processes in the same cwd can receive separate threads.
 - Thread cleanup remains conservative and centralized: destructive close/delete actions are planned and applied through `thread-reconciler` with proof-before-delete checks, leader-epoch fencing, and retry-preserving failure semantics.
+- Profile recovery downgrade is coordinated only by the current transport leader. It snapshots the live follower roster, sends authenticated `leader.fenceRecovery` envelopes bound to recipient instance, registration generation, profile, and fence generation, and requires exact structured ACKs after each follower has suspended grouped input/queue dispatch and drained in-flight recovery operations. Unreachable, timed-out, stale, or mismatched followers abort before quarantine. `leader.resumeRecovery` is accepted only for that exact pre-quarantine fence generation; successful or commit-uncertain quarantine never resumes followers.
 - `allowedUserId` remains the primary authorization boundary unless explicit allowlists are added. Forum/group membership alone must not grant control.
 
 ## Runtime State
@@ -439,3 +440,9 @@ Live client and native Windows evidence gates are tracked in `BACKLOG.md`; this 
 ## Evidence Gates
 
 Open live/client questions belong in `BACKLOG.md` until confirmed. Capture confirmed quirks as focused regressions or documented caveats, not broad speculative matrices.
+
+## Durable follower mutations
+
+Follower API envelopes carry the exact profile, target, instance id, stable manual owner, registration generation, and follower session generation. The leader revalidates that tuple against the live registry on every request and replay. Retry-safe reads/idempotent methods keep the ordinary local-bus path; unsafe Bot API mutations enter the profile-scoped `recovery-v1*` journal before the leader calls Telegram.
+
+A completed journal entry stores its private serialized response and returns that response after leader restart without repeating Telegram. A process loss after mutation start but before durable completion reopens as `bus-uncertain` and never executes automatically. `/start` → Recovery exposes only an opaque metadata handle: confirmed Retry warns that Telegram may already contain the effect and creates a linked request, confirmed Discard terminalizes retained work, and safe Drain does not include uncertain requests. Profile downgrade fences new and in-flight bus operations through the same generation-bound recovery gate.

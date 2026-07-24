@@ -319,11 +319,37 @@ test("Menu runtime builds menu state from settings and model-registry ports", as
   assert.equal(reloadCount, 1);
   assert.equal(refreshCount, 1);
   assert.equal(result.state.chatId, 42);
+  assert.equal(result.state.scope, "all");
   assert.deepEqual(
     result.state.allModels.map((entry) => entry.model.id),
     ["gpt-5"],
   );
   assert.deepEqual(result.cachedInputs.availableModels, [model]);
+});
+
+test("Model menu all view preserves scoped thinking metadata for matching models", () => {
+  const modelA = createMenuModel("openai", "gpt-5", true);
+  const modelB = createMenuModel("anthropic", "claude-3", true);
+  const modelC = createMenuModel("google", "gemini-2", true);
+  const state = buildTelegramModelMenuState({
+    chatId: 42,
+    activeModel: modelA,
+    availableModels: [modelA, modelB, modelC],
+    configuredScopedModelPatterns: ["ANTHROPIC/CLAUDE-3:high"],
+  });
+
+  assert.equal(state.scope, "all");
+  assert.deepEqual(
+    state.allModels.map((entry) => ({
+      id: `${entry.model.provider}/${entry.model.id}`,
+      thinkingLevel: entry.thinkingLevel,
+    })),
+    [
+      { id: "openai/gpt-5", thinkingLevel: undefined },
+      { id: "anthropic/claude-3", thinkingLevel: "high" },
+      { id: "google/gemini-2", thinkingLevel: undefined },
+    ],
+  );
 });
 
 test("Menu helpers expose UI constants", () => {
@@ -2105,7 +2131,7 @@ test("Menu helpers build model, thinking, and status UI payloads", () => {
   const statusCallbackData = statusMarkup.inline_keyboard.flatMap((row) =>
     row.map((button) => button.callback_data),
   );
-  assert.equal(statusMarkup.inline_keyboard.length, 4);
+  assert.equal(statusMarkup.inline_keyboard.length, 5);
   assert.equal(
     statusMarkup.inline_keyboard[0]?.[0]?.text.startsWith("🤖 Model"),
     true,
@@ -2115,6 +2141,7 @@ test("Menu helpers build model, thinking, and status UI payloads", () => {
     true,
   );
   assert.equal(statusMarkup.inline_keyboard[2]?.[0]?.text, "⏳ Queue: 3");
+  assert.equal(statusMarkup.inline_keyboard[3]?.[0]?.text, "🛟 Recovery: 0");
   assert.equal(statusMarkup.inline_keyboard.at(-1)?.[0]?.text, "⚙️ Settings");
   assert.equal(
     buildStatusReplyMarkup(undefined, "off", 0).inline_keyboard[1]?.[0]?.text,
@@ -2124,6 +2151,7 @@ test("Menu helpers build model, thinking, and status UI payloads", () => {
     "menu:model",
     "menu:thinking",
     "menu:queue",
+    "menu:recovery",
     "menu:settings",
   ]);
   assert.equal(
@@ -2133,7 +2161,7 @@ test("Menu helpers build model, thinking, and status UI payloads", () => {
     false,
   );
   const noReasoningMarkup = buildStatusReplyMarkup(modelB, "medium");
-  assert.equal(noReasoningMarkup.inline_keyboard.length, 3);
+  assert.equal(noReasoningMarkup.inline_keyboard.length, 4);
 });
 
 test("Section callback actions preserve callback thread target", async () => {

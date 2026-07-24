@@ -64,7 +64,7 @@ test("Setup runner validates token, persists config, starts polling, and updates
     },
     getMe: async (botToken) => {
       calls.push(`getMe:${botToken}`);
-      return { ok: true, result: { id: 7, username: "demo_bot" } };
+      return { ok: true, result: { id: 7, is_bot: true, first_name: "Demo", username: "demo_bot" } };
     },
     persistConfig: async (config) => {
       persisted = config;
@@ -90,7 +90,6 @@ test("Setup runner validates token, persists config, starts polling, and updates
     "getMe:token",
     "persist",
     "info:Telegram bot connected: @demo_bot",
-    "info:Send /start to your bot in Telegram to pair this extension with your account.",
     "info:Polling started",
     "status",
   ]);
@@ -117,6 +116,34 @@ test("Setup runner reports invalid tokens without persisting or starting polling
   assert.deepEqual(calls, ["error:Unauthorized"]);
 });
 
+test("Setup runner uses the strict shared bot identity validator", async () => {
+  const calls: string[] = [];
+  const nextConfig = await runTelegramSetup({
+    hasUI: true,
+    env: {},
+    config: {},
+    promptInput: async () => "bad-token",
+    promptEditor: async () => "bad-token",
+    getMe: async () => ({
+      ok: true,
+      result: {
+        id: 7,
+        is_bot: false,
+        first_name: "Not a bot",
+        username: "demo_bot",
+      },
+    }),
+    persistConfig: async () => {
+      calls.push("persist");
+    },
+    notify: (message, level) => calls.push(`${level}:${message}`),
+    startPolling: () => calls.push("start"),
+    updateStatus: () => calls.push("status"),
+  });
+  assert.deepEqual(nextConfig, { status: "validation-failed" });
+  assert.deepEqual(calls, ["error:Invalid Telegram bot token"]);
+});
+
 test("Setup runner distinguishes cancellation and polling startup failure", async () => {
   const baseDeps = {
     hasUI: true,
@@ -125,7 +152,7 @@ test("Setup runner distinguishes cancellation and polling startup failure", asyn
     promptEditor: async () => undefined,
     getMe: async () => ({
       ok: true,
-      result: { id: 7, username: "demo_bot" },
+      result: { id: 7, is_bot: true, first_name: "Demo", username: "demo_bot" },
     }),
     persistConfig: async () => undefined,
     notify: () => undefined,
@@ -174,7 +201,7 @@ test("Setup prompt runtime stores config before starting polling", async () => {
       start: () => true,
       finish: () => calls.push("finish"),
     },
-    getMe: async () => ({ ok: true, result: { id: 7, username: "demo_bot" } }),
+    getMe: async () => ({ ok: true, result: { id: 7, is_bot: true, first_name: "Demo", username: "demo_bot" } }),
     persistConfig: async (config) => {
       calls.push(`persist:${config.botToken}`);
     },
@@ -195,7 +222,6 @@ test("Setup prompt runtime stores config before starting polling", async () => {
     "set:token",
     "persist:token",
     "notify:Telegram bot connected: @demo_bot",
-    "notify:Send /start to your bot in Telegram to pair this extension with your account.",
     "start:token",
     "status",
     "finish",
@@ -216,7 +242,7 @@ test("Setup prompt runtime rolls memory back when persistence fails", async () =
       start: () => true,
       finish: () => calls.push("finish"),
     },
-    getMe: async () => ({ ok: true, result: { id: 7, username: "demo_bot" } }),
+    getMe: async () => ({ ok: true, result: { id: 7, is_bot: true, first_name: "Demo", username: "demo_bot" } }),
     persistConfig: async () => {
       calls.push("persist");
       throw new Error("disk full");
@@ -262,7 +288,7 @@ test("Setup prompt runtime persists the first validated config to missing or emp
         setupGuard: { start: () => true, finish: () => {} },
         getMe: async () => ({
           ok: true,
-          result: { id: 77, username: "first_run_bot" },
+          result: { id: 77, is_bot: true, first_name: "Demo", username: "first_run_bot" },
         }),
         persistConfig: async () => store.persist(),
         startPolling: () => ({ ok: true }),
@@ -318,7 +344,7 @@ test("Setup prompt runtime persists a first named profile without changing sibli
       setupGuard: { start: () => true, finish: () => {} },
       getMe: async () => ({
         ok: true,
-        result: { id: 3, username: "fresh_bot" },
+        result: { id: 3, is_bot: true, first_name: "Demo", username: "fresh_bot" },
       }),
       persistConfig: async () => store.persist(),
       startPolling: () => ({ ok: true }),
@@ -397,4 +423,22 @@ test("Setup prompt runtime reports token check errors and always finishes", asyn
     "guard-finish",
   ]);
   assert.equal(locked, false);
+});
+
+test("Setup displays transient pairing instructions only through local UI", async () => {
+  const notifications: string[] = [];
+  await runTelegramSetup({
+    hasUI: true,
+    env: {},
+    config: {},
+    promptInput: async () => "token",
+    promptEditor: async () => undefined,
+    getMe: async () => ({ ok: true, result: { id: 7, is_bot: true, first_name: "Demo", username: "demo_bot" } }),
+    persistConfig: async () => {},
+    getPairingInstructions: async () => "Pairing code: local-only",
+    notify: (message) => notifications.push(message),
+    startPolling: () => ({ ok: true }),
+    updateStatus: () => {},
+  });
+  assert.ok(notifications.includes("Pairing code: local-only"));
 });

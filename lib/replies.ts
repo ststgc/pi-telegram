@@ -9,6 +9,7 @@ import {
   getTelegramTargetThreadParams,
   type TelegramTarget,
 } from "./target.ts";
+import { TelegramApiHttpError } from "./telegram-api.ts";
 import type {
   TelegramInputRichMessage,
   TelegramReplyParameters,
@@ -38,35 +39,83 @@ export const TELEGRAM_RICH_MESSAGE_MAX_BLOCKS = 500;
 
 // --- Reply Dedup ---
 
-/** Non-persistent reply deduplication for a single agent turn.
- *  First reply to a prompt gets `reply_parameters.message_id`;
- *  subsequent replies in the same turn skip it to avoid stacking
- *  duplicate reply headers in the chat viewport. */
+export interface TelegramReplyDedupReservation {
+  readonly shouldReply: boolean;
+  confirm(): void;
+  releaseKnownFailure(error: unknown): void;
+}
+
+interface TelegramReplyDedupEntry {
+  status: "pending" | "confirmed";
+  token: symbol;
+}
+
+function isKnownTelegramReplyFailure(error: unknown): boolean {
+  return error instanceof TelegramApiHttpError &&
+    error.status !== undefined &&
+    error.status < 500;
+}
+
+function reserveReplyDedupEntry(
+  entries: Map<number, TelegramReplyDedupEntry>,
+  messageId: number,
+): TelegramReplyDedupReservation {
+  if (entries.has(messageId)) {
+    return {
+      shouldReply: false,
+      confirm() {},
+      releaseKnownFailure() {},
+    };
+  }
+  const token = Symbol("telegram-reply-dedup");
+  entries.set(messageId, { status: "pending", token });
+  return {
+    shouldReply: true,
+    confirm(): void {
+      const current = entries.get(messageId);
+      if (current?.token === token && current.status === "pending") {
+        current.status = "confirmed";
+      }
+    },
+    releaseKnownFailure(error): void {
+      const current = entries.get(messageId);
+      if (
+        isKnownTelegramReplyFailure(error) &&
+        current?.token === token &&
+        current.status === "pending"
+      ) {
+        entries.delete(messageId);
+      }
+    },
+  };
+}
+
+/** Non-persistent pending/confirmed reply deduplication for one agent turn. */
 export interface ReplyDedupRuntime {
-  /** Returns true if this is the first reply for the given prompt
-   *  message id in the current turn. Side-effect: marks it replied. */
+  reserve(promptMessageId: number): TelegramReplyDedupReservation;
+  /** Compatibility reservation probe. Prefer `reserve()` when a receipt is available. */
   shouldReply(promptMessageId: number): boolean;
-  /** Reset the tracker when a new prompt enters the queue. */
   reset(): void;
 }
 
 export function createReplyDedupRuntime(): ReplyDedupRuntime {
-  const replied = new Map<number, boolean>();
+  const entries = new Map<number, TelegramReplyDedupEntry>();
   return {
-    shouldReply(promptMessageId: number): boolean {
-      if (replied.has(promptMessageId)) return false;
-      replied.set(promptMessageId, true);
-      return true;
+    reserve(promptMessageId): TelegramReplyDedupReservation {
+      return reserveReplyDedupEntry(entries, promptMessageId);
+    },
+    shouldReply(promptMessageId): boolean {
+      return reserveReplyDedupEntry(entries, promptMessageId).shouldReply;
     },
     reset(): void {
-      replied.clear();
+      entries.clear();
     },
   };
 }
 
 // --- Transport-level dedup ---
 
-const lastRepliedToMessageIdByTarget = new Map<string, number>();
+const replyDedupByTarget = new Map<string, Map<number, TelegramReplyDedupEntry>>();
 
 function getReplyDedupTargetKey(
   chatId: number,
@@ -79,33 +128,65 @@ function getReplyDedupTargetKey(
 }
 
 export function resetTransportReplyDedup(): void {
-  lastRepliedToMessageIdByTarget.clear();
+  replyDedupByTarget.clear();
 }
 
+export interface TelegramReplyParametersReservation
+  extends TelegramReplyDedupReservation {
+  readonly parameters?: TelegramReplyParameters;
+  readonly multipartParameters?: string;
+}
+
+export function reserveTelegramReplyParameters(
+  chatId: number,
+  messageId: number | undefined,
+  target?: TelegramTarget,
+): TelegramReplyParametersReservation {
+  if (messageId === undefined || messageId <= 0) {
+    return {
+      shouldReply: false,
+      confirm() {},
+      releaseKnownFailure() {},
+    };
+  }
+  const key = getReplyDedupTargetKey(chatId, target);
+  let entries = replyDedupByTarget.get(key);
+  if (!entries) {
+    entries = new Map();
+    replyDedupByTarget.set(key, entries);
+  }
+  const reservation = reserveReplyDedupEntry(entries, messageId);
+  const parameters = reservation.shouldReply
+    ? { message_id: messageId, allow_sending_without_reply: true as const }
+    : undefined;
+  return {
+    ...reservation,
+    ...(parameters
+      ? {
+          parameters,
+          multipartParameters: JSON.stringify(parameters),
+        }
+      : {}),
+  };
+}
+
+/** Compatibility probe. Runtime mutations should use `reserveTelegramReplyParameters`. */
 export function buildTelegramReplyParameters(
   chatId: number,
   messageId: number | undefined,
   target?: TelegramTarget,
 ): TelegramReplyParameters | undefined {
-  if (messageId === undefined || messageId <= 0) return undefined;
-  const key = getReplyDedupTargetKey(chatId, target);
-  if (lastRepliedToMessageIdByTarget.get(key) === messageId) {
-    return undefined;
-  }
-  lastRepliedToMessageIdByTarget.set(key, messageId);
-  return {
-    message_id: messageId,
-    allow_sending_without_reply: true,
-  };
+  return reserveTelegramReplyParameters(chatId, messageId, target).parameters;
 }
 
+/** Compatibility probe. Runtime mutations should use `reserveTelegramReplyParameters`. */
 export function buildTelegramMultipartReplyParameters(
   chatId: number,
   messageId: number | undefined,
   target?: TelegramTarget,
 ): string | undefined {
-  const parameters = buildTelegramReplyParameters(chatId, messageId, target);
-  return parameters ? JSON.stringify(parameters) : undefined;
+  return reserveTelegramReplyParameters(chatId, messageId, target)
+    .multipartParameters;
 }
 
 function getAgentMessageField(message: unknown, field: string): unknown {
@@ -239,30 +320,38 @@ export async function sendTelegramRenderedChunks<TReplyMarkup>(
   assertTelegramInlineKeyboardCallbackData(options?.replyMarkup);
   let lastMessageId: number | undefined;
   for (const [index, chunk] of chunks.entries()) {
-    const replyParameters =
-      index === 0
-        ? buildTelegramReplyParameters(
-            chatId,
-            options?.replyToMessageId,
-            options?.target,
-          )
-        : undefined;
+    const reservation = reserveTelegramReplyParameters(
+      chatId,
+      index === 0 ? options?.replyToMessageId : undefined,
+      options?.target,
+    );
     const body = {
       chat_id: chatId,
       text: chunk.text,
       parse_mode: chunk.parseMode,
       reply_markup:
         index === chunks.length - 1 ? options?.replyMarkup : undefined,
-      ...(replyParameters ? { reply_parameters: replyParameters } : {}),
+      ...(reservation.parameters
+        ? { reply_parameters: reservation.parameters }
+        : {}),
       ...(options?.target ? getTelegramTargetThreadParams(options.target) : {}),
     };
-    const sent = await deps.sendMessage(body);
-    lastMessageId = sent.message_id;
-    deps.recordOwnership?.({
-      chatId,
-      messageId: sent.message_id,
-      target: options?.target,
-    });
+    try {
+      const sent = await deps.sendMessage(body);
+      lastMessageId = validateTelegramReplyMessageId(
+        "sendMessage",
+        sent.message_id,
+      );
+      reservation.confirm();
+      deps.recordOwnership?.({
+        chatId,
+        messageId: lastMessageId,
+        target: options?.target,
+      });
+    } catch (error) {
+      reservation.releaseKnownFailure(error);
+      throw error;
+    }
   }
   return lastMessageId;
 }
@@ -639,6 +728,122 @@ function findTelegramNativeMarkdownSplitIndex(
   return hardLimit;
 }
 
+export interface TelegramSingleReplyUnitOptions<TReplyMarkup = unknown>
+  extends TelegramReplyTargetOptions {
+  replyMarkup?: TReplyMarkup;
+}
+
+export interface TelegramSingleReplyUnitReceipt {
+  method: "sendMessage" | "sendRichMessage" | "answerGuestQuery";
+  messageId?: number;
+}
+
+export class TelegramReplyMalformedSuccessError extends Error {
+  readonly kind = "malformed-success" as const;
+
+  constructor(method: string) {
+    super(`Telegram ${method} success returned an invalid message_id.`);
+    this.name = "TelegramReplyMalformedSuccessError";
+  }
+}
+
+function validateTelegramReplyMessageId(
+  method: "sendMessage" | "sendRichMessage",
+  messageId: number,
+): number {
+  if (!Number.isSafeInteger(messageId) || messageId <= 0) {
+    throw new TelegramReplyMalformedSuccessError(method);
+  }
+  return messageId;
+}
+
+function getTelegramSingleReplyParameters(
+  messageId: number | undefined,
+): TelegramReplyParameters | undefined {
+  return messageId !== undefined && messageId > 0
+    ? { message_id: messageId, allow_sending_without_reply: true }
+    : undefined;
+}
+
+/** Sends exactly one already-rendered ordinary Telegram message mutation. */
+export async function sendTelegramRenderedReplyUnit<TReplyMarkup = unknown>(
+  chatId: number,
+  content: string,
+  contentMode: "html" | "plain",
+  deps: Pick<TelegramReplyDeliveryDeps<TReplyMarkup>, "sendMessage">,
+  options: TelegramSingleReplyUnitOptions<TReplyMarkup> = {},
+): Promise<TelegramSingleReplyUnitReceipt> {
+  assertTelegramInlineKeyboardCallbackData(options.replyMarkup);
+  const replyParameters = getTelegramSingleReplyParameters(
+    options.replyToMessageId,
+  );
+  const parseMode: "HTML" | undefined =
+    contentMode === "html" ? "HTML" : undefined;
+  const sent = await deps.sendMessage({
+    chat_id: chatId,
+    text: content,
+    ...(parseMode ? { parse_mode: parseMode } : {}),
+    ...(options.replyMarkup ? { reply_markup: options.replyMarkup } : {}),
+    ...(replyParameters ? { reply_parameters: replyParameters } : {}),
+    ...(options.target ? getTelegramTargetThreadParams(options.target) : {}),
+  });
+  return {
+    method: "sendMessage",
+    messageId: validateTelegramReplyMessageId("sendMessage", sent.message_id),
+  };
+}
+
+/** Sends exactly one already-split native Rich Markdown mutation. */
+export async function sendTelegramNativeMarkdownReplyUnit<
+  TReplyMarkup = unknown,
+>(
+  chatId: number,
+  markdown: string,
+  deps: {
+    sendRichMessage: (
+      body: TelegramSendRichMessageBody,
+    ) => Promise<TelegramSentMessage>;
+  },
+  options: TelegramSingleReplyUnitOptions<TReplyMarkup> = {},
+): Promise<TelegramSingleReplyUnitReceipt> {
+  assertTelegramInlineKeyboardCallbackData(options.replyMarkup);
+  const replyParameters = getTelegramSingleReplyParameters(
+    options.replyToMessageId,
+  );
+  const sent = await deps.sendRichMessage({
+    chat_id: chatId,
+    rich_message: { markdown, skip_entity_detection: true },
+    ...(options.replyMarkup ? { reply_markup: options.replyMarkup } : {}),
+    ...(replyParameters ? { reply_parameters: replyParameters } : {}),
+    ...(options.target ? getTelegramTargetThreadParams(options.target) : {}),
+  });
+  return {
+    method: "sendRichMessage",
+    messageId: validateTelegramReplyMessageId(
+      "sendRichMessage",
+      sent.message_id,
+    ),
+  };
+}
+
+/** Sends exactly one Guest Rich Markdown answer mutation. */
+export async function sendTelegramGuestMarkdownReplyUnit(
+  guestQueryId: string,
+  markdown: string,
+  deps: {
+    answerGuestQuery: (
+      guestQueryId: string,
+      text?: string,
+      options?: { parseMode?: string; richMessage?: TelegramInputRichMessage },
+    ) => Promise<void>;
+  },
+): Promise<TelegramSingleReplyUnitReceipt> {
+  await deps.answerGuestQuery(guestQueryId, undefined, {
+    richMessage: { markdown, skip_entity_detection: true },
+  });
+  return { method: "answerGuestQuery" };
+}
+
 export async function sendTelegramNativeMarkdownReply<TReplyMarkup = unknown>(
   chatId: number,
   replyToMessageId: number | undefined,
@@ -655,28 +860,36 @@ export async function sendTelegramNativeMarkdownReply<TReplyMarkup = unknown>(
   let lastMessageId: number | undefined;
   const chunks = splitTelegramNativeMarkdown(markdown);
   for (const [index, chunk] of chunks.entries()) {
-    const replyParameters =
-      index === 0
-        ? buildTelegramReplyParameters(
-            chatId,
-            replyToMessageId,
-            options?.target,
-          )
-        : undefined;
-    const sent = await deps.sendRichMessage({
-      chat_id: chatId,
-      rich_message: { markdown: chunk, skip_entity_detection: true },
-      reply_markup:
-        index === chunks.length - 1 ? options?.replyMarkup : undefined,
-      ...(replyParameters ? { reply_parameters: replyParameters } : {}),
-      ...(options?.target ? getTelegramTargetThreadParams(options.target) : {}),
-    });
-    lastMessageId = sent.message_id;
-    deps.recordOwnership?.({
+    const reservation = reserveTelegramReplyParameters(
       chatId,
-      messageId: sent.message_id,
-      target: options?.target,
-    });
+      index === 0 ? replyToMessageId : undefined,
+      options?.target,
+    );
+    try {
+      const sent = await deps.sendRichMessage({
+        chat_id: chatId,
+        rich_message: { markdown: chunk, skip_entity_detection: true },
+        reply_markup:
+          index === chunks.length - 1 ? options?.replyMarkup : undefined,
+        ...(reservation.parameters
+          ? { reply_parameters: reservation.parameters }
+          : {}),
+        ...(options?.target ? getTelegramTargetThreadParams(options.target) : {}),
+      });
+      lastMessageId = validateTelegramReplyMessageId(
+        "sendRichMessage",
+        sent.message_id,
+      );
+      reservation.confirm();
+      deps.recordOwnership?.({
+        chatId,
+        messageId: lastMessageId,
+        target: options?.target,
+      });
+    } catch (error) {
+      reservation.releaseKnownFailure(error);
+      throw error;
+    }
   }
   return lastMessageId;
 }
@@ -864,10 +1077,18 @@ export function dedupSendTextReply(
   options?: TelegramTextReplyOptions,
 ) => Promise<number | undefined> {
   return async (chatId, replyToMessageId, text, options) => {
-    const effectiveReplyTo = dedup.shouldReply(replyToMessageId)
+    const reservation = dedup.reserve(replyToMessageId);
+    const effectiveReplyTo = reservation.shouldReply
       ? replyToMessageId
       : undefined;
-    return inner(chatId, effectiveReplyTo, text, options);
+    try {
+      const receipt = await inner(chatId, effectiveReplyTo, text, options);
+      reservation.confirm();
+      return receipt;
+    } catch (error) {
+      reservation.releaseKnownFailure(error);
+      throw error;
+    }
   };
 }
 

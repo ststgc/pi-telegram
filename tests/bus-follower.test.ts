@@ -39,11 +39,12 @@ import {
   getTelegramLeaderSessionHandoff,
   setTelegramLeaderSessionHandoff,
 } from "../lib/threads.ts";
+import { RecoveryProfileOperationGate } from "../lib/recovery.ts";
 import { isTelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
 
 async function waitForCondition(
   predicate: () => boolean,
-  timeoutMs = 250,
+  timeoutMs = 2_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -349,6 +350,127 @@ test("Bus follower receiver handles leader-forwarded updates and target replacem
     ]);
   } finally {
     await leader.stop();
+    await receiver.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus follower recovery fence authenticates exact authority, drains, and resumes exact generation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-recovery-fence-"));
+  const socketPath = join(dir, "follower.sock");
+  const gate = new RecoveryProfileOperationGate();
+  const activeLease = gate.enter("work");
+  assert.ok(activeLease);
+  let suspended = 0;
+  let resumed = 0;
+  let resumeFails = true;
+  const receiver = createTelegramBusForwardedUpdateReceiverRuntime({
+    socketPath,
+    instanceId: "inst-b",
+    getAuthSecret: () => "secret",
+    getRegistrationGeneration: () => "registration-b",
+    getProfile: () => "work",
+    getContext: () => "ctx",
+    recoveryFence: {
+      enter: (profile) => gate.enter(profile),
+      beginFencing: (profile, generation) =>
+        gate.beginFencing(profile, generation),
+      awaitDrained: (profile, generation) =>
+        gate.awaitDrained(profile, generation),
+      resumeAfter: (profile, generation, resumeRuntime) =>
+        gate.resumeAfter(profile, generation, resumeRuntime),
+      suspendRuntime() {
+        suspended += 1;
+      },
+      resumeRuntime() {
+        resumed += 1;
+        if (resumeFails) throw new Error("follower resume failed");
+      },
+    },
+    handleForwardedCallback() {},
+    handleForwardedReaction() {},
+  });
+  const send = (
+    overrides: Partial<{
+      auth: string;
+      profile: string;
+      recipientInstanceId: string;
+      recipientRegistrationGeneration: string;
+      fenceGeneration: string;
+    }> = {},
+    kind: "leader.fenceRecovery" | "leader.resumeRecovery" =
+      "leader.fenceRecovery",
+  ) =>
+    sendTelegramBusLocalEnvelope({
+      socketPath,
+      timeoutMs: 500,
+      envelope: {
+        kind,
+        requestId: `${kind}:${Math.random()}`,
+        auth: overrides.auth ?? "secret",
+        profile: overrides.profile ?? "work",
+        recipientInstanceId: overrides.recipientInstanceId ?? "inst-b",
+        recipientRegistrationGeneration:
+          overrides.recipientRegistrationGeneration ?? "registration-b",
+        fenceGeneration: overrides.fenceGeneration ?? "fence-b",
+        sentAtMs: 1000,
+      },
+    });
+  try {
+    await receiver.start();
+    for (const response of [
+      await send({ auth: "wrong" }),
+      await send({ profile: "other" }),
+      await send({ recipientRegistrationGeneration: "stale" }),
+      await send({ recipientInstanceId: "other" }),
+    ]) {
+      assert.equal(response?.kind === "bus.ack" && response.ok, false);
+    }
+
+    let fenceSettled = false;
+    const fenceResponse = send().then((response) => {
+      fenceSettled = true;
+      return response;
+    });
+    await waitForCondition(() => suspended === 1);
+    assert.equal(fenceSettled, false);
+    assert.equal(gate.getState("work").phase, "fencing");
+    activeLease.release();
+    const fenced = await fenceResponse;
+    assert.equal(fenced?.kind, "bus.ack");
+    assert.equal(fenced?.ok, true);
+    assert.deepEqual(
+      fenced?.kind === "bus.ack" ? fenced.recoveryFence : undefined,
+      {
+        version: 1,
+        state: "fenced",
+        profile: "work",
+        recipientInstanceId: "inst-b",
+        recipientRegistrationGeneration: "registration-b",
+        fenceGeneration: "fence-b",
+      },
+    );
+    assert.equal(gate.enter("work"), undefined);
+
+    const failedResume = await send({}, "leader.resumeRecovery");
+    assert.equal(failedResume?.kind, "bus.ack");
+    assert.equal(failedResume?.ok, false);
+    assert.equal(resumed, 1);
+    assert.equal(gate.getState("work").phase, "fencing");
+    assert.equal(gate.enter("work"), undefined);
+
+    resumeFails = false;
+    const resumeResponse = await send({}, "leader.resumeRecovery");
+    assert.equal(resumeResponse?.kind, "bus.ack");
+    assert.equal(resumeResponse?.ok, true);
+    assert.equal(resumed, 2);
+    assert.equal(gate.getState("work").phase, "active");
+    const staleResume = await send({}, "leader.resumeRecovery");
+    assert.equal(
+      staleResume?.kind === "bus.ack" && staleResume.ok,
+      false,
+    );
+  } finally {
     await receiver.stop();
     rmSync(dir, { recursive: true, force: true });
   }
@@ -950,6 +1072,7 @@ test("Bus follower assembly wires receiver, recovery, and registration", async (
       getLeaderSocketPath: () => leaderSocketPath,
       registrationState,
       createRequestId: () => `inst-a:${++requestSequence}`,
+      getSessionGeneration: () => 1,
     },
   });
   try {
@@ -1008,6 +1131,7 @@ test("Bus follower registration state tracks successful registration and stop", 
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => "inst-a:1",
+    getSessionGeneration: () => 1,
     getNowMs: () => 1000,
     registrationState: state,
   });
@@ -1072,6 +1196,7 @@ test("Bus follower re-registration carries its last known target", async () => {
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => `inst-a:reload:${++requestSequence}`,
+    getSessionGeneration: () => 1,
     registrationState: state,
   });
   try {
@@ -1124,6 +1249,7 @@ test("Bus follower registration runtime retries while leader endpoint is startin
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => "inst-a:1",
+    getSessionGeneration: () => 1,
     getNowMs: () => 1000,
     registrationState: state,
     registrationTimeoutMs: 50,
@@ -1177,6 +1303,7 @@ test("Bus follower registration runtime waits for slow target provisioning", asy
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => "inst-a:1",
+    getSessionGeneration: () => 1,
     getNowMs: () => 1000,
     registrationState: state,
     timeoutMs: 20,
@@ -1223,6 +1350,7 @@ test("Bus follower registration runtime registers and explicitly disconnects", a
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => `inst-a:${++sequence}`,
+    getSessionGeneration: () => 1,
     getNowMs: () => 1000,
     getPid: () => 123,
   });
@@ -1242,6 +1370,7 @@ test("Bus follower registration runtime registers and explicitly disconnects", a
       cwd: "/repo",
       pid: 123,
       registrationGeneration: "inst-a:1",
+      sessionGeneration: 1,
       connectedAtMs: 1000,
       lastHeartbeatMs: 1000,
       target: undefined,
@@ -1269,6 +1398,7 @@ test("Bus follower registration runtime accepts explicit manual profile keys", a
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => "inst-a:1",
+    getSessionGeneration: () => 1,
     getNowMs: () => 1000,
     getProfileKey: () => "manual:inst-a",
   });
@@ -1305,6 +1435,7 @@ test("Bus follower registration runtime reports heartbeat failure with active co
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => "inst-a:1",
+    getSessionGeneration: () => 1,
     registrationState: createTelegramBusFollowerRegistrationState(),
     heartbeatMs: 10,
     timeoutMs: 50,
@@ -1350,6 +1481,7 @@ test("Bus follower registration runtime reports rejected heartbeat with active c
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => `inst-a:${++requestSequence}`,
+    getSessionGeneration: () => 1,
     registrationState: createTelegramBusFollowerRegistrationState(),
     heartbeatMs: 10,
     timeoutMs: 50,
@@ -1393,6 +1525,7 @@ test("Bus follower registration runtime heartbeats until stopped", async () => {
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => `inst-a:${++requestSequence}`,
+    getSessionGeneration: () => 1,
     getNowMs: () => nowMs,
     heartbeatMs: 50,
   });
@@ -1437,6 +1570,7 @@ test("Bus follower registration runtime surfaces leader rejection reasons", asyn
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => "inst-a:1",
+    getSessionGeneration: () => 1,
     stopReceiving: () => {
       stopped.push("stop");
     },
@@ -1474,6 +1608,7 @@ test("Bus follower registration runtime derives leader socket when lock omits it
   const follower = createTelegramBusFollowerRegistrationRuntime({
     instanceId: "inst-a",
     createRequestId: () => "inst-a:1",
+    getSessionGeneration: () => 1,
     getLeaderSocketPath: () => socketPath,
   });
   try {
@@ -1506,7 +1641,12 @@ test("Bus follower API caller sends method calls and returns leader results", as
   const callApi = createTelegramBusFollowerApiCaller({
     socketPath,
     instanceId: "inst-a",
+    manualFollowerOwnerId: "owner-a",
     createRequestId: () => "inst-a:1",
+    getProfile: () => "default",
+    getTarget: () => ({ chatId: 1, threadId: 2 }),
+    getRegistrationGeneration: () => "generation-a",
+    getSessionGeneration: () => 3,
     getNowMs: () => 7000,
   });
   try {
@@ -1518,7 +1658,12 @@ test("Bus follower API caller sends method calls and returns leader results", as
       {
         kind: "follower.callApi",
         requestId: "inst-a:1",
+        profile: "default",
+        target: { chatId: 1, threadId: 2 },
         instanceId: "inst-a",
+        manualFollowerOwnerId: "owner-a",
+        registrationGeneration: "generation-a",
+        followerSessionGeneration: 3,
         method: "sendRichMessage",
         args: [{ chat_id: 1 }],
         sentAtMs: 7000,
@@ -1546,7 +1691,12 @@ test("Bus follower API caller preserves structured commit-unknown errors", async
   const callApi = createTelegramBusFollowerApiCaller({
     socketPath,
     instanceId: "inst-a",
+    manualFollowerOwnerId: "owner-a",
     createRequestId: () => "inst-a:ambiguous:1",
+    getProfile: () => "default",
+    getTarget: () => ({ chatId: 1 }),
+    getRegistrationGeneration: () => "generation-a",
+    getSessionGeneration: () => 3,
   });
   try {
     await server.start();
@@ -1580,7 +1730,12 @@ test("Bus follower API caller classifies non-idempotent acknowledgement loss as 
   const callApi = createTelegramBusFollowerApiCaller({
     socketPath,
     instanceId: "inst-a",
+    manualFollowerOwnerId: "owner-a",
     createRequestId: () => "inst-a:ack-loss:1",
+    getProfile: () => "default",
+    getTarget: () => ({ chatId: 1 }),
+    getRegistrationGeneration: () => "generation-a",
+    getSessionGeneration: () => 3,
     timeoutMs: 10,
   });
   try {

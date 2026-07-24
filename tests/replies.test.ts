@@ -24,16 +24,25 @@ import {
   getAgentMessageText,
   isAssistantAgentMessage,
   normalizeTelegramNativeMarkdown,
+  reserveTelegramReplyParameters,
   resetTransportReplyDedup,
+  sendTelegramGuestMarkdownReplyUnit,
   sendTelegramNativeMarkdownReply,
+  sendTelegramNativeMarkdownReplyUnit,
   sendTelegramPlainReply,
   sendTelegramRenderedChunks,
+  sendTelegramRenderedReplyUnit,
+  TelegramReplyMalformedSuccessError,
   splitTelegramNativeMarkdown,
   TELEGRAM_RICH_MESSAGE_MAX_BLOCKS,
   TELEGRAM_RICH_MESSAGE_MAX_CHARS,
 } from "../lib/replies.ts";
 import { createDedupAgentStartHook } from "../lib/lifecycle.ts";
 import { createTelegramThreadTarget } from "../lib/target.ts";
+import {
+  TelegramApiCommitUnknownError,
+  TelegramApiHttpError,
+} from "../lib/telegram-api.ts";
 
 test("Reply helpers extract assistant message text and metadata", () => {
   const messages = [
@@ -828,6 +837,84 @@ test("Native Markdown splitter respects the rich-message block limit for lists",
   assert.equal(chunks[1]?.split("\n").length, 5);
 });
 
+test("single reply units issue one mutation and return validated receipts", async () => {
+  const bodies: Array<Record<string, unknown>> = [];
+  assert.deepEqual(
+    await sendTelegramRenderedReplyUnit(
+      7,
+      "<b>answer</b>",
+      "html",
+      {
+        sendMessage: async (body) => {
+          bodies.push(body);
+          return { message_id: 71 };
+        },
+      },
+      {
+        target: createTelegramThreadTarget(7, 9),
+        replyToMessageId: 42,
+        replyMarkup: {
+          inline_keyboard: [[{ text: "OK", callback_data: "ok" }]],
+        },
+      },
+    ),
+    { method: "sendMessage", messageId: 71 },
+  );
+  assert.deepEqual(bodies, [{
+    chat_id: 7,
+    text: "<b>answer</b>",
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [[{ text: "OK", callback_data: "ok" }]],
+    },
+    reply_parameters: {
+      message_id: 42,
+      allow_sending_without_reply: true,
+    },
+    message_thread_id: 9,
+  }]);
+
+  let richCalls = 0;
+  await assert.rejects(
+    sendTelegramNativeMarkdownReplyUnit(
+      7,
+      "answer",
+      {
+        sendRichMessage: async () => {
+          richCalls += 1;
+          return { message_id: Number.NaN };
+        },
+      },
+    ),
+    TelegramReplyMalformedSuccessError,
+  );
+  assert.equal(richCalls, 1);
+
+  const guestCalls: unknown[] = [];
+  assert.deepEqual(
+    await sendTelegramGuestMarkdownReplyUnit(
+      "guest-1",
+      "Guest **answer**",
+      {
+        answerGuestQuery: async (...args) => {
+          guestCalls.push(args);
+        },
+      },
+    ),
+    { method: "answerGuestQuery" },
+  );
+  assert.deepEqual(guestCalls, [[
+    "guest-1",
+    undefined,
+    {
+      richMessage: {
+        markdown: "Guest **answer**",
+        skip_entity_detection: true,
+      },
+    },
+  ]]);
+});
+
 test("Native Markdown delivery attaches reply metadata first and markup last", async () => {
   const bodies: Array<Record<string, unknown>> = [];
   const markdown = `${"a".repeat(TELEGRAM_RICH_MESSAGE_MAX_CHARS - 10)}\n\n${"b".repeat(30)}`;
@@ -931,6 +1018,36 @@ test("Reply dedup tracks first reply per prompt message id and resets", () => {
   assert.equal(dedup.shouldReply(99), true);
   dedup.reset();
   assert.equal(dedup.shouldReply(42), true);
+});
+
+test("Transport reply dedup confirms only after receipt and releases only known failure", () => {
+  const pending = reserveTelegramReplyParameters(1, 42);
+  assert.deepEqual(pending.parameters, {
+    message_id: 42,
+    allow_sending_without_reply: true,
+  });
+  assert.equal(reserveTelegramReplyParameters(1, 42).parameters, undefined);
+  pending.confirm();
+  assert.equal(reserveTelegramReplyParameters(1, 42).parameters, undefined);
+
+  const knownFailure = reserveTelegramReplyParameters(1, 99);
+  knownFailure.releaseKnownFailure(
+    new TelegramApiHttpError("rejected", 400, undefined),
+  );
+  assert.deepEqual(reserveTelegramReplyParameters(1, 99).parameters, {
+    message_id: 99,
+    allow_sending_without_reply: true,
+  });
+
+  const uncertain = reserveTelegramReplyParameters(1, 100);
+  uncertain.releaseKnownFailure(
+    new TelegramApiCommitUnknownError(
+      "sendMessage",
+      new Error("response lost"),
+      "response-lost",
+    ),
+  );
+  assert.equal(reserveTelegramReplyParameters(1, 100).parameters, undefined);
 });
 
 test("Dedup wrapper suppresses reply_to_message_id after the first message in a turn", async () => {

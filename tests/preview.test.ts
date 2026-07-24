@@ -12,6 +12,7 @@ import {
   clearTelegramPreview,
   createTelegramAssistantPreviewRuntime,
   createTelegramNativeMarkdownPreviewFinalizer,
+  createTelegramNativeMarkdownPreviewReceiptFinalizer,
   createTelegramPreviewControllerRuntime,
   createTelegramPreviewRuntimeState,
   finalizeTelegramPreview,
@@ -344,6 +345,78 @@ test("Native Markdown finalizer waits for active draft flush before final reply"
     "final:7:55:final body",
   ]);
   assert.equal(harness.getState(), undefined);
+});
+
+test("receipt finalizer waits for the live flush and returns the first-unit receipt", async () => {
+  const harness = createPreviewRuntimeHarness({
+    mode: "draft",
+    draftId: 10,
+    pendingText: "draft body",
+    lastSentText: "",
+  });
+  let release: (() => void) | undefined;
+  harness.deps.sendDraft = async () =>
+    new Promise<void>((resolve) => {
+      release = resolve;
+    });
+  let sends = 0;
+  const finalize = createTelegramNativeMarkdownPreviewReceiptFinalizer({
+    getState: harness.deps.getState,
+    discard: () => harness.deps.setState(undefined),
+    sendUnit: async () => {
+      sends += 1;
+      return { method: "sendRichMessage" as const, messageId: 88 };
+    },
+  });
+  const flush = flushTelegramPreview(7, harness.deps);
+  await Promise.resolve();
+  const pending = finalize();
+  await Promise.resolve();
+  assert.equal(sends, 0);
+  release?.();
+  assert.deepEqual(await pending, {
+    method: "sendRichMessage",
+    messageId: 88,
+  });
+  await flush;
+  assert.equal(sends, 1);
+  assert.equal(harness.getState(), undefined);
+});
+
+test("receipt finalizer does not send through a replaced preview generation", async () => {
+  const harness = createPreviewRuntimeHarness({
+    mode: "draft",
+    draftId: 10,
+    pendingText: "old draft",
+    lastSentText: "",
+  });
+  let release: (() => void) | undefined;
+  harness.deps.sendDraft = async () =>
+    new Promise<void>((resolve) => {
+      release = resolve;
+    });
+  let sends = 0;
+  const finalize = createTelegramNativeMarkdownPreviewReceiptFinalizer({
+    getState: harness.deps.getState,
+    sendUnit: async () => {
+      sends += 1;
+      return { messageId: 88 };
+    },
+  });
+  const flush = flushTelegramPreview(7, harness.deps);
+  await Promise.resolve();
+  const pending = finalize();
+  harness.deps.setState({
+    mode: "draft",
+    draftId: 11,
+    pendingText: "new draft",
+    lastSentText: "",
+  });
+  release?.();
+  assert.equal(await pending, undefined);
+  await flush;
+  assert.equal(sends, 0);
+  assert.equal(harness.getState()?.draftId, 11);
 });
 
 test("Native Markdown finalizer stops when preview generation changes during flush", async () => {

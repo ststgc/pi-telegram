@@ -4,7 +4,7 @@
 
 `pi-telegram` owns a single `getUpdates` long-poll connection per bot. Other pi extensions cannot open a competing polling connection against the same bot — the Telegram Bot API uses a per-bot `offset` cursor, and two loops race each other and lose updates.
 
-This document describes the registry that lets layered pi extensions running in the same pi process hook into `pi-telegram`'s polling loop and react to inbound Telegram updates **before** `pi-telegram`'s default routing fires.
+This document describes the registry that lets layered pi extensions running in the same pi process hook into `pi-telegram`'s polling loop and react to paired inbound Telegram updates **before** `pi-telegram`'s default routing fires. While a profile is unpaired, a security gate runs first: only an exact private-human text `/start <code>` claim is eligible, and neither the proof nor any rejected unpaired update reaches this registry.
 
 It is the runtime counterpart to [Callback Namespaces](./callback-namespaces.md): callback namespaces define how to share `callback_data` cleanly; update handlers define how to observe and optionally short-circuit the dispatch of those updates.
 
@@ -25,7 +25,8 @@ If the extension needs a durable top-level Telegram menu section with managed re
 - One bot, one pi process, one `getUpdates` loop. This registry does **not** enable running multiple pi instances against the same bot.
 - Handlers run in the polling loop. They must return quickly; long awaits delay subsequent updates.
 - Handler errors are caught and logged silently so polling never breaks. If you need durable error reporting, do it inside your handler.
-- The registry lives on `globalThis`. Module instance identity is not required, so layered extensions can reach it without importing `@llblab/pi-telegram`.
+- The registry lives on `globalThis`. Module instance identity is not required, so layered extensions can reach it without importing `@ststgc/pi-telegram`.
+- Pairing proofs are deliberately outside the public handler contract in every state. Bots, groups/channels, edits, callbacks, reactions, media, service messages, malformed claims, and all other unpaired updates are denied before handler dispatch. An exact `/start <code>` proof is always suppressed before handlers and default routing, including replay after a successful claim; while unpaired it is claimed atomically, and its generic reply/status refresh are best-effort side effects. After pairing, non-proof update registration order and `consume` behavior are unchanged.
 
 ## Verdicts
 
@@ -40,10 +41,10 @@ The first handler that returns `"consume"` wins; later handlers are not called f
 
 Two equivalent paths.
 
-### Typed import (recommended when you can depend on `@llblab/pi-telegram`)
+### Typed import (recommended when you can depend on `@ststgc/pi-telegram`)
 
 ```ts
-import { registerTelegramUpdateHandler } from "@llblab/pi-telegram/updates";
+import { registerTelegramUpdateHandler } from "@ststgc/pi-telegram/updates";
 
 const off = registerTelegramUpdateHandler(async (update) => {
   const cb = (update as { callback_query?: { id?: string; data?: string } })
@@ -59,7 +60,7 @@ off();
 
 ### Zero-coupling globalThis lookup
 
-When the layered extension prefers no `import` from `@llblab/pi-telegram`, so load order between the two extensions does not matter and either can be installed first, it must implement the **full v1 registry contract**, not just `version` and `add`. pi-telegram's polling runtime calls `dispatch` on whatever object it finds at `globalThis.__piTelegramUpdateHandlerRegistry__`, so a partial object would silently break the first update.
+When the layered extension prefers no `import` from `@ststgc/pi-telegram`, so load order between the two extensions does not matter and either can be installed first, it must implement the **full v1 registry contract**, not just `version` and `add`. pi-telegram's polling runtime calls `dispatch` on whatever object it finds at `globalThis.__piTelegramUpdateHandlerRegistry__`, so a partial object would silently break the first update.
 
 pi-telegram defensively re-creates the registry if the object on `globalThis` is missing `add` or `dispatch`, validated as `version === 1`, `typeof add === "function"`, and `typeof dispatch === "function"`. Handlers registered against a malformed object are dropped — make sure your bootstrap implements all three fields.
 
@@ -126,7 +127,7 @@ The registry object on `globalThis.__piTelegramUpdateHandlerRegistry__` is versi
 
 ## Interaction with built-in routing
 
-`pi-telegram` invokes registered handlers first, then routes the update through its own handlers: commands, app menu, queue menu, model menu, default prompt routing, and callback namespace fallback. If any handler returns `"consume"`, `pi-telegram` skips the rest of routing for that update.
+For paired profiles, `pi-telegram` invokes registered handlers first, then routes the update through its own handlers: commands, app menu, queue menu, model menu, default prompt routing, and callback namespace fallback. The unpaired proof gate is the sole exception and always runs before this public membrane. If any handler returns `"consume"`, `pi-telegram` skips the rest of routing for that update.
 
 This means:
 

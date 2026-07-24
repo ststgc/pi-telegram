@@ -32,17 +32,17 @@ test("Public package subpaths expose the stable extension API", async () => {
     voice,
     keyboard,
   ] = await Promise.all([
-    import("@llblab/pi-telegram"),
-    import("@llblab/pi-telegram/inbound"),
-    import("@llblab/pi-telegram/outbound"),
-    import("@llblab/pi-telegram/delivery"),
-    import("@llblab/pi-telegram/activity"),
-    import("@llblab/pi-telegram/updates"),
-    import("@llblab/pi-telegram/commands"),
-    import("@llblab/pi-telegram/sections"),
-    import("@llblab/pi-telegram/status"),
-    import("@llblab/pi-telegram/voice"),
-    import("@llblab/pi-telegram/keyboard"),
+    import("@ststgc/pi-telegram"),
+    import("@ststgc/pi-telegram/inbound"),
+    import("@ststgc/pi-telegram/outbound"),
+    import("@ststgc/pi-telegram/delivery"),
+    import("@ststgc/pi-telegram/activity"),
+    import("@ststgc/pi-telegram/updates"),
+    import("@ststgc/pi-telegram/commands"),
+    import("@ststgc/pi-telegram/sections"),
+    import("@ststgc/pi-telegram/status"),
+    import("@ststgc/pi-telegram/voice"),
+    import("@ststgc/pi-telegram/keyboard"),
   ]);
 
   assert.deepEqual(Object.keys(root), ["default"]);
@@ -87,6 +87,37 @@ test("Public package subpaths expose the stable extension API", async () => {
   assert.deepEqual(Object.keys(keyboard), []);
 });
 
+test("Package metadata uses the canonical GitHub-only identity", async () => {
+  const packageJson = JSON.parse(
+    await readFile(new URL("../package.json", import.meta.url), "utf8"),
+  ) as {
+    name?: string;
+    private?: boolean;
+    publishConfig?: unknown;
+    repository?: { url?: string };
+    homepage?: string;
+    bugs?: { url?: string };
+    pi?: { image?: string };
+  };
+
+  assert.equal(packageJson.name, "@ststgc/pi-telegram");
+  assert.equal(packageJson.private, true);
+  assert.equal(packageJson.publishConfig, undefined);
+  assert.equal(
+    packageJson.repository?.url,
+    "https://github.com/ststgc/pi-telegram.git",
+  );
+  assert.equal(packageJson.homepage, "https://github.com/ststgc/pi-telegram");
+  assert.equal(
+    packageJson.bugs?.url,
+    "https://github.com/ststgc/pi-telegram/issues",
+  );
+  assert.equal(
+    packageJson.pi?.image,
+    "https://github.com/ststgc/pi-telegram/raw/main/screenshot.png",
+  );
+});
+
 test("Activity API declares the Pi lifecycle compatibility floor", async () => {
   const packageJson = JSON.parse(
     await readFile(new URL("../package.json", import.meta.url), "utf8"),
@@ -106,7 +137,7 @@ test("Activity API declares the Pi lifecycle compatibility floor", async () => {
 });
 
 test("Package-private lib implementation paths are not exported", async () => {
-  await assertPackagePathNotExported("@llblab/pi-telegram/lib/updates.ts");
-  await assertPackagePathNotExported("@llblab/pi-telegram/lib/sections.ts");
-  await assertPackagePathNotExported("@llblab/pi-telegram/api/updates.ts");
+  await assertPackagePathNotExported("@ststgc/pi-telegram/lib/updates.ts");
+  await assertPackagePathNotExported("@ststgc/pi-telegram/lib/sections.ts");
+  await assertPackagePathNotExported("@ststgc/pi-telegram/api/updates.ts");
 });

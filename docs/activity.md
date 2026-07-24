@@ -11,7 +11,7 @@ The public membrane is:
 ```ts
 import {
   registerTelegramActivityHandler,
-} from "@llblab/pi-telegram/activity";
+} from "@ststgc/pi-telegram/activity";
 ```
 
 An issue #126 consumer can own optional Settings policy for reasoning, intermediate assistant prose, and tool rows. Those visibility choices do not become mandatory bridge-core settings.
@@ -299,4 +299,4 @@ The registration and delivery examples above provide the complete public buildin
 - Interactive toggles belong in a registered Section and Settings row; activity messages can remain non-interactive.
 - `session_shutdown` should dispose stable registrations and drop retained delivery handles, so reload/session replacement cannot reuse old contexts or handles.
 
-The separate [`pi-telegram-extension-demo`](https://github.com/llblab/pi-telegram-extension-demo) project remains the maintained companion-extension and managed-UI reference. This document owns the Activity-specific usage pattern; pi-telegram does not ship a redundant `examples/` package directory.
+The separate [`pi-telegram-extension-demo`](https://github.com/llblab/pi-telegram-extension-demo) project remains a historical upstream companion-extension and managed-UI reference and may still use legacy package coordinates. This document owns the Activity-specific usage pattern; pi-telegram does not ship a redundant `examples/` package directory.

@@ -1,7 +1,7 @@
 /**
- * Telegram bridge config and pairing helpers
- * Zones: telegram config, pairing, filesystem
- * Owns persisted bot/session pairing state, local config storage, live config controls, authorization policy, and first-user pairing side effects
+ * Telegram bridge configuration helpers
+ * Zones: telegram config, filesystem
+ * Owns persisted bot/session state, local config storage, live config controls, authorization policy, and serialized profile transactions
  */
 
 import { randomUUID } from "node:crypto";
@@ -67,6 +67,8 @@ export interface TelegramConfig {
   allowedUserId?: number;
   /** @deprecated persisted identity belongs in profiles.default; retained for effective/legacy views */
   lastUpdateId?: number;
+  /** Effective runtime view only; persisted under the active profile. */
+  pairing?: TelegramPairingVerifier;
   inboundHandlers?: TelegramInboundHandlerConfig[];
   attachmentHandlers?: TelegramInboundHandlerConfig[];
   outboundHandlers?: TelegramOutboundHandlerConfig[];
@@ -97,12 +99,23 @@ export interface TelegramConfig {
  * Shared bridge settings (inboundHandlers, outboundHandlers, voice, time,
  * assistant) stay at the top level.
  */
+export const TELEGRAM_PAIRING_EXPIRY_MS = 10 * 60 * 1000;
+
+export interface TelegramPairingVerifier {
+  verifier: string;
+  salt: string;
+  createdAtMs: number;
+  expiresAtMs: number;
+}
+
 export interface TelegramBotProfile {
   botToken: string;
   botUsername?: string;
   botId?: number;
   allowedUserId?: number;
   lastUpdateId?: number;
+  /** Runtime-managed proof verifier. The raw pairing code is never persisted. */
+  pairing?: TelegramPairingVerifier;
 }
 
 /** Profile names must contain only lowercase ASCII letters and digits; max 32 chars. */
@@ -139,6 +152,11 @@ export interface TelegramConfigStore {
   getAttachmentHandlers: () => TelegramInboundHandlerConfig[] | undefined;
   getOutboundHandlers: () => TelegramOutboundHandlerConfig[] | undefined;
   setAllowedUserId: (userId: number) => void;
+  transactActiveProfile: <T>(
+    mutate: (
+      profile: TelegramBotProfile | undefined,
+    ) => { profile: TelegramBotProfile | undefined; result: T },
+  ) => Promise<T>;
   load: () => Promise<void>;
   persist: (config?: TelegramConfig) => Promise<void>;
 }
@@ -228,6 +246,74 @@ function getInvalidTelegramConfigRecoveryPath(configPath: string): string {
   return `${configPath}.invalid-${process.pid}-${Date.now()}`;
 }
 
+const TELEGRAM_PAIRING_VERIFIER_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
+const TELEGRAM_PAIRING_SALT_PATTERN = /^[A-Za-z0-9_-]{22}$/u;
+const TELEGRAM_PAIRING_KEYS = new Set([
+  "verifier",
+  "salt",
+  "createdAtMs",
+  "expiresAtMs",
+]);
+
+function isCanonicalBase64Url(
+  value: unknown,
+  pattern: RegExp,
+  expectedBytes: number,
+): value is string {
+  if (typeof value !== "string" || !pattern.test(value)) return false;
+  const decoded = Buffer.from(value, "base64url");
+  return (
+    decoded.byteLength === expectedBytes &&
+    decoded.toString("base64url") === value
+  );
+}
+
+function validateTelegramPairingVerifier(
+  value: unknown,
+  location: string,
+): void {
+  if (!isPlainConfigRecord(value)) {
+    throw new Error(`Invalid Telegram pairing verifier at ${location}`);
+  }
+  if (
+    !Object.keys(value).every((key) => TELEGRAM_PAIRING_KEYS.has(key)) ||
+    Object.keys(value).length !== TELEGRAM_PAIRING_KEYS.size ||
+    !isCanonicalBase64Url(value.verifier, TELEGRAM_PAIRING_VERIFIER_PATTERN, 32) ||
+    !isCanonicalBase64Url(value.salt, TELEGRAM_PAIRING_SALT_PATTERN, 16) ||
+    !Number.isSafeInteger(value.createdAtMs) ||
+    (value.createdAtMs as number) < 0 ||
+    !Number.isSafeInteger(value.expiresAtMs) ||
+    (value.expiresAtMs as number) - (value.createdAtMs as number) !==
+      TELEGRAM_PAIRING_EXPIRY_MS
+  ) {
+    throw new Error(`Invalid Telegram pairing verifier at ${location}`);
+  }
+}
+
+function parseTelegramConfigContent(
+  content: string,
+  configPath: string,
+): TelegramConfig {
+  const parsed: unknown = JSON.parse(content);
+  if (!isPlainConfigRecord(parsed)) {
+    throw new Error(`Invalid Telegram config object: ${configPath}`);
+  }
+  if (Object.hasOwn(parsed, "pairing")) {
+    validateTelegramPairingVerifier(parsed.pairing, "root");
+  }
+  if (isPlainConfigRecord(parsed.profiles)) {
+    for (const [profileName, profile] of Object.entries(parsed.profiles)) {
+      if (isPlainConfigRecord(profile) && Object.hasOwn(profile, "pairing")) {
+        validateTelegramPairingVerifier(
+          profile.pairing,
+          `profiles.${profileName}`,
+        );
+      }
+    }
+  }
+  return parsed as TelegramConfig;
+}
+
 export async function readTelegramConfig(
   configPath: string,
   options: {
@@ -237,7 +323,7 @@ export async function readTelegramConfig(
   if (!existsSync(configPath)) return {};
   const content = readFileSync(configPath, "utf8");
   try {
-    return JSON.parse(content) as TelegramConfig;
+    return parseTelegramConfigContent(content, configPath);
   } catch {
     // Atomic config publication makes ordinary reads safe without serialization.
     // Acquire the transaction only before destructive invalid-file recovery.
@@ -246,7 +332,7 @@ export async function readTelegramConfig(
       const identity = statSync(configPath);
       const currentContent = readFileSync(configPath, "utf8");
       try {
-        return JSON.parse(currentContent) as TelegramConfig;
+        return parseTelegramConfigContent(currentContent, configPath);
       } catch (error) {
         const currentIdentity = statSync(configPath);
         if (
@@ -282,7 +368,6 @@ export async function writeTelegramConfig(
   });
   await chmod(tempConfigPath, 0o600);
   await rename(tempConfigPath, configPath);
-  await chmod(configPath, 0o600);
 }
 
 function isPlainConfigRecord(value: unknown): value is Record<string, unknown> {
@@ -341,11 +426,7 @@ function mergeTelegramConfigDelta(
 
 function readTelegramConfigForTransaction(configPath: string): TelegramConfig {
   if (!existsSync(configPath)) return {};
-  const parsed: unknown = JSON.parse(readFileSync(configPath, "utf8"));
-  if (!isPlainConfigRecord(parsed)) {
-    throw new Error(`Invalid Telegram config object: ${configPath}`);
-  }
-  return parsed as TelegramConfig;
+  return parseTelegramConfigContent(readFileSync(configPath, "utf8"), configPath);
 }
 
 function writeTelegramConfigInTransaction(
@@ -361,7 +442,6 @@ function writeTelegramConfigInTransaction(
   });
   chmodSync(tempConfigPath, 0o600);
   renameSync(tempConfigPath, configPath);
-  chmodSync(configPath, 0o600);
 }
 
 export function getTelegramProfileFields(
@@ -381,6 +461,9 @@ export function getTelegramProfileFields(
     ...(config.lastUpdateId !== undefined
       ? { lastUpdateId: config.lastUpdateId }
       : {}),
+    ...(config.pairing !== undefined
+      ? { pairing: cloneTelegramConfig(config.pairing) }
+      : {}),
   };
 }
 
@@ -391,6 +474,7 @@ function omitTelegramRootProfileFields(config: TelegramConfig): TelegramConfig {
     botId: _botId,
     allowedUserId: _allowedUserId,
     lastUpdateId: _lastUpdateId,
+    pairing: _pairing,
     ...sharedConfig
   } = config;
   return sharedConfig;
@@ -555,6 +639,67 @@ export function createTelegramConfigStore(
       nextConfig.allowedUserId = userId;
       setEffectiveConfig(nextConfig);
     },
+    transactActiveProfile: <T>(
+      mutate: (
+        profile: TelegramBotProfile | undefined,
+      ) => { profile: TelegramBotProfile | undefined; result: T },
+    ): Promise<T> => {
+      const profileName = activeProfileName ?? TELEGRAM_DEFAULT_PROFILE_NAME;
+      const baseConfig = cloneTelegramConfig(config);
+      const capturedMutationVersion = mutationVersion;
+      let transactionResult!: T;
+      const transaction = persistQueue.then(() => {
+        const committedConfig = withTelegramFileTransaction(
+          `${configPath}.transaction`,
+          () => {
+            const rawConfig = readTelegramConfigForTransaction(configPath);
+            const normalized = normalizeTelegramDefaultProfileConfig(rawConfig);
+            const latestConfig = normalized.config;
+            const currentProfile = latestConfig.profiles?.[profileName];
+            const outcome = mutate(
+              currentProfile
+                ? cloneTelegramConfig(currentProfile)
+                : undefined,
+            );
+            transactionResult = outcome.result;
+            const profiles = { ...(latestConfig.profiles ?? {}) };
+            if (outcome.profile) {
+              profiles[profileName] = cloneTelegramConfig(outcome.profile);
+            } else {
+              delete profiles[profileName];
+            }
+            const nextConfig = {
+              ...latestConfig,
+              profiles:
+                Object.keys(profiles).length > 0 ? profiles : undefined,
+            };
+            if (
+              normalized.changed ||
+              !configValuesEqual(latestConfig, nextConfig)
+            ) {
+              writeTelegramConfigInTransaction(agentDir, configPath, nextConfig);
+            }
+            return nextConfig;
+          },
+        );
+        persistedConfig = cloneTelegramConfig(committedConfig);
+        if (mutationVersion === capturedMutationVersion) {
+          config = cloneTelegramConfig(committedConfig);
+        } else {
+          config = mergeTelegramConfigDelta(
+            baseConfig as Record<string, unknown>,
+            config as Record<string, unknown>,
+            committedConfig as Record<string, unknown>,
+          ) as TelegramConfig;
+        }
+        return transactionResult;
+      });
+      persistQueue = transaction.then(
+        () => undefined,
+        () => undefined,
+      );
+      return transaction;
+    },
     load: async () => {
       const loadedConfig = await readTelegramConfig(configPath, {
         onInvalidConfig: (recovery) => {
@@ -636,23 +781,25 @@ export function createTelegramConfigStore(
 }
 
 export function createTelegramPollingOffsetPersister(
-  configStore: Pick<TelegramConfigStore, "get" | "set" | "persist">,
-  persist: () => Promise<void> = () => configStore.persist(),
+  configStore: Pick<TelegramConfigStore, "get" | "persist">,
+  persist: (config?: TelegramConfig) => Promise<void> = (config) =>
+    configStore.persist(config),
 ): (pollingConfig: { lastUpdateId?: number }) => Promise<void> {
   return async (pollingConfig) => {
     const nextOffset = pollingConfig.lastUpdateId;
-    if (typeof nextOffset === "number") {
-      const current = configStore.get();
-      const currentOffset = current.lastUpdateId;
-      configStore.set({
-        ...current,
-        lastUpdateId:
-          typeof currentOffset === "number"
-            ? Math.max(currentOffset, nextOffset)
-            : nextOffset,
-      });
+    if (typeof nextOffset !== "number") {
+      await persist();
+      return;
     }
-    await persist();
+    const current = configStore.get();
+    const currentOffset = current.lastUpdateId;
+    await persist({
+      ...current,
+      lastUpdateId:
+        typeof currentOffset === "number"
+          ? Math.max(currentOffset, nextOffset)
+          : nextOffset,
+    });
   };
 }
 
@@ -883,79 +1030,19 @@ export function createTelegramConfigControls(
   };
 }
 
-export type TelegramAuthorizationState =
-  { kind: "pair"; userId: number } | { kind: "allow" } | { kind: "deny" };
+export type TelegramAuthorizationState = { kind: "allow" } | { kind: "deny" };
 
-export interface TelegramUserPairingDeps<TContext> {
-  allowedUserId?: number;
-  ctx: TContext;
-  setAllowedUserId: (userId: number) => void;
-  persistConfig: () => Promise<void>;
-  updateStatus: (ctx: TContext) => void;
-}
-
-export interface TelegramUserPairingRuntimeDeps<TContext> {
-  getAllowedUserId: () => number | undefined;
-  setAllowedUserId: (userId: number) => void;
-  persistConfig: () => Promise<void>;
-  updateStatus: (ctx: TContext) => void;
-}
-
-export interface TelegramUserPairingRuntime<TContext> {
-  pairIfNeeded: (userId: number, ctx: TContext) => Promise<boolean>;
+export function isValidTelegramAllowedUserId(
+  userId: number | undefined,
+): userId is number {
+  return Number.isSafeInteger(userId) && (userId ?? 0) > 0;
 }
 
 export function getTelegramAuthorizationState(
   userId: number,
   allowedUserId?: number,
 ): TelegramAuthorizationState {
-  if (allowedUserId === undefined) {
-    return { kind: "pair", userId };
-  }
-  if (userId === allowedUserId) {
-    return { kind: "allow" };
-  }
-  return { kind: "deny" };
-}
-
-function isTelegramStaleContextError(error: unknown): boolean {
-  return (
-    error instanceof Error &&
-    (error.message.includes("stale after session") ||
-      error.message.includes("stale ctx"))
-  );
-}
-
-export async function pairTelegramUserIfNeeded<TContext>(
-  userId: number,
-  deps: TelegramUserPairingDeps<TContext>,
-): Promise<boolean> {
-  const authorization = getTelegramAuthorizationState(
-    userId,
-    deps.allowedUserId,
-  );
-  if (authorization.kind !== "pair") return false;
-  deps.setAllowedUserId(authorization.userId);
-  await deps.persistConfig();
-  try {
-    deps.updateStatus(deps.ctx);
-  } catch (error) {
-    if (!isTelegramStaleContextError(error)) throw error;
-  }
-  return true;
-}
-
-export function createTelegramUserPairingRuntime<TContext>(
-  deps: TelegramUserPairingRuntimeDeps<TContext>,
-): TelegramUserPairingRuntime<TContext> {
-  return {
-    pairIfNeeded: (userId, ctx) =>
-      pairTelegramUserIfNeeded(userId, {
-        allowedUserId: deps.getAllowedUserId(),
-        ctx,
-        setAllowedUserId: deps.setAllowedUserId,
-        persistConfig: deps.persistConfig,
-        updateStatus: deps.updateStatus,
-      }),
-  };
+  return isValidTelegramAllowedUserId(allowedUserId) && userId === allowedUserId
+    ? { kind: "allow" }
+    : { kind: "deny" };
 }

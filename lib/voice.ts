@@ -45,6 +45,7 @@ export type TelegramVoiceSynthesisProviderResult =
   | {
       audioPath: string;
       transcriptText?: string;
+      cleanup?: () => void | Promise<void>;
     }
   | undefined;
 
@@ -150,6 +151,16 @@ export function getTelegramVoiceSynthesisProviders(): TelegramVoiceSynthesisProv
   return Array.from(getOrCreateVoiceSynthesisProviderRegistry().values());
 }
 
+export function getTelegramVoiceSynthesisProviderEntries(): Array<{
+  id: string;
+  provider: TelegramVoiceSynthesisProvider;
+}> {
+  return Array.from(
+    getOrCreateVoiceSynthesisProviderRegistry(),
+    ([id, provider]) => ({ id, provider }),
+  );
+}
+
 export function hasTelegramVoiceSynthesisProvider(): boolean {
   return getOrCreateVoiceSynthesisProviderRegistry().size > 0;
 }
@@ -202,6 +213,16 @@ export function registerTelegramVoiceTranscriptionProvider(
 
 export function getTelegramVoiceTranscriptionProviders(): TelegramVoiceTranscriptionProvider[] {
   return Array.from(getOrCreateVoiceTranscriptionProviderRegistry().values());
+}
+
+export function getTelegramVoiceTranscriptionProviderEntries(): Array<{
+  id: string;
+  provider: TelegramVoiceTranscriptionProvider;
+}> {
+  return Array.from(
+    getOrCreateVoiceTranscriptionProviderRegistry(),
+    ([id, provider]) => ({ id, provider }),
+  );
 }
 
 export function hasTelegramVoiceTranscriptionProvider(): boolean {

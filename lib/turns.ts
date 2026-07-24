@@ -22,6 +22,12 @@ import {
   type DownloadTelegramMessageFilesDeps,
   type TelegramMediaMessage,
 } from "./media.ts";
+import {
+  getTelegramOperationOwnedFiles,
+  setTelegramOperationOwnedFiles,
+  settleTelegramOperationOwnedFileCleanup,
+  type TelegramOperationOwnedPrivateFile,
+} from "./operation-files.ts";
 import type {
   PendingTelegramTurn,
   TelegramPromptContent,
@@ -54,6 +60,7 @@ export interface TelegramTurnTarget {
 export interface TelegramTurnMessage {
   message_id: number;
   message_thread_id?: number;
+  business_connection_id?: string;
   chat: { id: number; type?: string };
 }
 
@@ -407,6 +414,7 @@ export interface BuildTelegramPromptTurnOptions {
   rawText: string;
   statusText?: string;
   files: DownloadedTelegramTurnFile[];
+  sourceFiles?: DownloadedTelegramTurnFile[];
   promptFiles?: DownloadedTelegramTurnFile[];
   displayFiles?: DownloadedTelegramTurnFile[];
   handlerOutputs?: string[];
@@ -457,14 +465,22 @@ export function createTelegramPromptTurnRuntimeBuilder<
   ctx?: TContext,
 ) => Promise<PendingTelegramTurn> {
   return async (messages, historyTurns = [], ctx) => {
+    const operationFiles: TelegramOperationOwnedPrivateFile[] = [];
+    try {
     const rawText = extractTelegramMessagesText(messages);
     const firstMessage = messages[0];
     const replyFiles = firstMessage?.reply_to_message
       ? await downloadTelegramMessageFiles(
           [firstMessage.reply_to_message as typeof firstMessage],
-          { downloadFile: deps.downloadFile },
+          {
+            downloadFile: deps.downloadFile,
+            recordCleanupFailure: deps.recordCleanupFailure,
+          },
         )
       : [];
+    operationFiles.push(
+      ...replyFiles.flatMap((file) => getTelegramOperationOwnedFiles(file)),
+    );
     const replyContext = firstMessage
       ? buildTelegramReplyContextBlock(firstMessage, replyFiles)
       : "";
@@ -488,7 +504,11 @@ export function createTelegramPromptTurnRuntimeBuilder<
     });
     const files = await downloadTelegramMessageFiles(messages, {
       downloadFile: deps.downloadFile,
+      recordCleanupFailure: deps.recordCleanupFailure,
     });
+    operationFiles.push(
+      ...files.flatMap((file) => getTelegramOperationOwnedFiles(file)),
+    );
     const processed = deps.processAttachments
       ? await deps.processAttachments(files, rawText, ctx as TContext)
       : { rawText, promptFiles: files };
@@ -553,7 +573,7 @@ export function createTelegramPromptTurnRuntimeBuilder<
       ? deps.getTelegramThreadLabel?.(firstMessage)
       : undefined;
     const telegramPrefix = createTelegramTurnPrefix({ thread: threadLabel });
-    return buildTelegramPromptTurnRuntime({
+    const turn = await buildTelegramPromptTurnRuntime({
       telegramPrefix,
       messages,
       historyTurns,
@@ -562,6 +582,7 @@ export function createTelegramPromptTurnRuntimeBuilder<
       sourceContext,
       statusText: processed.rawText,
       files,
+      sourceFiles: replyFiles,
       promptFiles: processed.promptFiles,
       displayFiles: (processed.promptFiles ?? files).filter(
         (file) => !forwardedFilePaths.has(file.path),
@@ -576,6 +597,16 @@ export function createTelegramPromptTurnRuntimeBuilder<
         rawText,
       ),
     });
+    setTelegramOperationOwnedFiles(turn, operationFiles);
+    return turn;
+    } catch (error) {
+      await settleTelegramOperationOwnedFileCleanup(
+        operationFiles,
+        "turn-build-failure-cleanup",
+        deps.recordCleanupFailure,
+      );
+      throw error;
+    }
   };
 }
 
@@ -645,10 +676,22 @@ export async function buildTelegramPromptTurn(
     }
   }
 
+  const recoveryFiles = [
+    ...options.files,
+    ...(options.sourceFiles ?? []),
+    ...(options.promptFiles ?? []),
+  ].filter(
+    (file, index, entries) =>
+      entries.findIndex((candidate) => candidate.path === file.path) === index,
+  );
+
   return {
     kind: "prompt",
     chatId: firstMessage.chat.id,
     target: getTelegramTurnTarget(firstMessage),
+    ...(firstMessage.business_connection_id
+      ? { businessConnectionId: firstMessage.business_connection_id }
+      : {}),
     replyToMessageId: firstMessage.message_id,
     sourceMessageIds: collectTelegramMessageIds(options.messages),
     queueOrder: options.queueOrder,
@@ -656,6 +699,16 @@ export async function buildTelegramPromptTurn(
     laneOrder: options.queueOrder,
     queuedAttachments: [],
     content,
+    ...(recoveryFiles.length > 0
+      ? {
+          recoveryFiles: recoveryFiles.map((file) => ({
+            path: file.path,
+            fileName: file.fileName,
+            ...(file.mimeType ? { mimeType: file.mimeType } : {}),
+            ...(file.kind ? { kind: file.kind } : {}),
+          })),
+        }
+      : {}),
     historyText: appendTelegramSourceContext(
       formatTelegramHistoryText(
         options.rawText,

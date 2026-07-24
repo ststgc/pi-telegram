@@ -4,6 +4,7 @@
  */
 
 import assert from "node:assert/strict";
+import { EventEmitter, getEventListeners } from "node:events";
 import {
   mkdir,
   mkdtemp,
@@ -15,6 +16,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 
 import {
@@ -30,12 +32,17 @@ import {
   createTelegramNativeMarkdownDraftSender,
   downloadTelegramFile,
   fetchTelegramBotIdentity,
+  getTelegramApiAttemptDeadlineMs,
+  getTelegramApiMethodClass,
   getTelegramInboundFileByteLimitFromEnv,
   isTelegramApiCommitUnknownError,
   isTelegramMessageNotModifiedError,
   setTelegramApiHttpsFetchForTesting,
+  setTelegramApiHttpsRequestForTesting,
+  setTelegramApiRetryTimerForTesting,
   prepareTelegramTempDir,
   TELEGRAM_FILE_MAX_BYTES,
+  TelegramApiTimeoutError,
   type TelegramApiClient,
   type TelegramInputRichMessage,
 } from "../lib/telegram-api.ts";
@@ -95,6 +102,38 @@ function setApiTestNetworkFamily(value: string | undefined): () => void {
     if (previous === undefined) delete process.env.PI_TELEGRAM_NETWORK_FAMILY;
     else process.env.PI_TELEGRAM_NETWORK_FAMILY = previous;
   };
+}
+
+class FakeTelegramClientRequest extends EventEmitter {
+  destroyed = false;
+  ended = false;
+
+  end(): void {
+    this.ended = true;
+  }
+
+  destroy(error?: Error): this {
+    this.destroyed = true;
+    if (error) this.emit("error", error);
+    this.emit("close");
+    return this;
+  }
+}
+
+function createFakeTelegramIncomingMessage(): PassThrough & {
+  headers: Record<string, string>;
+  statusCode: number;
+  statusMessage: string;
+} {
+  const response = new PassThrough() as PassThrough & {
+    headers: Record<string, string>;
+    statusCode: number;
+    statusMessage: string;
+  };
+  response.headers = { "content-type": "application/json" };
+  response.statusCode = 200;
+  response.statusMessage = "OK";
+  return response;
 }
 
 function createSyntheticFetchFailure(): TypeError {
@@ -409,7 +448,8 @@ test("Non-idempotent Telegram API calls retry explicit 429 but report 5xx commit
         }),
       (error) =>
         isTelegramApiCommitUnknownError(error) &&
-        error.method === "sendMessage",
+        error.method === "sendMessage" &&
+        error.reason === "response-lost",
     );
     assert.equal(calls, 2);
     assert.deepEqual(sleeps, [2000]);
@@ -663,7 +703,9 @@ test("Telegram multipart 5xx reports commit unknown without replay", async () =>
           "demo.txt",
           { retryBaseDelayMs: 0, sleep: async () => {} },
         ),
-      (error) => isTelegramApiCommitUnknownError(error),
+      (error) =>
+        isTelegramApiCommitUnknownError(error) &&
+        error.reason === "response-lost",
     );
     assert.equal(calls, 1);
     assert.deepEqual(contentTypes, ["blob"]);
@@ -773,7 +815,9 @@ test("Non-idempotent malformed success becomes commit-unknown", async () => {
         callTelegram("123:abc", "createForumTopic", {}, {
           maxAttempts: 1,
         }),
-      isTelegramApiCommitUnknownError,
+      (error) =>
+        isTelegramApiCommitUnknownError(error) &&
+        error.reason === "malformed-success",
     );
   } finally {
     restoreFetch();
@@ -1213,6 +1257,325 @@ test("Telegram bridge API runtime edits messages and tolerates unchanged text", 
   assert.deepEqual(events, []);
 });
 
+test("Telegram API method classes expose bounded long-poll and transport defaults", () => {
+  assert.equal(getTelegramApiMethodClass("getUpdates"), "long-poll");
+  assert.equal(getTelegramApiMethodClass("getMe"), "read");
+  assert.equal(getTelegramApiMethodClass("sendMessage"), "mutation");
+  assert.equal(getTelegramApiMethodClass("downloadFile"), "download");
+  assert.equal(getTelegramApiAttemptDeadlineMs("getUpdates", { timeout: 30 }), 40_000);
+  assert.equal(getTelegramApiAttemptDeadlineMs("getMe") > 0, true);
+});
+
+test("Telegram custom HTTPS path times out a stalled connect/TLS attempt", async () => {
+  const restoreEnv = setApiTestNetworkFamily("ipv4");
+  let transportSignal: AbortSignal | undefined;
+  const restoreHttpsFetch = setTelegramApiHttpsFetchForTesting(
+    async (_input, init) => {
+      transportSignal = init.signal as AbortSignal;
+      return new Promise<Response>(() => {});
+    },
+  );
+  try {
+    await assert.rejects(
+      () => callTelegram("123:abc", "getMe", {}, { deadlineMs: 5, maxAttempts: 1 }),
+      TelegramApiTimeoutError,
+    );
+    assert.equal(transportSignal?.aborted, true);
+  } finally {
+    restoreHttpsFetch();
+    restoreEnv();
+  }
+});
+
+test("Production Telegram HTTPS transport aborts a pending request and cleans listeners", async () => {
+  const restoreEnv = setApiTestNetworkFamily("ipv4");
+  const request = new FakeTelegramClientRequest();
+  let transportSignal: AbortSignal | undefined;
+  const restoreRequest = setTelegramApiHttpsRequestForTesting(
+    () => request as never,
+    (signal) => { transportSignal = signal; },
+  );
+  const caller = new AbortController();
+  try {
+    const pending = callTelegram("123:abc", "getMe", {}, {
+      signal: caller.signal,
+      deadlineMs: 1_000,
+      maxAttempts: 1,
+    });
+    await Promise.resolve();
+    assert.equal(getEventListeners(transportSignal!, "abort").length, 1);
+    caller.abort();
+    await assert.rejects(pending, (error) =>
+      error instanceof DOMException && error.name === "AbortError"
+    );
+    assert.equal(request.destroyed, true);
+    assert.equal(getEventListeners(transportSignal!, "abort").length, 0);
+  } finally {
+    restoreRequest();
+    restoreEnv();
+  }
+});
+
+test("Production Telegram HTTPS transport keeps a stalled body abortable", async () => {
+  const restoreEnv = setApiTestNetworkFamily("ipv4");
+  const request = new FakeTelegramClientRequest();
+  const response = createFakeTelegramIncomingMessage();
+  let transportSignal: AbortSignal | undefined;
+  const restoreRequest = setTelegramApiHttpsRequestForTesting(
+    (_url, _options, callback) => {
+      queueMicrotask(() => callback(response as never));
+      return request as never;
+    },
+    (signal) => { transportSignal = signal; },
+  );
+  const caller = new AbortController();
+  try {
+    const pending = callTelegram("123:abc", "getMe", {}, {
+      signal: caller.signal,
+      deadlineMs: 1_000,
+      maxAttempts: 1,
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(getEventListeners(transportSignal!, "abort").length, 1);
+    caller.abort();
+    await assert.rejects(pending, (error) =>
+      error instanceof DOMException && error.name === "AbortError"
+    );
+    assert.equal(response.destroyed, true);
+    assert.equal(getEventListeners(transportSignal!, "abort").length, 0);
+  } finally {
+    restoreRequest();
+    restoreEnv();
+  }
+});
+
+test("Production Telegram HTTPS transport cleans listeners on success, error, and close", async () => {
+  const restoreEnv = setApiTestNetworkFamily("ipv4");
+  try {
+    for (const settlement of ["success", "error", "close"] as const) {
+      const request = new FakeTelegramClientRequest();
+      let transportSignal: AbortSignal | undefined;
+      const restoreRequest = setTelegramApiHttpsRequestForTesting(
+        (_url, _options, callback) => {
+          queueMicrotask(() => {
+            if (settlement === "success") {
+              const response = createFakeTelegramIncomingMessage();
+              callback(response as never);
+              response.end(JSON.stringify(createApiResponseBody(true)));
+            } else if (settlement === "error") {
+              request.emit("error", new Error("request failed"));
+            } else {
+              request.emit("close");
+            }
+          });
+          return request as never;
+        },
+        (signal) => { transportSignal = signal; },
+      );
+      try {
+        const operation = callTelegram("123:abc", "getMe", {}, {
+          deadlineMs: 1_000,
+          maxAttempts: 1,
+        });
+        if (settlement === "success") assert.equal(await operation, true);
+        else await assert.rejects(operation);
+        assert.equal(getEventListeners(transportSignal!, "abort").length, 0);
+      } finally {
+        restoreRequest();
+      }
+    }
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("HTTPS close before headers retries reads and marks mutations commit-unknown", async () => {
+  const restoreEnv = setApiTestNetworkFamily("ipv4");
+  let calls = 0;
+  let mutationMode = false;
+  const restoreRequest = setTelegramApiHttpsRequestForTesting(
+    (_url, _options, callback) => {
+      calls += 1;
+      const request = new FakeTelegramClientRequest();
+      queueMicrotask(() => {
+        if (!mutationMode && calls > 1) {
+          const response = createFakeTelegramIncomingMessage();
+          callback(response as never);
+          response.end(JSON.stringify(createApiResponseBody(true)));
+          return;
+        }
+        request.emit("close");
+      });
+      return request as never;
+    },
+  );
+  try {
+    assert.equal(
+      await callTelegram("123:abc", "getMe", {}, {
+        retryBaseDelayMs: 0,
+        sleep: async () => {},
+      }),
+      true,
+    );
+    assert.equal(calls, 2);
+
+    mutationMode = true;
+    calls = 0;
+    await assert.rejects(
+      () =>
+        callTelegram("123:abc", "sendMessage", {}, {
+          maxAttempts: 1,
+        }),
+      (error) =>
+        isTelegramApiCommitUnknownError(error) &&
+        error.reason === "connection-lost-after-write",
+    );
+    assert.equal(calls, 1);
+  } finally {
+    restoreRequest();
+    restoreEnv();
+  }
+});
+
+test("Telegram API deadline covers stalled headers and distinguishes caller abort", async () => {
+  let deadlineSignal: AbortSignal | undefined;
+  const restoreFetch = setApiTestFetch(async (_input, init) => {
+    deadlineSignal = init?.signal as AbortSignal;
+    return new Promise<Response>(() => {});
+  });
+  try {
+    await assert.rejects(
+      () => callTelegram("123:abc", "getMe", {}, { deadlineMs: 5, maxAttempts: 1 }),
+      TelegramApiTimeoutError,
+    );
+    assert.equal(deadlineSignal?.aborted, true);
+
+    const caller = new AbortController();
+    const pending = callTelegram("123:abc", "getMe", {}, {
+      signal: caller.signal,
+      deadlineMs: 1_000,
+      maxAttempts: 1,
+    });
+    caller.abort();
+    await assert.rejects(pending, (error) =>
+      error instanceof DOMException && error.name === "AbortError"
+    );
+  } finally {
+    restoreFetch();
+  }
+});
+
+test("Telegram API timeout preserves retry and commit-unknown classification", async () => {
+  let calls = 0;
+  const restoreFetch = setApiTestFetch(async () => {
+    calls += 1;
+    if (calls === 1) return new Promise<Response>(() => {});
+    return createApiJsonResponse(true);
+  });
+  try {
+    assert.equal(
+      await callTelegram("123:abc", "getMe", {}, {
+        deadlineMs: 5,
+        retryBaseDelayMs: 0,
+        sleep: async () => {},
+      }),
+      true,
+    );
+    calls = 0;
+    await assert.rejects(
+      () => callTelegram("123:abc", "sendMessage", {}, {
+        deadlineMs: 5,
+        maxAttempts: 1,
+      }),
+      (error) =>
+        isTelegramApiCommitUnknownError(error) &&
+        error.reason === "timeout-after-write",
+    );
+  } finally {
+    restoreFetch();
+  }
+});
+
+test("Telegram API deadline covers stalled body consumption", async () => {
+  const restoreFetch = setApiTestFetch(async () => ({
+    ok: true,
+    status: 200,
+    text: async () => new Promise<string>(() => {}),
+  }) as Response);
+  try {
+    await assert.rejects(
+      () => callTelegram("123:abc", "getMe", {}, { deadlineMs: 5, maxAttempts: 1 }),
+      TelegramApiTimeoutError,
+    );
+  } finally {
+    restoreFetch();
+  }
+});
+
+test("Telegram API retry delay is caller-cancellable and removes listeners", async () => {
+  const caller = new AbortController();
+  const baseline = getEventListeners(caller.signal, "abort").length;
+  const restoreFetch = setApiTestFetch(async () =>
+    createApiErrorResponse(503, "Unavailable")
+  );
+  let releaseSleep: (() => void) | undefined;
+  try {
+    const pending = callTelegram("123:abc", "getMe", {}, {
+      signal: caller.signal,
+      retryBaseDelayMs: 10,
+      sleep: async () => new Promise<void>((resolve) => { releaseSleep = resolve; }),
+    });
+    await Promise.resolve();
+    caller.abort();
+    await assert.rejects(pending, (error) =>
+      error instanceof DOMException && error.name === "AbortError"
+    );
+    releaseSleep?.();
+    assert.equal(getEventListeners(caller.signal, "abort").length, baseline);
+  } finally {
+    restoreFetch();
+  }
+});
+
+test("Default Telegram retry timer is cancelled with its abort listener", async () => {
+  const caller = new AbortController();
+  const baseline = getEventListeners(caller.signal, "abort").length;
+  const restoreFetch = setApiTestFetch(async () =>
+    createApiErrorResponse(503, "Unavailable")
+  );
+  let activeTimer = false;
+  let cleared = false;
+  const fakeTimer = { unref() {} } as ReturnType<typeof setTimeout>;
+  const restoreTimer = setTelegramApiRetryTimerForTesting(
+    () => {
+      activeTimer = true;
+      return fakeTimer;
+    },
+    () => {
+      activeTimer = false;
+      cleared = true;
+    },
+  );
+  try {
+    const pending = callTelegram("123:abc", "getMe", {}, {
+      signal: caller.signal,
+      retryBaseDelayMs: 60_000,
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(activeTimer, true);
+    caller.abort();
+    await assert.rejects(pending, (error) =>
+      error instanceof DOMException && error.name === "AbortError"
+    );
+    assert.equal(cleared, true);
+    assert.equal(activeTimer, false);
+    assert.equal(getEventListeners(caller.signal, "abort").length, baseline);
+  } finally {
+    restoreTimer();
+    restoreFetch();
+  }
+});
+
 test("Telegram API client resolves bot tokens lazily for wrapped calls", async () => {
   const calls: string[] = [];
   let botToken = "123:abc";
@@ -1230,4 +1593,43 @@ test("Telegram API client resolves bot tokens lazily for wrapped calls", async (
   } finally {
     restoreFetch();
   }
+});
+
+test("getMe requires HTTP success, ok, and a strict bot identity schema", async () => {
+  const invalidBodies = [
+    { ok: false, result: { id: 1, is_bot: true, first_name: "Demo" } },
+    { ok: true, result: { id: 0, is_bot: true, first_name: "Demo" } },
+    { ok: true, result: { id: 1, is_bot: false, first_name: "Demo" } },
+    { ok: true, result: { id: 1, is_bot: true, first_name: "   " } },
+    {
+      ok: true,
+      result: {
+        id: 1,
+        is_bot: true,
+        first_name: "Demo",
+        username: "bad name",
+      },
+    },
+  ];
+  for (const body of invalidBodies) {
+    await assert.rejects(
+      () => fetchTelegramBotIdentity(" token ", async (url) => {
+        assert.equal(String(url), "https://api.telegram.org/bottoken/getMe");
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }),
+      /invalid (response|bot identity)/,
+    );
+  }
+  await assert.rejects(
+    () =>
+      fetchTelegramBotIdentity(
+        "token",
+        async () => new Response("no", { status: 500 }),
+      ),
+    /HTTP 500/,
+  );
+  await assert.rejects(() => fetchTelegramBotIdentity("   "), /not configured/);
 });

@@ -340,6 +340,8 @@ function isAbandonedLockTransaction(path: string): boolean {
 
 const TELEGRAM_TRANSACTION_RECLAIM_PATTERN =
   /^owner\.reclaim\.(\d+)\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.json$/u;
+// Keep the pre-rename key so co-loaded @llblab and @ststgc package copies
+// serialize transaction recovery through one process-global set.
 const TELEGRAM_ACTIVE_TRANSACTION_RECLAIMS = Symbol.for(
   "@llblab/pi-telegram/active-transaction-reclaims",
 );
@@ -1113,6 +1115,7 @@ export interface TelegramLockedPollingRuntime<
     options?: TelegramLockedPollingStartOptions,
   ) => Promise<TelegramLockedPollingStartResult>;
   stop: () => Promise<string>;
+  terminalizeTransportLease: () => Promise<void>;
   suspend: () => Promise<void>;
   onSessionStart: (_event: unknown, ctx: TContext) => Promise<void>;
   registerFollowerWithOwner?: (
@@ -1351,6 +1354,18 @@ export function createTelegramLockedPollingRuntime<
         return `Removed stale Telegram bridge lock (${formatTelegramLockEntry(state.lock)}).`;
       }
       return "Telegram bridge disconnected.";
+    },
+    terminalizeTransportLease: async () => {
+      sessionAutoStartGeneration += 1;
+      deps.stopFollowerRegistration?.();
+      stopOwnershipWatcher();
+      try {
+        if (sessionAutoStartRun) await sessionAutoStartRun;
+        if (ownershipStop) await ownershipStop;
+        else await deps.stopPolling();
+      } finally {
+        deps.lock.release();
+      }
     },
     suspend: suspendPolling,
     onSessionStart: async (_event, ctx) => {

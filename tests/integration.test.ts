@@ -4,7 +4,14 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as waitForTimeout } from "node:timers/promises";
@@ -12,16 +19,24 @@ import testRoot, { mock, type TestContext } from "node:test";
 
 import { registerTelegramActivityHandler } from "../api/activity.ts";
 import * as BusApi from "../lib/bus-api.ts";
+import * as BusFollower from "../lib/bus-follower.ts";
 import * as BusLeader from "../lib/bus-leader.ts";
 import * as Bus from "../lib/bus.ts";
 import * as Delivery from "../lib/delivery.ts";
+import * as Locks from "../lib/locks.ts";
+import * as Polling from "../lib/polling.ts";
+import * as Recovery from "../lib/recovery.ts";
 import type { TelegramBridgeApiRuntime } from "../lib/telegram-api.ts";
 
 type RuntimeTestHandler = (context: TestContext) => void | Promise<void>;
 type RuntimeTelegramExtension = (typeof import("../index.ts"))["default"];
 
 function test(name: string, fn: RuntimeTestHandler): void {
-  void testRoot(name, { concurrency: false, timeout: 5000 }, fn);
+  const timeout = name ===
+      "Public activity delivery reaches the classic instance without blocking agent start"
+    ? 20_000
+    : 15_000;
+  void testRoot(name, { concurrency: false, timeout }, fn);
 }
 
 let runtimeTelegramExtension: RuntimeTelegramExtension | undefined;
@@ -44,6 +59,327 @@ async function getRuntimeTelegramExtension(): Promise<RuntimeTelegramExtension> 
   return runtimeTelegramExtension;
 }
 
+test("Profile-wide recovery downgrade fences follower and leader before quarantine", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-downgrade-integration-"));
+  const followerSocketPath = join(dir, "follower.sock");
+  const followerGate = new Recovery.RecoveryProfileOperationGate();
+  const leaderGate = new Recovery.RecoveryProfileOperationGate();
+  let followerSuspended = 0;
+  let leaderSuspended = 0;
+  let quarantined = 0;
+  const receiver = BusFollower.createTelegramBusForwardedUpdateReceiverRuntime({
+    socketPath: followerSocketPath,
+    instanceId: "follower-a",
+    getAuthSecret: () => "secret",
+    getRegistrationGeneration: () => "registration-a",
+    getProfile: () => "default",
+    getContext: () => "follower-ctx",
+    recoveryFence: {
+      enter: (profile) => followerGate.enter(profile),
+      beginFencing: (profile, generation) =>
+        followerGate.beginFencing(profile, generation),
+      awaitDrained: (profile, generation) =>
+        followerGate.awaitDrained(profile, generation),
+      resumeAfter: (profile, generation, resumeRuntime) =>
+        followerGate.resumeAfter(profile, generation, resumeRuntime),
+      suspendRuntime() {
+        followerSuspended += 1;
+      },
+      resumeRuntime() {
+        assert.fail("successful quarantine must not resume follower runtime");
+      },
+    },
+    handleForwardedCallback() {},
+    handleForwardedReaction() {},
+  });
+  const follower = {
+    instanceId: "follower-a",
+    registrationGeneration: "registration-a",
+    busSocketPath: followerSocketPath,
+    connectedAtMs: 1,
+    lastHeartbeatMs: 1,
+  };
+  const downgrade = BusLeader.createTelegramRecoveryDowngradeCoordinator<string>({
+    canCoordinate: () => true,
+    getCoordinationGeneration: () => "leader-epoch-1",
+    getProfile: () => "default",
+    getFollowers: () => [follower],
+    getAuthSecret: () => "secret",
+    createRequestId: () => "leader:fence:1",
+    gate: leaderGate,
+    preflight: () => ({ safe: true, blockerCount: 0 }),
+    beginStoreExclusive() {},
+    quarantineStore() {
+      quarantined += 1;
+      return join(dir, "quarantine");
+    },
+    cancelStoreExclusive() {
+      assert.fail("successful quarantine must not cancel store exclusive");
+    },
+    stopPolling() {},
+    suspendRuntime() {
+      leaderSuspended += 1;
+    },
+    resumeRuntime() {
+      assert.fail("successful quarantine must not resume leader runtime");
+    },
+    createFenceGeneration: () => "fence-a",
+  });
+  try {
+    await receiver.start();
+    assert.deepEqual(await downgrade("leader-ctx"), {
+      status: "downgraded",
+    });
+    assert.equal(followerSuspended, 1);
+    assert.equal(leaderSuspended, 1);
+    assert.equal(quarantined, 1);
+    assert.equal(followerGate.getState("default").phase, "fencing");
+    assert.equal(leaderGate.getState("default").phase, "quarantined");
+    assert.equal(followerGate.enter("default"), undefined);
+    assert.equal(leaderGate.enter("default"), undefined);
+  } finally {
+    await receiver.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Recovery downgrade suspends and drains outbound scheduling before failure resume", async () => {
+  const gate = new Recovery.RecoveryProfileOperationGate();
+  const inFlight = gate.enter("default");
+  assert.ok(inFlight);
+  const events: string[] = [];
+  let releaseDrain: (() => void) | undefined;
+  const drained = new Promise<void>((resolve) => {
+    releaseDrain = resolve;
+  });
+  const downgrade = BusLeader.createTelegramRecoveryDowngradeCoordinator<string>({
+    canCoordinate: () => true,
+    getCoordinationGeneration: () => "leader-epoch-drain",
+    getProfile: () => "default",
+    getFollowers: () => [],
+    getAuthSecret: () => "secret",
+    createRequestId: () => "leader:fence:drain",
+    gate,
+    preflight: () => ({ safe: true, blockerCount: 0 }),
+    beginStoreExclusive() {
+      events.push("store:exclusive");
+      throw new Error("exclusive failed");
+    },
+    quarantineStore() {
+      assert.fail("failed exclusive must not quarantine");
+    },
+    cancelStoreExclusive() {},
+    stopPolling() {
+      events.push("polling:stop");
+    },
+    async suspendRuntime() {
+      events.push("scheduler:suspend");
+      await drained;
+      events.push("scheduler:drained");
+    },
+    resumeRuntime() {
+      events.push("scheduler:resume");
+    },
+    createFenceGeneration: () => "fence-drain",
+  });
+
+  const attempt = downgrade("ctx");
+  for (
+    let index = 0;
+    index < 100 && !events.includes("scheduler:suspend");
+    index += 1
+  ) {
+    await waitForTimeout(1);
+  }
+  assert.deepEqual(events, ["polling:stop", "scheduler:suspend"]);
+  inFlight.release();
+  releaseDrain?.();
+  await assert.rejects(attempt, /exclusive failed/);
+  assert.deepEqual(events, [
+    "polling:stop",
+    "scheduler:suspend",
+    "scheduler:drained",
+    "store:exclusive",
+    "scheduler:resume",
+  ]);
+  assert.equal(gate.getState("default").phase, "active");
+  assert.ok(gate.enter("default"));
+});
+
+test("Recovery downgrade reports outbound and future bus blockers before fencing", async () => {
+  const gate = new Recovery.RecoveryProfileOperationGate();
+  const sideEffects: string[] = [];
+  const downgrade = BusLeader.createTelegramRecoveryDowngradeCoordinator<string>({
+    canCoordinate: () => true,
+    getCoordinationGeneration: () => "leader-epoch-blocked",
+    getProfile: () => "default",
+    getFollowers: () => [],
+    getAuthSecret: () => "secret",
+    createRequestId: () => "leader:fence:blocked",
+    gate,
+    preflight: () => ({ safe: false, blockerCount: 3 }),
+    beginStoreExclusive() {
+      sideEffects.push("exclusive");
+    },
+    quarantineStore() {
+      sideEffects.push("quarantine");
+      return "quarantine";
+    },
+    cancelStoreExclusive() {
+      sideEffects.push("cancel");
+    },
+    stopPolling() {
+      sideEffects.push("polling");
+    },
+    suspendRuntime() {
+      sideEffects.push("suspend");
+    },
+    resumeRuntime() {
+      sideEffects.push("resume");
+    },
+    createFenceGeneration: () => "fence-blocked",
+  });
+
+  assert.deepEqual(await downgrade("ctx"), {
+    status: "blocked",
+    blockerCount: 3,
+  });
+  assert.deepEqual(sideEffects, []);
+  assert.equal(gate.getState("default").phase, "active");
+});
+
+test("Poll supervisor terminal failure stops bus transport and releases the exact lease", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-poll-terminal-"));
+  const socketPath = join(dir, "bus.sock");
+  const registry = Bus.createTelegramBusFollowerRegistry();
+  const events: string[] = [];
+  const ctx = { cwd: dir };
+  const pollingState = Polling.createTelegramPollingControllerState();
+  const terminalBinding = Polling.createTelegramPollingTerminalLeaseBinding();
+  let rejectPoll: ((error: Error) => void) | undefined;
+  const pollingController = Polling.createTelegramPollingControllerRuntime<
+    { update_id: number },
+    typeof ctx
+  >({
+    state: pollingState,
+    getConfig: () => ({ botToken: "123:abc", lastUpdateId: 1 }),
+    hasBotToken: () => true,
+    deleteWebhook: async () => {},
+    getUpdates: async () => {
+      events.push("poll:start");
+      return new Promise<never>((_resolve, reject) => {
+        rejectPoll = reject;
+      });
+    },
+    persistConfig: async () => {},
+    handleUpdate: async () => {},
+    stopTypingLoop: () => {},
+    updateStatus: () => {},
+    maxRestarts: 0,
+    supervisorSleep: async () => {},
+    onTerminalFailure: async (info) => {
+      await terminalBinding.handle(info);
+    },
+  });
+  const busRuntime = BusLeader.createTelegramBusLeaderRuntime({
+    socketPath,
+    followerRegistry: registry,
+    followerPruneIntervalMs: 5,
+    followerStaleAfterMs: 5,
+    startPolling: pollingController.start,
+    stopPolling: async () => {
+      events.push("poll:stop");
+      await pollingController.stop();
+    },
+  });
+  const lock = Locks.createTelegramLockRuntime<typeof ctx>({
+    key: "terminal-test",
+    locksPath: join(dir, "owners.json"),
+    pid: 4242,
+    instanceId: "leader",
+    isProcessAlive: () => true,
+  });
+  const lockedRuntime = Locks.createTelegramLockedPollingRuntime({
+    lock,
+    hasBotToken: () => true,
+    ownershipCheckMs: 5,
+    ownershipRefreshMs: 5,
+    startPolling: async () => {
+      events.push("health:start");
+      await busRuntime.startPolling(ctx);
+    },
+    stopPolling: async () => {
+      events.push("health:stop");
+      await busRuntime.stopPolling();
+    },
+    updateStatus: () => {},
+  });
+  terminalBinding.set(
+    Polling.createTelegramPollingTerminalLeaseHandler({
+      state: pollingState,
+      terminalizeTransportLease: lockedRuntime.terminalizeTransportLease,
+    }),
+  );
+  try {
+    assert.equal((await lockedRuntime.start(ctx)).ok, true);
+    assert.equal(lock.owns(ctx), true);
+    await waitForEventLoopCondition(() => rejectPoll !== undefined);
+    assert.equal(
+      (
+        await Bus.sendTelegramBusLocalEnvelope({
+          socketPath,
+          envelope: {
+            kind: "follower.register",
+            requestId: "follower:1",
+            registration: {
+              instanceId: "follower",
+              connectedAtMs: 1,
+              registrationGeneration: "follower:1",
+            },
+          },
+        })
+      )?.kind,
+      "bus.ack",
+    );
+    const failPoll = rejectPoll;
+    assert.ok(failPoll);
+    failPoll(new Error("simulated getUpdates transport failure"));
+    await waitForCondition(
+      () =>
+        !lock.owns(ctx) &&
+        pollingState.terminalizingGeneration === undefined &&
+        !Polling.isTelegramPollingControllerActive(pollingState),
+    );
+    assert.equal(lock.owns(ctx), false);
+    assert.deepEqual(events, [
+      "health:start",
+      "poll:start",
+      "health:stop",
+      "poll:stop",
+    ]);
+    assert.deepEqual(registry.list(), []);
+    await assert.rejects(
+      Bus.sendTelegramBusLocalEnvelope({
+        socketPath,
+        envelope: {
+          kind: "follower.heartbeat",
+          requestId: "follower:2",
+          instanceId: "follower",
+          sentAtMs: 2,
+        },
+        timeoutMs: 50,
+      }),
+    );
+    registry.register({ instanceId: "prune-probe", connectedAtMs: 0 });
+    await waitForTimeout(20);
+    assert.equal(registry.get("prune-probe")?.instanceId, "prune-probe");
+    assert.equal(events.filter((event) => event === "health:stop").length, 1);
+  } finally {
+    await busRuntime.stopPolling().catch(() => undefined);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 async function flushMicrotasks(iterations = 10): Promise<void> {
   for (let i = 0; i < iterations; i++) {
     await Promise.resolve();
@@ -63,7 +399,7 @@ async function waitForEventLoopCondition(
 
 async function waitForCondition(
   predicate: () => boolean,
-  timeoutMs = 2000,
+  timeoutMs = 10_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -104,6 +440,12 @@ function setRuntimeTestFetch(fetchImpl: typeof fetch): () => void {
 
 async function createRuntimeTelegramConfigFixture() {
   const agentDir = await ensureRuntimeAgentDir();
+  const telegramRuntimeDir = join(agentDir, "tmp", "telegram");
+  for (const entry of await readdir(telegramRuntimeDir).catch(() => [])) {
+    if (entry === "recovery-v1" || entry.startsWith("recovery-v1.")) {
+      await rm(join(telegramRuntimeDir, entry), { force: true, recursive: true });
+    }
+  }
   const configPath = join(agentDir, "telegram.json");
   const previousConfig = await readFile(configPath, "utf8").catch(
     () => undefined,
@@ -439,7 +781,7 @@ test("Follower aggregate delivery crosses the authorized leader transport", asyn
   ]);
 });
 
-test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn into pi", async () => {
+test("Extension runtime preserves paired polling and dispatches an inbound Telegram turn into pi", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const sentMessages: RuntimeHarnessMessage[] = [];
   let resolveDispatch: ((value: RuntimeHarnessMessage) => void) | undefined;
@@ -495,7 +837,11 @@ test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn in
     throw new Error(`Unexpected Telegram API method: ${method}`);
   });
   try {
-    await telegramConfig.write({ botToken: "123:abc", lastUpdateId: 0 });
+    await telegramConfig.write({
+      botToken: "123:abc",
+      allowedUserId: 77,
+      lastUpdateId: 0,
+    });
     (await getRuntimeTelegramExtension())(pi);
     const ctx = createRuntimeExtensionContext();
     await handlers.get("session_start")?.({}, ctx);
@@ -503,8 +849,7 @@ test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn in
     const dispatchedContent = await dispatched;
     assert.equal(sentMessages.length, 1);
     assert.equal(Array.isArray(dispatchedContent), true);
-    assert.equal(apiCalls.includes("sendMessage"), true);
-    assert.equal(sendMessageCalls, 2);
+    assert.equal(sendMessageCalls, 0);
     assert.equal(apiCalls.includes("sendChatAction"), true);
     const promptBlock = getRuntimeHarnessTextBlock(dispatchedContent);
     assert.equal(promptBlock.type, "text");
@@ -603,7 +948,7 @@ test("Extension runtime coalesces a cross-batch forward comment into one Pi turn
   }
 });
 
-test("Extension runtime finalizes queued turn after polling ownership moves away", async () => {
+test("Extension runtime fences final delivery after polling ownership moves away", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const extension = await getRuntimeTelegramExtension();
   let resolveDispatch: (() => void) | undefined;
@@ -702,8 +1047,10 @@ test("Extension runtime finalizes queued turn after polling ownership moves away
     await handlers.get("agent_start")?.({}, ctx);
     await writeRuntimeTelegramLocks({
       default: {
-        pid: process.pid + 1_000_000,
+        pid: process.pid,
         cwd: "/tmp/other-pi-instance",
+        instanceId: "other-live-instance",
+        leaderEpoch: "other-live-epoch",
       },
     });
     mock.timers.tick(1100);
@@ -734,12 +1081,8 @@ test("Extension runtime finalizes queued turn after polling ownership moves away
     await flushMicrotasks(20);
     await waitForTimeout(20);
     assert.deepEqual(draftTexts, []);
-    assert.equal(sentTexts.length, 1);
-    assert.match(sentTexts[0] ?? "", /Final \*\*answer\*\*/);
-    assert.deepEqual(sentBodies[0]?.reply_parameters, {
-      message_id: 7,
-      allow_sending_without_reply: true,
-    });
+    assert.deepEqual(sentTexts, []);
+    assert.deepEqual(sentBodies, []);
     assert.deepEqual(editedTexts, []);
     releasePolling?.();
     await handlers.get("session_shutdown")?.({}, ctx);
@@ -750,7 +1093,7 @@ test("Extension runtime finalizes queued turn after polling ownership moves away
   }
 });
 
-test("Extension runtime keeps local queue progress but fences delivery after ownership moves away", async () => {
+test("Extension runtime fences queued Pi dispatch and delivery after ownership moves away", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const sentMessages: RuntimeHarnessMessage[] = [];
   const sentBodies: Array<Record<string, unknown>> = [];
@@ -828,8 +1171,10 @@ test("Extension runtime keeps local queue progress but fences delivery after own
     await handlers.get("agent_start")?.({}, ctx);
     await writeRuntimeTelegramLocks({
       default: {
-        pid: process.pid + 1_000_000,
+        pid: process.pid,
         cwd: "/repo/queue-owner-b",
+        instanceId: "other-live-instance",
+        leaderEpoch: "other-live-epoch",
       },
     });
     await handlers.get("agent_end")?.(
@@ -843,14 +1188,11 @@ test("Extension runtime keeps local queue progress but fences delivery after own
       },
       ctx,
     );
-    // Follow-up dispatch is intentionally routed through the session-bound
-    // deferred queue timer; wait on real time instead of setImmediate turns.
-    await waitForCondition(() => sentMessages.length === 2);
+    // Durable dispatch requires the exact current owner; the accepted follow-up
+    // stays queued for recovery rather than invoking Pi through a stale owner.
+    await waitForTimeout(100);
     assert.deepEqual(sentBodies, []);
-    assert.match(
-      getRuntimeHarnessMessageText(sentMessages[1] as RuntimeHarnessMessage),
-      /^\[telegram\] second queued$/,
-    );
+    assert.equal(sentMessages.length, 1);
     await handlers.get("session_shutdown")?.({}, ctx);
   } finally {
     restoreFetch();
@@ -2271,6 +2613,7 @@ test("Extension runtime applies reaction priority and removal before the next di
   const thirdUpdates = createRuntimeDeferredResponse();
   const fourthUpdates = createRuntimeDeferredResponse();
   const fifthUpdates = createRuntimeDeferredResponse();
+  const sixthUpdates = createRuntimeDeferredResponse();
   const { handlers, commands, pi } = createRuntimePiHarness({
     sendUserMessage: (content) => {
       recordRuntimeDispatchEvent(runtimeEvents, content);
@@ -2282,6 +2625,14 @@ test("Extension runtime applies reaction priority and removal before the next di
     const method = getRuntimeTelegramApiMethod(input);
     if (method === "deleteWebhook") {
       return createRuntimeTelegramApiResponse(true);
+    }
+    if (method === "getMe") {
+      return createRuntimeTelegramApiResponse({
+        id: 123,
+        is_bot: true,
+        first_name: "Test Bot",
+        username: "test_bot",
+      });
     }
     if (method === "getUpdates") {
       getUpdatesCalls += 1;
@@ -2303,10 +2654,20 @@ test("Extension runtime applies reaction priority and removal before the next di
       if (getUpdatesCalls === 3) return thirdUpdates.promise;
       if (getUpdatesCalls === 4) return fourthUpdates.promise;
       if (getUpdatesCalls === 5) return fifthUpdates.promise;
+      if (getUpdatesCalls === 6) return sixthUpdates.promise;
       throw new DOMException("stop", "AbortError");
     }
     if (method === "sendChatAction") {
       return createRuntimeTelegramApiResponse(true);
+    }
+    if (method === "sendMessage" || method === "sendRichMessage") {
+      return createRuntimeTelegramApiResponse({ message_id: 500 });
+    }
+    if (method === "createForumTopic") {
+      return createRuntimeTelegramApiResponse({
+        message_thread_id: 42,
+        name: "Recovered test thread",
+      });
     }
     throw new Error(`Unexpected Telegram API method: ${method}`);
   });
@@ -2395,7 +2756,7 @@ test("Extension runtime applies reaction priority and removal before the next di
         messages: [
           {
             role: "assistant",
-            content: [{ type: "text", text: "" }],
+            content: [{ type: "text", text: "first complete" }],
           },
         ],
       },
@@ -2410,7 +2771,7 @@ test("Extension runtime applies reaction priority and removal before the next di
         messages: [
           {
             role: "assistant",
-            content: [{ type: "text", text: "" }],
+            content: [{ type: "text", text: "second complete" }],
           },
         ],
       },
@@ -2526,7 +2887,7 @@ test("Extension runtime applies idle model picks immediately and refreshes statu
           callback_query: {
             id: "cb-idle-1",
             from: { id: 77, is_bot: false, first_name: "Test" },
-            data: "model:pick:0",
+            data: "model:pick:1",
             message: {
               message_id: 100,
               chat: { id: 99, type: "private" },

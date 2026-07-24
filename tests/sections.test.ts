@@ -615,7 +615,13 @@ test("buildStatusReplyMarkup includes extension section rows before Settings", a
     }),
   );
 
-  const markup = buildStatusReplyMarkup(undefined, "off" as never, 0, registry);
+  const markup = buildStatusReplyMarkup(
+    undefined,
+    "off" as never,
+    0,
+    0,
+    registry,
+  );
   const rows = markup.inline_keyboard;
 
   // Find the Settings row index
@@ -623,9 +629,17 @@ test("buildStatusReplyMarkup includes extension section rows before Settings", a
     (r) => r[0].callback_data === "menu:settings",
   );
   assert.ok(settingsIdx > 0);
-  // Queue should be before section rows
-  assert.equal(rows[settingsIdx - 3][0].text, "⌛ Queue: 0");
-  // Section rows injected between Queue and Settings
+  // Queue and Recovery should be before extension section rows.
+  const queueIdx = rows.findIndex(
+    (row) => row[0].callback_data === "menu:queue",
+  );
+  const recoveryIdx = rows.findIndex(
+    (row) => row[0].callback_data === "menu:recovery",
+  );
+  assert.ok(queueIdx >= 0 && queueIdx < recoveryIdx);
+  assert.equal(rows[queueIdx][0].text, "⌛ Queue: 0");
+  assert.equal(rows[recoveryIdx][0].text, "🛟 Recovery: 0");
+  // Section rows stay immediately before Settings.
   assert.equal(rows[settingsIdx - 2][0].text, "Explorer");
   assert.equal(rows[settingsIdx - 2][0].callback_data, "section:0:open");
   assert.equal(rows[settingsIdx - 1][0].text, "🟢 Status");
