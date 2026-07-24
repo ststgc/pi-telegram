@@ -597,3 +597,6 @@ The following are not stable public contracts unless explicitly documented elsew
 - test support functions
 
 They are intentionally not exposed through a `./lib/*.ts` export wildcard in `0.12.0`.
+### Voice synthesis temporary files
+
+`TelegramVoiceSynthesisProviderResult` accepts a string path or `{ audioPath, transcriptText?, cleanup? }`. A path is never deletion authority by itself. Providers that want pi-telegram to release a generated file must return an explicit `cleanup` capability; it runs after live delivery or successful durable-spool transfer.

@@ -215,3 +215,6 @@ The bridge reads `voice.replyMode` from the config when building a turn.
 ### Provider config
 
 Provider-specific settings (voice ID, language, speech style, transcript behavior, STT/TTS enablement) are owned by the voice provider extension. Reply mode is owned by pi-telegram's `voice.replyMode` and configured from the built-in pi-telegram Settings menu, not duplicated in provider UIs.
+### Synthesized file ownership
+
+A synthesis provider may return a string path or `{ audioPath, transcriptText?, cleanup? }`. String paths and object paths without `cleanup` remain provider-owned and pi-telegram never deletes them. When `cleanup` is declared, pi-telegram invokes that capability after live delivery or after the bytes have transferred successfully into durable outbound spool storage. Configured voice templates receive pi-telegram-owned `{mp3}` / `{ogg}` destinations; only those exact declared destinations are cleaned automatically.

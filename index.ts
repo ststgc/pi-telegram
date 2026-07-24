@@ -674,12 +674,12 @@ export default function (pi: Pi.ExtensionAPI) {
   const activityRuntime = Activity.createTelegramActivityBridgeRuntime({
     generation: deliveryGenerationSeed,
     observeEvent: assistantOutputBindingRuntime.observeEvent,
-    recordFailure(handlerId, event, error) {
-      recordRuntimeEvent("activity", error, {
-        handlerId,
-        eventType: event.type,
-        activityId: event.activityId,
-      });
+    recordFailure(handlerId) {
+      recordRuntimeEvent(
+        "public-handler",
+        new Error("Public handler failed"),
+        { handlerId, handlerCategory: "activity" },
+      );
     },
   });
   const dispatchNextQueuedTelegramTurn =
@@ -1106,6 +1106,7 @@ export default function (pi: Pi.ExtensionAPI) {
     });
   const inboundRouteRuntime = Routing.createTelegramInboundRouteRuntime({
     configStore,
+    getEffectiveProfile: getActiveTelegramThreadProfile,
     callApi: callTelegramApi,
     getCurrentInstanceId() {
       return telegramInstanceId;
@@ -1187,6 +1188,7 @@ export default function (pi: Pi.ExtensionAPI) {
   });
   const telegramUpdateHandle = Updates.createTelegramUpdateHandle({
     defaultHandle: inboundRouteRuntime.handleUpdate,
+    recordRuntimeEvent,
     pairingGate: {
       getAllowedUserId: configStore.getAllowedUserId,
       claim: pairingRuntime.claim,

@@ -231,7 +231,11 @@ export interface TelegramUpdate {
   callback_query?: TelegramCallbackQuery;
   message_reaction?: TelegramMessageReactionUpdated;
   guest_message?: TelegramGuestMessage;
-  deleted_business_messages?: { message_ids?: unknown };
+  deleted_business_messages?: {
+    business_connection_id?: string;
+    chat?: { id?: number };
+    message_ids?: unknown;
+  };
 }
 
 export interface TelegramSentMessage {
@@ -1345,8 +1349,9 @@ export async function prepareTelegramTempDir(
 function assertTelegramBotTokenConfigured(
   botToken: string | undefined,
 ): string {
-  if (!botToken) throw new Error("Telegram bot token is not configured");
-  return botToken;
+  const configured = botToken?.trim();
+  if (!configured) throw new Error("Telegram bot token is not configured");
+  return configured;
 }
 
 export async function callTelegram<TResponse>(
@@ -1383,7 +1388,8 @@ export async function fetchTelegramBotIdentity(
   botToken: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<TelegramBotIdentityResponse> {
-  const url = `${TELEGRAM_API_BASE}/bot${botToken}/getMe`;
+  const configuredBotToken = assertTelegramBotTokenConfigured(botToken);
+  const url = `${TELEGRAM_API_BASE}/bot${configuredBotToken}/getMe`;
   return runTelegramApiAttempt(
     "getMe",
     getTelegramApiAttemptDeadlineMs("getMe"),
@@ -1394,7 +1400,48 @@ export async function fetchTelegramBotIdentity(
           ? telegramFetch(url, { signal }, family)
           : fetchImpl(url, { signal }),
       );
-      return response.json() as Promise<TelegramBotIdentityResponse>;
+      if (!response.ok) {
+        throw new TelegramApiHttpError(
+          `Telegram API getMe failed with HTTP ${response.status}`,
+          response.status,
+          undefined,
+        );
+      }
+      const value: unknown = await response.json();
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new Error("Telegram API getMe returned an invalid response");
+      }
+      const envelope = value as Record<string, unknown>;
+      const result = envelope.result;
+      if (
+        envelope.ok !== true ||
+        typeof result !== "object" ||
+        result === null ||
+        Array.isArray(result)
+      ) {
+        throw new Error("Telegram API getMe returned an invalid response");
+      }
+      const user = result as Record<string, unknown>;
+      if (!Number.isSafeInteger(user.id) || (user.id as number) <= 0) {
+        throw new Error("Telegram API getMe returned an invalid bot id");
+      }
+      if (
+        user.username !== undefined &&
+        (typeof user.username !== "string" ||
+          !/^[A-Za-z][A-Za-z0-9_]{0,31}$/u.test(user.username))
+      ) {
+        throw new Error("Telegram API getMe returned an invalid bot username");
+      }
+      return {
+        ok: true,
+        result: {
+          ...(result as TelegramUser),
+          id: user.id as number,
+          ...(typeof user.username === "string"
+            ? { username: user.username }
+            : {}),
+        },
+      };
     },
   );
 }

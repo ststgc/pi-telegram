@@ -75,7 +75,10 @@ export interface TelegramTextGroupController<TMessage, TContext = unknown> {
     ) => void | Promise<void>;
     onFailed?: (messages: TMessage[], error: unknown) => void | Promise<void>;
   }) => boolean;
-  removeMessages: (messageIds: number[]) => number;
+  removeMessages: (
+    messageIds: number[],
+    scope?: { chatId?: number; threadId?: number },
+  ) => number;
   suspend: () => void;
   resume: (context: TContext) => void;
   clear: () => void;
@@ -441,13 +444,17 @@ export function createTelegramTextGroupController<
             : undefined,
       });
     },
-    removeMessages: (messageIds) => {
+    removeMessages: (messageIds, scope) => {
       if (messageIds.length === 0 || groups.size === 0) return 0;
       const deleted = new Set(messageIds);
       let removed = 0;
       for (const [key, state] of groups) {
         const retained = state.messages.filter(
-          (message) => !deleted.has(message.message_id),
+          (message) =>
+            !deleted.has(message.message_id) ||
+            (scope?.chatId !== undefined && message.chat.id !== scope.chatId) ||
+            (scope?.threadId !== undefined &&
+              message.message_thread_id !== scope.threadId),
         );
         removed += state.messages.length - retained.length;
         if (retained.length === state.messages.length) continue;

@@ -4545,3 +4545,23 @@ await test("executeTelegramQueueDispatchPlan sends ready prompts as normal user 
     },
   );
 });
+
+test("Business deletion scopes preserve colliding ids across profile, chat, connection, and thread", () => {
+  const matching = createQueueTestPromptTurn({
+    sourceMessageIds: [99], chatId: 7, target: { chatId: 7, threadId: 3 },
+    transportStamp: { profile: "work", generation: "1" },
+    businessConnectionId: "business-a", statusSummary: "matching",
+  });
+  const collisions = [
+    createQueueTestPromptTurn({ ...matching, transportStamp: { profile: "other", generation: "1" }, statusSummary: "profile" }),
+    createQueueTestPromptTurn({ ...matching, chatId: 8, target: { chatId: 8, threadId: 3 }, statusSummary: "chat" }),
+    createQueueTestPromptTurn({ ...matching, businessConnectionId: "business-b", statusSummary: "business" }),
+    createQueueTestPromptTurn({ ...matching, target: { chatId: 7, threadId: 4 }, statusSummary: "thread" }),
+  ];
+  const result = removeTelegramQueueItemsByMessageIds(
+    [matching, ...collisions], [99],
+    { profile: "work", chatId: 7, businessConnectionId: "business-a", exactThreadId: 3 },
+  );
+  assert.equal(result.removedCount, 1);
+  assert.deepEqual(result.items.map((item) => item.statusSummary), ["profile", "chat", "business", "thread"]);
+});

@@ -5,6 +5,7 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
+import { chmodSync, unlinkSync } from "node:fs";
 import { chmod, mkdir, readdir, unlink, writeFile } from "node:fs/promises";
 import { basename, isAbsolute, join } from "node:path";
 
@@ -12,7 +13,13 @@ export interface TelegramOperationOwnedPrivateFile {
   readonly path: string;
   readonly fileName: string;
   cleanup(): Promise<void>;
+  cleanupSync(): void;
 }
+
+const operationFilesByOwner = new WeakMap<
+  object,
+  readonly TelegramOperationOwnedPrivateFile[]
+>();
 
 export interface TelegramOperationOwnedPrivateFileOptions {
   directory: string;
@@ -58,6 +65,66 @@ function getOperationFilePrefix(prefix: string, operationKey: string): string {
   return `.${prefix}-${digest}-`;
 }
 
+function isMissingFileError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    Reflect.get(error, "code") === "ENOENT"
+  );
+}
+
+/** Claims a caller-declared operation output and returns its cleanup capability. */
+export function claimTelegramOperationOwnedPrivateFile(
+  path: string,
+  fileName = basename(path),
+): TelegramOperationOwnedPrivateFile {
+  assertOperationFileName(fileName);
+  try {
+    chmodSync(path, 0o600);
+  } catch (error) {
+    if (!isMissingFileError(error)) throw error;
+  }
+  let cleaned = false;
+  return {
+    path,
+    fileName,
+    async cleanup(): Promise<void> {
+      if (cleaned) return;
+      try {
+        await unlink(path);
+        cleaned = true;
+      } catch (error) {
+        if (!isMissingFileError(error)) throw error;
+        cleaned = true;
+      }
+    },
+    cleanupSync(): void {
+      if (cleaned) return;
+      try {
+        unlinkSync(path);
+        cleaned = true;
+      } catch (error) {
+        if (!isMissingFileError(error)) throw error;
+        cleaned = true;
+      }
+    },
+  };
+}
+
+export function setTelegramOperationOwnedFiles(
+  owner: object,
+  files: readonly TelegramOperationOwnedPrivateFile[],
+): void {
+  if (files.length > 0) operationFilesByOwner.set(owner, [...files]);
+}
+
+export function getTelegramOperationOwnedFiles(
+  owner: object,
+): readonly TelegramOperationOwnedPrivateFile[] {
+  return operationFilesByOwner.get(owner) ?? [];
+}
+
 /** Creates one 0600 file in a 0700 directory and returns its sole cleanup capability. */
 export async function createTelegramOperationOwnedPrivateFile(
   options: TelegramOperationOwnedPrivateFileOptions,
@@ -72,29 +139,7 @@ export async function createTelegramOperationOwnedPrivateFile(
     `${operationPrefix}${process.pid}-${randomUUID()}-${fileName}`,
   );
   await writeFile(path, options.bytes, { mode: 0o600, flag: "wx" });
-  let cleaned = false;
-  return {
-    path,
-    fileName,
-    async cleanup(): Promise<void> {
-      if (cleaned) return;
-      try {
-        await unlink(path);
-        cleaned = true;
-      } catch (error) {
-        if (
-          typeof error === "object" &&
-          error !== null &&
-          "code" in error &&
-          Reflect.get(error, "code") === "ENOENT"
-        ) {
-          cleaned = true;
-          return;
-        }
-        throw error;
-      }
-    },
-  };
+  return claimTelegramOperationOwnedPrivateFile(path, fileName);
 }
 
 /** Removes only files minted for the exact operation key, including after restart. */

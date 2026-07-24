@@ -63,7 +63,16 @@ export const TELEGRAM_REMOVAL_REACTION_EMOJIS = TELEGRAM_REMOVAL_REACTIONS.map(
 );
 
 export interface TelegramUpdateDeletion {
-  deleted_business_messages?: { message_ids?: unknown };
+  deleted_business_messages?: {
+    business_connection_id?: unknown;
+    chat?: { id?: unknown };
+    message_ids?: unknown;
+  };
+}
+
+export interface TelegramDeletedMessagesScope {
+  chatId?: number;
+  businessConnectionId?: string;
 }
 
 function isTelegramMessageIdList(value: unknown): value is number[] {
@@ -260,6 +269,7 @@ export function getAuthorizedTelegramGuestMessage(
 export interface TelegramMessageOwnershipView {
   instanceId: string;
   ownerGeneration?: string;
+  target?: TelegramTarget;
 }
 
 export type TelegramMessageOwnershipLookup = (
@@ -331,7 +341,11 @@ export type TelegramUpdateFlowAction<
   TGuestMessage extends TelegramGuestMessage = TelegramGuestMessage,
 > =
   | { kind: "ignore" }
-  | { kind: "deleted"; messageIds: number[] }
+  | {
+      kind: "deleted";
+      messageIds: number[];
+      scope: TelegramDeletedMessagesScope;
+    }
   | { kind: "reaction"; reactionUpdate: TReactionUpdate }
   | {
       kind: "topic-lifecycle";
@@ -371,7 +385,19 @@ export function buildTelegramUpdateFlowAction<
 > {
   const deletedMessageIds = extractDeletedTelegramMessageIds(update);
   if (deletedMessageIds.length > 0) {
-    return { kind: "deleted", messageIds: deletedMessageIds };
+    const deleted = update.deleted_business_messages;
+    return {
+      kind: "deleted",
+      messageIds: deletedMessageIds,
+      scope: {
+        ...(typeof deleted?.chat?.id === "number"
+          ? { chatId: deleted.chat.id }
+          : {}),
+        ...(typeof deleted?.business_connection_id === "string"
+          ? { businessConnectionId: deleted.business_connection_id }
+          : {}),
+      },
+    };
   }
   if (update.message_reaction) {
     return { kind: "reaction", reactionUpdate: update.message_reaction };
@@ -446,7 +472,11 @@ export type TelegramUpdateExecutionPlan<
   TGuestMessage extends TelegramGuestMessage = TelegramGuestMessage,
 > =
   | { kind: "ignore" }
-  | { kind: "deleted"; messageIds: number[] }
+  | {
+      kind: "deleted";
+      messageIds: number[];
+      scope: TelegramDeletedMessagesScope;
+    }
   | {
       kind: "reaction";
       reactionUpdate: TReactionUpdate;
@@ -498,7 +528,11 @@ export function buildTelegramUpdateExecutionPlan<
     case "ignore":
       return { kind: "ignore" };
     case "deleted":
-      return { kind: "deleted", messageIds: action.messageIds };
+      return {
+        kind: "deleted",
+        messageIds: action.messageIds,
+        scope: action.scope,
+      };
     case "reaction":
       return { kind: "reaction", reactionUpdate: action.reactionUpdate };
     case "topic-lifecycle":
@@ -725,10 +759,20 @@ export interface TelegramUpdateRuntimeDeps<
     TCallbackQuery,
     TMessage
   >;
-  removePendingMediaGroupMessages: (messageIds: number[]) => void;
+  removePendingMediaGroupMessages: (
+    messageIds: number[],
+    scope?: { chatId?: number; threadId?: number },
+  ) => void;
   removeQueuedTelegramTurnsByMessageIds: (
     messageIds: number[],
     ctx: TContext,
+    scope?: {
+      profile?: string;
+      chatId?: number;
+      threadId?: number;
+      exactThreadId?: number | null;
+      businessConnectionId?: string;
+    },
   ) => number;
   handleAuthorizedTelegramReactionUpdate: (
     reactionUpdate: TReactionUpdate,
@@ -778,6 +822,7 @@ export interface TelegramUpdateRuntimeControllerDeps<
   TMessage extends TelegramUpdateMessage = TelegramUpdateMessage,
 > {
   getAllowedUserId: () => number | undefined;
+  getEffectiveProfile?: () => string;
   getCurrentInstanceId?: () => string | undefined;
   getMessageOwnership?: TelegramMessageOwnershipLookup;
   getTargetOwnership?: TelegramTargetOwnershipLookup;
@@ -1274,10 +1319,51 @@ export async function executeTelegramUpdatePlan<
     switch (plan.kind) {
       case "ignore":
         return { kind: "completed", reason: "ignored" };
-      case "deleted":
-        deps.removePendingMediaGroupMessages(plan.messageIds);
-        deps.removeQueuedTelegramTurnsByMessageIds(plan.messageIds, deps.ctx);
+      case "deleted": {
+        if (
+          plan.scope.chatId === undefined &&
+          plan.scope.businessConnectionId === undefined
+        ) {
+          deps.removePendingMediaGroupMessages(plan.messageIds);
+          deps.removeQueuedTelegramTurnsByMessageIds(plan.messageIds, deps.ctx);
+          return { kind: "completed", reason: "deleted" };
+        }
+        for (const messageId of plan.messageIds) {
+          const ownership =
+            plan.scope.chatId === undefined
+              ? undefined
+              : deps.getMessageOwnership?.(plan.scope.chatId, messageId);
+          const threadId = ownership?.target?.threadId;
+          const targetScope = {
+            ...(plan.scope.chatId !== undefined
+              ? { chatId: plan.scope.chatId }
+              : {}),
+            ...(threadId !== undefined ? { threadId } : {}),
+          };
+          if (!plan.scope.businessConnectionId) {
+            deps.removePendingMediaGroupMessages([messageId], targetScope);
+          }
+          deps.removeQueuedTelegramTurnsByMessageIds([messageId], deps.ctx, {
+            ...((deps as unknown as { getEffectiveProfile?: () => string })
+              .getEffectiveProfile
+              ? {
+                  profile:
+                    (
+                      deps as unknown as {
+                        getEffectiveProfile: () => string | undefined;
+                      }
+                    ).getEffectiveProfile() ?? "default",
+                }
+              : {}),
+            ...targetScope,
+            exactThreadId: threadId ?? null,
+            ...(plan.scope.businessConnectionId
+              ? { businessConnectionId: plan.scope.businessConnectionId }
+              : {}),
+          });
+        }
         return { kind: "completed", reason: "deleted" };
+      }
       case "reaction":
         return deps.handleAuthorizedTelegramReactionUpdate(
           plan.reactionUpdate,
@@ -1484,7 +1570,10 @@ export interface TelegramUpdateHandlerRegistry {
    * Used by pi-telegram's polling runtime; extension consumers should call
    * {@link registerTelegramUpdateHandler} or `add` instead of dispatching directly.
    */
-  dispatch: (update: unknown) => Promise<TelegramUpdateHandlerVerdict>;
+  dispatch: (
+    update: unknown,
+    recordFailure?: (handlerId: string, handlerCategory: string) => void,
+  ) => Promise<TelegramUpdateHandlerVerdict>;
 }
 
 const UPDATE_HANDLER_REGISTRY_KEY = "__piTelegramUpdateHandlerRegistry__";
@@ -1505,20 +1594,28 @@ function getOrCreateUpdateHandlerRegistry(): TelegramUpdateHandlerRegistry {
   const g = globalThis as Record<string, unknown>;
   const existing = g[UPDATE_HANDLER_REGISTRY_KEY];
   if (isValidV1UpdateHandlerRegistry(existing)) return existing;
-  const handlers = new Set<TelegramUpdateHandler>();
+  const handlers = new Map<
+    TelegramUpdateHandler,
+    { id: string; handler: TelegramUpdateHandler }
+  >();
+  let nextHandlerId = 0;
   const registry: TelegramUpdateHandlerRegistry = {
     version: 1,
     add(handler) {
-      handlers.add(handler);
+      const entry = {
+        id: `update-${nextHandlerId++}`,
+        handler,
+      };
+      handlers.set(handler, entry);
       return () => handlers.delete(handler);
     },
-    async dispatch(update) {
-      for (const handler of handlers) {
+    async dispatch(update, recordFailure) {
+      for (const entry of handlers.values()) {
         try {
-          const result = await handler(update);
+          const result = await entry.handler(update);
           if (result === "consume") return "consume";
         } catch {
-          // Update handler errors must not break polling.
+          recordFailure?.(entry.id, "update");
         }
       }
       return "pass";
@@ -1560,6 +1657,11 @@ export interface TelegramUpdateHandlerWrapDeps<TUpdate, TContext> {
   ) => Promise<TelegramInboundHandlingOutcome>;
   pairingGate: TelegramUnpairedUpdateGateDeps<TContext>;
   registry?: TelegramUpdateHandlerRegistry;
+  recordRuntimeEvent?: (
+    category: string,
+    error: unknown,
+    details?: Record<string, unknown>,
+  ) => void;
 }
 
 function getTelegramUpdateSenderId(update: unknown): number | undefined {
@@ -1656,7 +1758,16 @@ export function createTelegramUpdateHandle<TUpdate, TContext>(
       return { kind: "completed", reason: "unauthorized" };
     }
     if (senderId === allowedUserId) {
-      const verdict = await registry.dispatch(update);
+      const verdict = await registry.dispatch(
+        update,
+        (handlerId, handlerCategory) => {
+          deps.recordRuntimeEvent?.(
+            "public-handler",
+            new Error("Public handler failed"),
+            { handlerId, handlerCategory },
+          );
+        },
+      );
       if (verdict === "consume") {
         return { kind: "completed", reason: "public-handler" };
       }

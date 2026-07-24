@@ -546,3 +546,28 @@ test("Media helpers remove pending groups by message id", () => {
   assert.deepEqual(cleared, [10]);
   assert.equal(groups.size, 0);
 });
+
+test("Media download failure cleans only paths created by the current operation", async () => {
+  const { mkdtemp, writeFile, access, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = await mkdtemp(join(tmpdir(), "pi-tg-media-cleanup-"));
+  const first = join(dir, "first.pdf");
+  let call = 0;
+  try {
+    await assert.rejects(() => downloadTelegramMessageFiles([
+      { message_id: 1, document: { file_id: "one", file_name: "first.pdf" } },
+      { message_id: 2, document: { file_id: "two", file_name: "second.pdf" } },
+    ], {
+      async downloadFile() {
+        call += 1;
+        if (call === 2) throw new Error("download failed");
+        await writeFile(first, "owned");
+        return first;
+      },
+    }), /download failed/);
+    await assert.rejects(() => access(first));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

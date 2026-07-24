@@ -6,6 +6,11 @@
 
 import { basename, dirname } from "node:path";
 
+import {
+  claimTelegramOperationOwnedPrivateFile,
+  setTelegramOperationOwnedFiles,
+  type TelegramOperationOwnedPrivateFile,
+} from "./operation-files.ts";
 import type { TelegramInboundHandlingOutcome } from "./updates.ts";
 
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
@@ -130,7 +135,10 @@ export interface TelegramMediaGroupController<
     ) => void | Promise<void>;
     onFailed?: (messages: TMessage[], error: unknown) => void | Promise<void>;
   }) => boolean;
-  removeMessages: (messageIds: number[]) => number[];
+  removeMessages: (
+    messageIds: number[],
+    scope?: { chatId?: number; threadId?: number },
+  ) => number[];
   suspend: () => void;
   resume: (context: TContext) => void;
   clear: () => void;
@@ -491,6 +499,7 @@ export function removePendingTelegramMediaGroupMessages<
   groups: Map<string, TelegramMediaGroupState<TMessage, unknown>>,
   messageIds: number[],
   clearTimer: (timer: ReturnType<typeof setTimeout>) => void,
+  scope?: { chatId?: number; threadId?: number },
 ): number[] {
   if (messageIds.length === 0 || groups.size === 0) return [];
   const deletedMessageIds = new Set(messageIds);
@@ -498,7 +507,10 @@ export function removePendingTelegramMediaGroupMessages<
   for (const [key, state] of groups.entries()) {
     if (
       !state.messages.some((message) =>
-        deletedMessageIds.has(message.message_id),
+        deletedMessageIds.has(message.message_id) &&
+        (scope?.chatId === undefined || message.chat.id === scope.chatId) &&
+        (scope?.threadId === undefined ||
+          message.message_thread_id === scope.threadId),
       )
     ) {
       continue;
@@ -640,8 +652,13 @@ export function createTelegramMediaGroupController<
         onSettled,
         onFailed,
       }),
-    removeMessages: (messageIds) =>
-      removePendingTelegramMediaGroupMessages(groups, messageIds, clearTimer),
+    removeMessages: (messageIds, scope) =>
+      removePendingTelegramMediaGroupMessages(
+        groups,
+        messageIds,
+        clearTimer,
+        scope,
+      ),
     suspend: () => {
       for (const state of groups.values()) {
         state.suspended = true;
@@ -737,16 +754,30 @@ export async function downloadTelegramMessageFiles(
   deps: DownloadTelegramMessageFilesDeps,
 ): Promise<DownloadedTelegramMessageFile[]> {
   const downloaded: DownloadedTelegramMessageFile[] = [];
-  for (const file of collectTelegramFileInfos(messages)) {
-    downloaded.push({
-      path: await deps.downloadFile(file.file_id, file.fileName),
-      fileName: file.fileName,
-      isImage: file.isImage,
-      mimeType: file.mimeType,
-      kind: file.kind,
-    });
+  const operationFiles: TelegramOperationOwnedPrivateFile[] = [];
+  try {
+    for (const file of collectTelegramFileInfos(messages)) {
+      const path = await deps.downloadFile(file.file_id, file.fileName);
+      const result = {
+        path,
+        fileName: file.fileName,
+        isImage: file.isImage,
+        mimeType: file.mimeType,
+        kind: file.kind,
+      };
+      const operationFile = claimTelegramOperationOwnedPrivateFile(
+        path,
+        file.fileName,
+      );
+      operationFiles.push(operationFile);
+      setTelegramOperationOwnedFiles(result, [operationFile]);
+      downloaded.push(result);
+    }
+    return downloaded;
+  } catch (error) {
+    await Promise.allSettled(operationFiles.map((file) => file.cleanup()));
+    throw error;
   }
-  return downloaded;
 }
 
 function collectTelegramRichBlockFileInfos(

@@ -69,6 +69,7 @@ export interface TelegramDurableOutboundSourceDescriptor {
   path: string;
   fileName: string;
   caption?: string;
+  cleanup?: () => void | Promise<void>;
 }
 
 export interface TelegramDurableOutboundPlanOptions {
@@ -764,6 +765,9 @@ export async function commitTelegramDurableOutbound(
   deps: TelegramDurableOutboundCommitDeps,
 ): Promise<TelegramDurableOutboundCommittedIntent> {
   const operationOwnedFiles: TelegramOperationOwnedPrivateFile[] = [];
+  const transferredSourceCleanups = (options.generatedVoice ?? []).flatMap(
+    (source) => source.cleanup ? [source.cleanup] : [],
+  );
   let durablePublicationConfirmed = false;
   try {
     let semanticReply = planTelegramDurableOutboundReply(options.finalMarkdown, {
@@ -839,6 +843,9 @@ export async function commitTelegramDurableOutbound(
     if (!committed) {
       throw new Error("Committed durable outbound plan could not be verified");
     }
+    await Promise.allSettled(
+      transferredSourceCleanups.map((cleanup) => cleanup()),
+    );
     return { ...committed, operationOwnedFiles };
   } catch (error) {
     if (
@@ -847,6 +854,9 @@ export async function commitTelegramDurableOutbound(
     ) {
       await cleanupTelegramOperationOwnedFiles(operationOwnedFiles).catch(
         () => {},
+      );
+      await Promise.allSettled(
+        transferredSourceCleanups.map((cleanup) => cleanup()),
       );
     }
     throw error;

@@ -12,6 +12,10 @@ import {
   isTelegramFollowerDurableAdmissionAckV1,
   type TelegramFollowerDurableAdmissionAckV1,
 } from "./bus.ts";
+import {
+  getTelegramOperationOwnedFiles,
+  setTelegramOperationOwnedFiles,
+} from "./operation-files.ts";
 import type {
   TelegramDurableInboundAdmission,
   TelegramPollingConfig,
@@ -456,6 +460,7 @@ function validateRecoveryTurn(value: unknown): PendingTelegramTurn {
     [
       "target",
       "transportStamp",
+      "businessConnectionId",
       "guestQueryId",
       "priorityEmoji",
       "voiceReplyPreferred",
@@ -466,6 +471,8 @@ function validateRecoveryTurn(value: unknown): PendingTelegramTurn {
   if (
     value.kind !== "prompt" ||
     typeof value.chatId !== "number" ||
+    (value.businessConnectionId !== undefined &&
+      typeof value.businessConnectionId !== "string") ||
     typeof value.replyToMessageId !== "number" ||
     !Array.isArray(value.sourceMessageIds) ||
     !value.sourceMessageIds.every((id) => Number.isSafeInteger(id)) ||
@@ -1338,41 +1345,73 @@ export function createInboundRecoveryRuntime<
     },
 
     decorateTurn(messages, turn) {
-      return runGatedOperationSync(() => {
-      const records = matchesForMessages(messages);
-      if (records.length === 0) return turn;
-      const recovery = {
-        recordIds: records.map(({ record }) => record.recordId),
-        turnId: records[0]!.record.turnId,
-      };
-      const decorated = { ...turn, recovery } as typeof turn;
-      const spool = readTurnSpool(decorated);
-      const payload = encodeEnvelope({
-        version: 1,
-        kind: "turn",
-        turn: decorated,
-        spool: spool.mapping,
-      });
-      const materialized = getStore().materializeInboundGroup(
-        records.map((admitted) => ({
-          recordId: admitted.record.recordId,
-          claim: { identity: admitted.identity },
-          turnId: recovery.turnId,
-          payload,
-          spool: spool.bytes,
-          ...(admitted.sourcePayload
-            ? { previousPayload: admitted.sourcePayload }
-            : {}),
-        })),
-      );
-      for (let index = 0; index < records.length; index += 1) {
-        const admitted = records[index]!;
-        admitted.record = materialized[index]!;
-        admitted.sourcePayload = undefined;
-        identityByRecordId.set(admitted.record.recordId, admitted.identity);
+      const operationFiles = getTelegramOperationOwnedFiles(turn);
+      try {
+        return runGatedOperationSync(() => {
+          const records = matchesForMessages(messages);
+          if (records.length === 0) return turn;
+          const recovery = {
+            recordIds: records.map(({ record }) => record.recordId),
+            turnId: records[0]!.record.turnId,
+          };
+          const decorated = { ...turn, recovery } as typeof turn;
+          setTelegramOperationOwnedFiles(decorated, operationFiles);
+          const spool = readTurnSpool(decorated);
+          const payload = encodeEnvelope({
+            version: 1,
+            kind: "turn",
+            turn: decorated,
+            spool: spool.mapping,
+          });
+          const recoveryStore = getStore();
+          const materialized = recoveryStore.materializeInboundGroup(
+            records.map((admitted) => ({
+              recordId: admitted.record.recordId,
+              claim: { identity: admitted.identity },
+              turnId: recovery.turnId,
+              payload,
+              spool: spool.bytes,
+              ...(admitted.sourcePayload
+                ? { previousPayload: admitted.sourcePayload }
+                : {}),
+            })),
+          );
+          for (let index = 0; index < records.length; index += 1) {
+            const admitted = records[index]!;
+            admitted.record = materialized[index]!;
+            admitted.sourcePayload = undefined;
+            identityByRecordId.set(admitted.record.recordId, admitted.identity);
+          }
+          const primary = records[0]!;
+          const restoredPaths = recoveryStore.restoreInboundSpool(
+            primary.record.recordId,
+            { identity: primary.identity },
+            spool.mapping.map((entry) => entry.fileName),
+          );
+          const restored = rewriteTurnPaths(
+            decorated,
+            spool.mapping,
+            restoredPaths,
+          );
+          for (const file of operationFiles) {
+            try {
+              file.cleanupSync();
+            } catch {
+              // Durable paths are already authoritative; cleanup is fail-soft.
+            }
+          }
+          return restored as typeof turn;
+        });
+      } catch (error) {
+        for (const file of operationFiles) {
+          try {
+            file.cleanupSync();
+          } catch {
+            // Preserve the materialization error; cleanup is fail-soft.
+          }
+        }
+        throw error;
       }
-      return decorated;
-      });
     },
 
     claimTurnDispatch(turn) {

@@ -732,3 +732,28 @@ test("Inbound handler composition: non-critical failure continues, critical stop
   assert.deepEqual(calls, ["step-a", "step-b"]);
   assert.deepEqual(result.handlerOutputs, []);
 });
+
+test("Public inbound handler failures are sanitized to handler id/category", async () => {
+  const events: Array<{ category: string; message: string; details?: Record<string, unknown> }> = [];
+  const dispose = registerTelegramInboundHandler("text", async () => {
+    throw new Error("secret inbound payload");
+  });
+  try {
+    const result = await processTelegramInboundHandlers({
+      files: [], rawText: "original", handlers: [], cwd: "/work",
+      execCommand: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+      recordRuntimeEvent(category, error, details) {
+        events.push({ category, message: error instanceof Error ? error.message : String(error), details });
+      },
+    });
+    assert.equal(result.rawText, "original");
+    assert.equal(events.length, 1);
+    assert.equal(events[0]!.category, "public-handler");
+    assert.equal(events[0]!.message, "Public handler failed");
+    assert.match(String(events[0]!.details?.handlerId), /^inbound-text-/);
+    assert.equal(events[0]!.details?.handlerCategory, "inbound:text");
+    assert.equal(JSON.stringify(events).includes("secret"), false);
+  } finally {
+    dispose();
+  }
+});

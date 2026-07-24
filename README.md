@@ -106,7 +106,7 @@ The code expires after 10 minutes and is single-use. The bridge stores only a st
 | Threaded Mode | Run one leader plus visible follower Pi instances through named private-chat threads. | One bot can host a local multi-instance Pi organism without hidden process spawning. |
 | Reroute and restore | Preserve unknown threads and offer explicit target choices. | Telegram client state can be repaired without silently deleting or hijacking prompts. |
 | Extension sections | Add menu sections, commands, status rows, settings, callbacks, and delivery helpers from companion extensions. | `pi-telegram` becomes a platform surface for other Pi extensions. |
-| Runtime diagnostics | Use `/telegram-status`, the Recovery submenu, and recent runtime events for connection, role, queue, transport, durable-work controls, and failure evidence. Pending delivery is a metadata-only aggregate; delivery-uncertain and bus-uncertain work expose only an opaque handle, family, state, and required action. | Debugging and confirmed recovery actions live in the operator surface instead of hidden logs only. |
+| Runtime diagnostics | Use `/telegram-status`, the Recovery submenu, recent runtime events, and append-only profile/instance diagnostic segments for connection, role, queue, transport, durable-work controls, and failure evidence. Pending delivery is a metadata-only aggregate; delivery-uncertain and bus-uncertain work expose only an opaque handle, family, state, and required action. | Debugging and confirmed recovery actions live in the operator surface instead of hidden logs only. |
 | Safety and ownership | Pair one owner, lock transport, scope targets, and reject fake terminal behavior. | Remote access remains explicit, bounded, and understandable. |
 
 ## Core Loop

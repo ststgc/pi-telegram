@@ -1594,3 +1594,29 @@ test("Telegram API client resolves bot tokens lazily for wrapped calls", async (
     restoreFetch();
   }
 });
+
+test("getMe requires HTTP success and a strict positive identity schema", async () => {
+  await assert.rejects(
+    () => fetchTelegramBotIdentity(" token ", async (url) => {
+      assert.equal(String(url), "https://api.telegram.org/bottoken/getMe");
+      return new Response(JSON.stringify({ ok: true, result: { id: 0 } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }),
+    /invalid bot id/,
+  );
+  await assert.rejects(
+    () => fetchTelegramBotIdentity("token", async () =>
+      new Response(JSON.stringify({ ok: true, result: { id: 1, username: "bad name" } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })),
+    /invalid bot username/,
+  );
+  await assert.rejects(
+    () => fetchTelegramBotIdentity("token", async () => new Response("no", { status: 500 })),
+    /HTTP 500/,
+  );
+  await assert.rejects(() => fetchTelegramBotIdentity("   "), /not configured/);
+});

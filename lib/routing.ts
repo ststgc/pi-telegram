@@ -550,6 +550,7 @@ export interface TelegramInboundRouteRuntimeDeps<
     TelegramConfigStore,
     "get" | "getAllowedUserId" | "persist"
   > & { set?: TelegramConfigStore["set"] };
+  getEffectiveProfile?: () => string | undefined;
   callApi?: <TResponse>(
     method: string,
     body: Record<string, unknown>,
@@ -2126,6 +2127,9 @@ export function createTelegramInboundRouteRuntime<
   });
   return Updates.createTelegramPairedUpdateRuntime<TContext, TUpdate>({
     getAllowedUserId: deps.configStore.getAllowedUserId,
+    getEffectiveProfile: deps.getEffectiveProfile
+      ? () => deps.getEffectiveProfile?.() ?? "default"
+      : undefined,
     getCurrentInstanceId: deps.getCurrentInstanceId,
     getMessageOwnership: deps.getMessageOwnership,
     getTargetOwnership: deps.getTargetOwnership,
@@ -2135,13 +2139,16 @@ export function createTelegramInboundRouteRuntime<
       return { kind: "completed", reason: "topic-lifecycle" };
     },
     foreignOwnedUpdateForwarder: deps.foreignOwnedUpdateForwarder,
-    removePendingMediaGroupMessages: (messageIds) => {
+    removePendingMediaGroupMessages: (
+      messageIds: number[],
+      scope?: { chatId?: number; threadId?: number },
+    ) => {
       const removedMediaMessageIds =
-        deps.mediaGroupRuntime.removeMessages(messageIds);
+        deps.mediaGroupRuntime.removeMessages(messageIds, scope);
       deps.terminalizeDeletedRecoveryMessages?.([
         ...new Set([...messageIds, ...removedMediaMessageIds]),
       ]);
-      deps.textGroupRuntime.removeMessages(messageIds);
+      deps.textGroupRuntime.removeMessages(messageIds, scope);
     },
     removeQueuedTelegramTurnsByMessageIds:
       deps.queueMutationRuntime.removeByMessageIds,

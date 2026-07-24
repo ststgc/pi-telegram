@@ -1265,7 +1265,11 @@ test("Voice reply sender throws when every handler fails", async () => {
   dispose();
   assert.equal(hasTelegramVoiceSynthesisProvider(), false);
   assert.ok(events.length >= 2);
-  assert.ok(events.some((e) => (e as string).includes("handler 1 failed")));
+  assert.ok(
+    events.some((e) =>
+      (e as string).includes("error:public-handler:Public handler failed"),
+    ),
+  );
   assert.ok(
     events.some((e) =>
       (e as string).includes(
@@ -1489,4 +1493,37 @@ test("Voice reply sender passes transcriptText as caption", async () => {
     "Clean text without speech tags",
   );
   dispose();
+});
+
+test("Voice provider paths are deleted only through an explicit cleanup capability", async () => {
+  const { mkdtemp, writeFile, access, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = await mkdtemp(join(tmpdir(), "pi-tg-provider-cleanup-"));
+  const undeclared = join(dir, "undeclared.ogg");
+  const declared = join(dir, "declared.ogg");
+  await writeFile(undeclared, "voice");
+  await writeFile(declared, "voice");
+  try {
+    let dispose = registerTelegramVoiceSynthesisProvider(async () => undeclared, { id: "test/undeclared" });
+    await createTelegramVoiceReplySender({
+      execCommand: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+      sendMultipart: async () => {},
+    })({ chatId: 1, replyToMessageId: 2 }, "hello");
+    dispose();
+    await access(undeclared);
+
+    dispose = registerTelegramVoiceSynthesisProvider(async () => ({
+      audioPath: declared,
+      cleanup: () => rm(declared),
+    }), { id: "test/declared" });
+    await createTelegramVoiceReplySender({
+      execCommand: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+      sendMultipart: async () => {},
+    })({ chatId: 1, replyToMessageId: 2 }, "hello");
+    dispose();
+    await assert.rejects(() => access(declared));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
