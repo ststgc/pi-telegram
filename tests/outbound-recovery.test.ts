@@ -6,6 +6,7 @@
  */
 
 import assert from "node:assert/strict";
+import { fork, type ChildProcess } from "node:child_process";
 import type { Stats } from "node:fs";
 import { mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -1993,3 +1994,372 @@ test("durable worker suspend drains an in-flight unit and resume restarts suspen
     await removeHarness(resumeHarness);
   }
 });
+
+const OUTBOUND_PROCESS_FIXTURE_PATH = join(
+  process.cwd(),
+  "tests/fixtures/outbound-recovery-process.ts",
+);
+const OUTBOUND_PROCESS_FAULTS = [
+  "OUT-01",
+  "OUT-02",
+  "OUT-03",
+  "OUT-04",
+  "OUT-05",
+  "OUT-06",
+] as const;
+type OutboundProcessFault = (typeof OUTBOUND_PROCESS_FAULTS)[number];
+
+interface OutboundProcessCounter {
+  calls: number;
+  committedEffects: number;
+  unexpected: string[];
+}
+
+function isOutboundFixtureMessage(
+  value: unknown,
+): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function startOutboundProcessFixture(
+  args: readonly string[],
+  faultId: OutboundProcessFault,
+  counter: OutboundProcessCounter,
+): ChildProcess {
+  const child = fork(OUTBOUND_PROCESS_FIXTURE_PATH, [...args], {
+    execArgv: ["--experimental-strip-types"],
+    env: { ...process.env },
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
+  });
+  let stderr = "";
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString();
+  });
+  child.on("message", (message: unknown) => {
+    if (!isOutboundFixtureMessage(message)) return;
+    if (message.type === "unexpected-terminal-before-kill") {
+      counter.unexpected.push(String(message.type));
+      return;
+    }
+    if (
+      message.type !== "remote-call" ||
+      typeof message.requestId !== "string"
+    ) {
+      return;
+    }
+    counter.calls += 1;
+    let outcome: "success" | "known-not-committed" | "commit-unknown" =
+      "success";
+    if (faultId === "OUT-03" && counter.calls <= 2) {
+      outcome = "known-not-committed";
+    } else if (faultId === "OUT-04") {
+      outcome = "commit-unknown";
+      counter.committedEffects += 1;
+    } else {
+      counter.committedEffects += 1;
+    }
+    child.send({
+      type: "remote-response",
+      requestId: message.requestId,
+      outcome,
+      ...(outcome === "success" ? { messageId: 1_000 + counter.calls } : {}),
+    });
+  });
+  child.once("close", (code, signal) => {
+    if (code && stderr) {
+      process.stderr.write(
+        `outbound recovery fixture exited ${code}/${signal ?? "none"}: ${stderr}\n`,
+      );
+    }
+  });
+  return child;
+}
+
+function waitForOutboundFixtureMessage(
+  child: ChildProcess,
+  predicate: (message: Record<string, unknown>) => boolean,
+  timeoutMs = 8_000,
+): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error("Timed out waiting for outbound recovery fixture IPC"));
+    }, timeoutMs);
+    const onMessage = (message: unknown) => {
+      if (!isOutboundFixtureMessage(message)) return;
+      if (message.type === "fixture-error" && typeof message.error === "string") {
+        cleanup();
+        reject(new Error(message.error));
+        return;
+      }
+      if (!predicate(message)) return;
+      cleanup();
+      resolve(message);
+    };
+    const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      reject(
+        new Error(
+          `Outbound recovery fixture closed before IPC (${code}/${signal ?? "none"}) pid=${child.pid ?? "none"} args=${child.spawnargs.join(" ")}`,
+        ),
+      );
+    };
+    const cleanup = () => {
+      clearTimeout(timeout);
+      child.off("message", onMessage);
+      child.off("close", onClose);
+    };
+    child.on("message", onMessage);
+    child.on("close", onClose);
+  });
+}
+
+async function stopOutboundProcessFixture(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const closed = new Promise<void>((resolve) => {
+    child.once("close", () => resolve());
+  });
+  child.kill("SIGKILL");
+  await closed;
+}
+
+function outboundEvidence(
+  message: Record<string, unknown>,
+): Record<string, unknown> {
+  const evidence = message.evidence;
+  assert.ok(isOutboundFixtureMessage(evidence), "fixture evidence is absent");
+  return evidence;
+}
+
+function outboundEvidenceNumber(
+  evidence: Record<string, unknown>,
+  key: string,
+): number {
+  const value = evidence[key];
+  assert.equal(typeof value, "number", `fixture evidence ${key} is not numeric`);
+  return value as number;
+}
+
+function outboundEvidenceState(evidence: Record<string, unknown>): string | null {
+  const value = evidence.outboundState;
+  assert.ok(value === null || typeof value === "string");
+  return value as string | null;
+}
+
+function outboundEvidenceCount(
+  evidence: Record<string, unknown>,
+  state: string,
+): number {
+  const counts = evidence.counts;
+  assert.ok(isOutboundFixtureMessage(counts));
+  return typeof counts[state] === "number" ? counts[state] : 0;
+}
+
+function assertProcessStatusPrivacy(
+  evidence: Record<string, unknown>,
+  secrets: readonly string[],
+): void {
+  assert.equal(typeof evidence.statusJson, "string");
+  for (const secret of secrets) {
+    assert.doesNotMatch(evidence.statusJson as string, new RegExp(secret.replace(
+      /[.*+?^${}()|[\]\\]/g,
+      "\\$&",
+    )));
+  }
+}
+
+const configuredOutboundProcessRuns = Number.parseInt(
+  process.env.PI_OUTBOUND_PROCESS_RUNS ?? "1",
+  10,
+);
+const outboundProcessRuns = Number.isSafeInteger(configuredOutboundProcessRuns) &&
+    configuredOutboundProcessRuns >= 1 && configuredOutboundProcessRuns <= 50
+  ? configuredOutboundProcessRuns
+  : 1;
+
+test(
+  "hard-kill/reopen OUT-01..06 preserves durable answer, unit receipt, spool, retry, privacy, and queue contracts",
+  { timeout: Math.max(30_000, outboundProcessRuns * 45_000) },
+  async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "pi-telegram-outbound-process-"));
+    const children = new Set<ChildProcess>();
+    try {
+      for (let iteration = 0; iteration < outboundProcessRuns; iteration += 1) {
+        for (const faultId of OUTBOUND_PROCESS_FAULTS) {
+          const seed = `${process.env.PI_RELIABILITY_SEED ?? "2026072205"}:${iteration}:${faultId}`;
+          const rootPath = join(tempDir, `${iteration}-${faultId}-recovery-v1`);
+          const attachmentPath = join(tempDir, `${iteration}-${faultId}-private.png`);
+          const attachmentText = `PRIVATE-ATTACHMENT-${seed}`;
+          const answerText = `PRIVATE-ANSWER-${seed}`;
+          await writeFile(attachmentPath, attachmentText);
+          const counter: OutboundProcessCounter = {
+            calls: 0,
+            committedEffects: 0,
+            unexpected: [],
+          };
+
+          const crash = startOutboundProcessFixture(
+            ["crash", rootPath, attachmentPath, faultId, seed],
+            faultId,
+            counter,
+          );
+          children.add(crash);
+          await waitForOutboundFixtureMessage(
+            crash,
+            (message) => message.type === "ready" && message.faultId === faultId,
+          );
+          const boundary = await waitForOutboundFixtureMessage(
+            crash,
+            (message) =>
+              message.type === "fault-boundary" && message.faultId === faultId,
+          );
+          assert.equal(boundary.faultAsserted, true, faultId);
+          assert.equal(boundary.seed, seed, faultId);
+          await stopOutboundProcessFixture(crash);
+          children.delete(crash);
+
+          const reopened = startOutboundProcessFixture(
+            ["reopen", rootPath, attachmentPath, faultId, seed],
+            faultId,
+            counter,
+          );
+          children.add(reopened);
+          const reopenedMessage = await waitForOutboundFixtureMessage(
+            reopened,
+            (message) => message.type === "reopened" && message.faultId === faultId,
+          );
+          const initial = outboundEvidence(reopenedMessage);
+          assertProcessStatusPrivacy(initial, [
+            answerText,
+            attachmentText,
+            attachmentPath,
+            String(700_007),
+          ]);
+
+          const expectedInitialState: Record<OutboundProcessFault, string | null> = {
+            "OUT-01": null,
+            "OUT-02": "pending",
+            "OUT-03": "retryable-pending",
+            "OUT-04": "delivery-uncertain",
+            "OUT-05": "delivery-uncertain",
+            "OUT-06": "delivered",
+          };
+          assert.equal(
+            outboundEvidenceState(initial),
+            expectedInitialState[faultId],
+            faultId,
+          );
+          assert.equal(
+            outboundEvidenceNumber(initial, "receiptCount"),
+            faultId === "OUT-06" ? 1 : 0,
+            faultId,
+          );
+          const initialSpoolExpected =
+            faultId === "OUT-02" ||
+            faultId === "OUT-03" ||
+            faultId === "OUT-04" ||
+            faultId === "OUT-05"
+              ? 1
+              : 0;
+          assert.equal(
+            outboundEvidenceNumber(initial, "outboundSpoolRefCount"),
+            initialSpoolExpected,
+            faultId,
+          );
+          assert.equal(
+            outboundEvidenceNumber(initial, "spoolFileCount"),
+            initialSpoolExpected,
+            faultId,
+          );
+          assert.equal(
+            outboundEvidenceNumber(initial, "outboundSpoolBytes"),
+            initialSpoolExpected ? Buffer.byteLength(attachmentText) : 0,
+            faultId,
+          );
+          if (faultId === "OUT-01") {
+            assert.equal(outboundEvidenceCount(initial, "execution-uncertain"), 1);
+            assert.equal(outboundEvidenceCount(initial, "planned"), 0);
+            assert.equal(outboundEvidenceCount(initial, "pending"), 0);
+          }
+          if (faultId === "OUT-06") {
+            assert.equal(outboundEvidenceCount(initial, "completed"), 1);
+            assert.equal(outboundEvidenceCount(initial, "pre-dispatch"), 1);
+          }
+
+          const finalResponse = waitForOutboundFixtureMessage(
+            reopened,
+            (message) => message.type === "final" && message.faultId === faultId,
+          );
+          reopened.send({ type: "continue" });
+          const finalMessage = await finalResponse;
+          const final = outboundEvidence(finalMessage);
+          assertProcessStatusPrivacy(final, [
+            answerText,
+            attachmentText,
+            attachmentPath,
+            String(700_007),
+          ]);
+          const delivered = faultId === "OUT-02" ||
+            faultId === "OUT-03" || faultId === "OUT-06";
+          const uncertain = faultId === "OUT-04" || faultId === "OUT-05";
+          assert.equal(
+            outboundEvidenceState(final),
+            delivered ? "delivered" : uncertain ? "delivery-uncertain" : null,
+            faultId,
+          );
+          assert.equal(
+            outboundEvidenceNumber(final, "receiptCount"),
+            faultId === "OUT-03" ? 2 : delivered ? 1 : 0,
+            faultId,
+          );
+          assert.equal(
+            outboundEvidenceNumber(final, "spoolFileCount"),
+            uncertain ? 1 : 0,
+            faultId,
+          );
+          assert.equal(
+            outboundEvidenceNumber(final, "outboundSpoolBytes"),
+            uncertain ? Buffer.byteLength(attachmentText) : 0,
+            faultId,
+          );
+          assert.equal(
+            finalMessage.terminalNotifications,
+            faultId === "OUT-02" || faultId === "OUT-03" ? 1 : 0,
+            faultId,
+          );
+          assert.equal(
+            finalMessage.nextTurnDispatches,
+            faultId === "OUT-06" ? 1 : 0,
+            faultId,
+          );
+          assert.equal(
+            finalMessage.remainingQueueCount,
+            faultId === "OUT-06" ? 1 : 0,
+            faultId,
+          );
+
+          const expectedCalls: Record<OutboundProcessFault, number> = {
+            "OUT-01": 0,
+            "OUT-02": 1,
+            "OUT-03": 4,
+            "OUT-04": 1,
+            "OUT-05": 1,
+            "OUT-06": 1,
+          };
+          assert.equal(counter.calls, expectedCalls[faultId], faultId);
+          assert.equal(
+            counter.committedEffects,
+            faultId === "OUT-01" ? 0 : faultId === "OUT-03" ? 2 : 1,
+            faultId,
+          );
+          assert.deepEqual(counter.unexpected, [], faultId);
+          await stopOutboundProcessFixture(reopened);
+          children.delete(reopened);
+        }
+      }
+    } finally {
+      await Promise.all([...children].map(stopOutboundProcessFixture));
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  },
+);
