@@ -121,7 +121,9 @@ test("Pairing persists only a salted verifier and survives restart without raw c
   assert.equal(pairing.expiresAtMs, 1_000 + TELEGRAM_PAIRING_EXPIRY_MS);
   assert.notEqual(pairing.verifier, begin.code);
   assert.notEqual(pairing.salt, begin.code);
-  assert.equal((await stat(h.configPath)).mode & 0o777, 0o600);
+  if (process.platform !== "win32") {
+    assert.equal((await stat(h.configPath)).mode & 0o777, 0o600);
+  }
 
   const restarted = createTelegramConfigStore({ agentDir: h.agentDir, configPath: h.configPath });
   await restarted.load();
@@ -341,8 +343,13 @@ test("Pairing enforces five attempts per sender, private modes, and expiry clean
     assert.deepEqual(await h.runtime.claim({ senderId: 9, code: wrong }), { kind: "rejected" });
   }
   assert.deepEqual(await h.runtime.claim({ senderId: 9, code: begin.code }), { kind: "limited" });
-  assert.equal((await stat(join(h.agentDir, "tmp", "telegram"))).mode & 0o777, 0o700);
-  assert.equal((await stat(h.attemptsPath)).mode & 0o777, 0o600);
+  if (process.platform !== "win32") {
+    assert.equal(
+      (await stat(join(h.agentDir, "tmp", "telegram"))).mode & 0o777,
+      0o700,
+    );
+    assert.equal((await stat(h.attemptsPath)).mode & 0o777, 0o600);
+  }
   const state = await readFile(h.attemptsPath, "utf8");
   assert.equal(state.includes(begin.code), false);
   assert.equal(state.includes(wrong), false);

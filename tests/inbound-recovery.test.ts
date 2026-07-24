@@ -1623,7 +1623,9 @@ test(
     assert.equal(restoredFiles.length, 2);
     assert.equal(readFileSync(restoredFiles[0]!.path, "utf8"), "document-body");
     assert.deepEqual([...readFileSync(restoredFiles[1]!.path)], [1, 2, 3, 4]);
-    assert.equal(statSync(restoredFiles[0]!.path).mode & 0o777, 0o600);
+    if (process.platform !== "win32") {
+      assert.equal(statSync(restoredFiles[0]!.path).mode & 0o777, 0o600);
+    }
     const restoredContent = restored.content[0];
     assert.equal(
       restoredContent?.type === "text" &&

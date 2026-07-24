@@ -19,7 +19,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import test from "node:test";
 
 import {
@@ -874,11 +874,13 @@ test("profile-scoped recovery store is private and admits idempotently with one 
     assert.equal(store.markDispatching(observed.recordId, claim).state, "dispatching");
     assert.equal(store.markCompleted(observed.recordId, claim).state, "completed");
     assert.equal(readdirSync(join(rootPath, "spool")).length, 0);
-    assert.equal(statSync(rootPath).mode & 0o777, 0o700);
-    assert.equal(statSync(join(rootPath, "payloads")).mode & 0o777, 0o700);
-    assert.equal(statSync(join(rootPath, "snapshot.json")).mode & 0o777, 0o600);
-    const payloadName = readdirSync(join(rootPath, "payloads"))[0]!;
-    assert.equal(statSync(join(rootPath, "payloads", payloadName)).mode & 0o777, 0o600);
+    if (process.platform !== "win32") {
+      assert.equal(statSync(rootPath).mode & 0o777, 0o700);
+      assert.equal(statSync(join(rootPath, "payloads")).mode & 0o777, 0o700);
+      assert.equal(statSync(join(rootPath, "snapshot.json")).mode & 0o777, 0o600);
+      const payloadName = readdirSync(join(rootPath, "payloads"))[0]!;
+      assert.equal(statSync(join(rootPath, "payloads", payloadName)).mode & 0o777, 0o600);
+    }
     assert.equal(readStoreSnapshot(rootPath).committedUpdateId, 101);
   } finally {
     removeHarness(harness);
@@ -2713,7 +2715,10 @@ test("filesystem durability ordering fsyncs parent, binary directories before sn
       payload: Buffer.from("payload"),
       spool: [Buffer.from("spool")],
     });
-    const payloadRename = events.findIndex((entry) => entry.includes("/payloads/") && entry.startsWith("rename:"));
+    const payloadRename = events.findIndex(
+      (entry) =>
+        entry.includes(`${sep}payloads${sep}`) && entry.startsWith("rename:"),
+    );
     const payloadDirectoryFsync = events.findIndex((entry) => entry === `fsync:${join(harness.rootPath, "payloads")}`);
     const spoolDirectoryFsync = events.findIndex((entry) => entry === `fsync:${join(harness.rootPath, "spool")}`);
     const snapshotRename = events.findIndex(
@@ -3080,7 +3085,10 @@ test("post-commit cleanup is fail-soft and the next mutation reconciles physical
   let payloadCleanupAttempts = 0;
   const trackedRemove = ((...args: Parameters<typeof rmSync>) => {
     const path = String(args[0]);
-    if (path.includes(`${join(rootPath, "payloads")}/`) && path.endsWith(".bin")) {
+    if (
+      path.includes(`${join(rootPath, "payloads")}${sep}`) &&
+      path.endsWith(".bin")
+    ) {
       payloadCleanupAttempts += 1;
       if (failNextPayloadCleanup) {
         failNextPayloadCleanup = false;
