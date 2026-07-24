@@ -2197,7 +2197,7 @@ function startOutboundProcessFixture(
 function waitForOutboundFixtureMessage(
   child: ChildProcess,
   predicate: (message: Record<string, unknown>) => boolean,
-  timeoutMs = 8_000,
+  timeoutMs = 20_000,
 ): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {

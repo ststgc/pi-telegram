@@ -31,6 +31,7 @@ import {
   type TelegramDurableOutboundReplyPlan,
 } from "./outbound.ts";
 import {
+  RecoverySnapshotCommitUnknownError,
   type RecoveryOutboundDrainItem,
   type RecoveryOutboundMediaKind,
   type RecoveryOutboundPlanInput,
@@ -763,6 +764,7 @@ export async function commitTelegramDurableOutbound(
   deps: TelegramDurableOutboundCommitDeps,
 ): Promise<TelegramDurableOutboundCommittedIntent> {
   const operationOwnedFiles: TelegramOperationOwnedPrivateFile[] = [];
+  let durablePublicationConfirmed = false;
   try {
     let semanticReply = planTelegramDurableOutboundReply(options.finalMarkdown, {
       automaticVoice: options.automaticVoice,
@@ -830,6 +832,7 @@ export async function commitTelegramDurableOutbound(
       ...planned.recoveryPlan,
       spool: captured.map((entry) => entry.bytes),
     });
+    durablePublicationConfirmed = true;
     const committed = deps.store
       .listClaimableOutboundRecords(options.claim)
       .find((item) => item.record.recordId === record.recordId);
@@ -838,7 +841,14 @@ export async function commitTelegramDurableOutbound(
     }
     return { ...committed, operationOwnedFiles };
   } catch (error) {
-    await cleanupTelegramOperationOwnedFiles(operationOwnedFiles).catch(() => {});
+    if (
+      !durablePublicationConfirmed &&
+      !(error instanceof RecoverySnapshotCommitUnknownError)
+    ) {
+      await cleanupTelegramOperationOwnedFiles(operationOwnedFiles).catch(
+        () => {},
+      );
+    }
     throw error;
   }
 }
