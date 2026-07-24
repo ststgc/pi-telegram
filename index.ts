@@ -802,11 +802,8 @@ export default function (pi: Pi.ExtensionAPI) {
   const durableOutboundOperationFiles =
     OutboundRecovery.createTelegramDurableOutboundOperationFileRuntime({
       operationTempDir: Paths.resolveTelegramTempDir(),
-      recordCleanupFailure(error, turnId) {
-        recordRuntimeEvent("delivery", error, {
-          phase: "guest-response-temp-cleanup",
-          turnId,
-        });
+      recordCleanupFailure(details) {
+        recordRuntimeEvent("delivery", "operation cleanup failed", details);
       },
     });
   const durableOutboundWorker =
@@ -926,6 +923,13 @@ export default function (pi: Pi.ExtensionAPI) {
                 execCommand: CommandTemplates.execCommandTemplate,
                 recordRuntimeEvent,
               });
+            },
+            recordCleanupFailure(details) {
+              recordRuntimeEvent(
+                "delivery",
+                "transferred source cleanup failed",
+                details,
+              );
             },
           },
         );

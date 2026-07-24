@@ -6,43 +6,79 @@ on:
       - "v*.*.*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
       - name: Check out exact tag commit
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
+          persist-credentials: false
       - name: Verify exact checked-out tag commit
+        shell: bash
         env:
           EXPECTED_SHA: ${{ github.sha }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
           ACTUAL_SHA="$(git rev-parse HEAD)"
           TAG_SHA="$(git rev-list -n 1 "$TAG_NAME")"
-          printf 'Release HEAD: %s\nTag commit: %s\n' "$ACTUAL_SHA" "$TAG_SHA"
+          printf 'Release validation HEAD: %s\nTag commit: %s\n' "$ACTUAL_SHA" "$TAG_SHA"
           test "$ACTUAL_SHA" = "$EXPECTED_SHA"
           test "$TAG_SHA" = "$EXPECTED_SHA"
       - name: Set up Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22.19.0
           cache: npm
       - name: Install dependencies
         run: npm ci
-      - name: Validate exact release commit
+      - name: Run typecheck
+        run: npm run typecheck
+      - name: Run tests
+        run: npm test
+      - name: Validate Domain DAG
+        run: npm run domain-dag
+      - name: Check package contents
+        run: npm run pack:check
+      - name: Smoke-test package tarball
+        run: npm run pack:smoke
+      - name: Audit dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: npm run audit
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out validated tag commit without credentials
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify validated publication commit
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          TAG_NAME: ${{ github.ref_name }}
         run: |
-          npm run typecheck
-          npm test
-          npm run audit
-          npm run domain-dag
-          npm run pack:check
-          npm run pack:smoke
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          TAG_SHA="$(git rev-list -n 1 "$TAG_NAME")"
+          test "$ACTUAL_SHA" = "$EXPECTED_SHA"
+          test "$TAG_SHA" = "$EXPECTED_SHA"
       - name: Build release notes from changelog
         env:
           TAG_NAME: ${{ github.ref_name }}

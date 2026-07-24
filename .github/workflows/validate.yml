@@ -23,9 +23,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out reviewed head
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - name: Verify exact checked-out head
         shell: bash
         env:
@@ -35,7 +36,7 @@ jobs:
           printf 'Validated HEAD: %s\n' "$ACTUAL_SHA"
           test "$ACTUAL_SHA" = "$EXPECTED_SHA"
       - name: Set up Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22.19.0
           cache: npm

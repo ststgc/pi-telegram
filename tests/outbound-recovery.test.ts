@@ -604,6 +604,45 @@ test("commit preserves voice metadata while transforming deterministic voice-onl
   }
 });
 
+test("durable publication verification failure still releases transferred voice source capability", async () => {
+  const harness = await createHarness();
+  try {
+    const voicePath = join(harness.tempDir, "published-voice.ogg");
+    await writeFile(voicePath, "voice bytes");
+    let cleanupCalls = 0;
+    await assert.rejects(
+      commitTelegramDurableOutbound(
+        baseOptions(harness, {
+          finalMarkdown: "Speak this answer.",
+          automaticVoice: true,
+          generatedVoice: [{
+            path: voicePath,
+            fileName: "published-voice.ogg",
+            cleanup: async () => {
+              cleanupCalls += 1;
+              await unlink(voicePath);
+            },
+          }],
+        }),
+        {
+          store: {
+            planOutbound: harness.store.planOutbound.bind(harness.store),
+            listClaimableOutboundRecords: () => {
+              throw new Error("verification unavailable");
+            },
+          },
+          transformReply: identityTransform,
+        },
+      ),
+      /verification unavailable/,
+    );
+    assert.equal(cleanupCalls, 1);
+    await assert.rejects(access(voicePath));
+  } finally {
+    await removeHarness(harness);
+  }
+});
+
 test("commit publishes all sources atomically and reconstructs only verified recovery spools", async () => {
   const harness = await createHarness();
   try {

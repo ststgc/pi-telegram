@@ -119,6 +119,10 @@ export interface TelegramDurableOutboundCommitDeps {
     source: Readonly<TelegramDurableOutboundSourceDescriptor>,
     index: number,
   ) => void | Promise<void>;
+  recordCleanupFailure?: (details: {
+    phase: "transferred-source-cleanup";
+    failedCount: number;
+  }) => void;
 }
 
 export interface TelegramDurableOutboundSourceBytes {
@@ -707,7 +711,10 @@ export interface TelegramDurableOutboundOperationFileRuntime {
 /** Retains only this operation's cleanup capabilities until durable terminal state. */
 export function createTelegramDurableOutboundOperationFileRuntime(deps: {
   operationTempDir?: string;
-  recordCleanupFailure?: (error: unknown, turnId: string) => void;
+  recordCleanupFailure?: (details: {
+    phase: "operation-file-cleanup" | "operation-temp-sweep";
+    failedCount: number;
+  }) => void;
 } = {}): TelegramDurableOutboundOperationFileRuntime {
   const filesByTurnId = new Map<
     string,
@@ -727,8 +734,11 @@ export function createTelegramDurableOutboundOperationFileRuntime(deps: {
       for (const file of files) {
         try {
           await file.cleanup();
-        } catch (error) {
-          deps.recordCleanupFailure?.(error, turnId);
+        } catch {
+          deps.recordCleanupFailure?.({
+            phase: "operation-file-cleanup",
+            failedCount: 1,
+          });
         }
       }
       if (deps.operationTempDir) {
@@ -738,8 +748,11 @@ export function createTelegramDurableOutboundOperationFileRuntime(deps: {
             operationKey: turnId,
             prefix: "guest-response",
           });
-        } catch (error) {
-          deps.recordCleanupFailure?.(error, turnId);
+        } catch {
+          deps.recordCleanupFailure?.({
+            phase: "operation-temp-sweep",
+            failedCount: 1,
+          });
         }
       }
     },
@@ -769,6 +782,23 @@ export async function commitTelegramDurableOutbound(
     (source) => source.cleanup ? [source.cleanup] : [],
   );
   let durablePublicationConfirmed = false;
+  let transferredSourceCleanupAttempted = false;
+  const cleanupTransferredSources = async (): Promise<void> => {
+    if (transferredSourceCleanupAttempted) return;
+    transferredSourceCleanupAttempted = true;
+    const results = await Promise.allSettled(
+      transferredSourceCleanups.map((cleanup) => cleanup()),
+    );
+    const failedCount = results.filter(
+      (result) => result.status === "rejected",
+    ).length;
+    if (failedCount > 0) {
+      deps.recordCleanupFailure?.({
+        phase: "transferred-source-cleanup",
+        failedCount,
+      });
+    }
+  };
   try {
     let semanticReply = planTelegramDurableOutboundReply(options.finalMarkdown, {
       automaticVoice: options.automaticVoice,
@@ -843,9 +873,7 @@ export async function commitTelegramDurableOutbound(
     if (!committed) {
       throw new Error("Committed durable outbound plan could not be verified");
     }
-    await Promise.allSettled(
-      transferredSourceCleanups.map((cleanup) => cleanup()),
-    );
+    await cleanupTransferredSources();
     return { ...committed, operationOwnedFiles };
   } catch (error) {
     if (
@@ -855,9 +883,9 @@ export async function commitTelegramDurableOutbound(
       await cleanupTelegramOperationOwnedFiles(operationOwnedFiles).catch(
         () => {},
       );
-      await Promise.allSettled(
-        transferredSourceCleanups.map((cleanup) => cleanup()),
-      );
+      await cleanupTransferredSources();
+    } else if (durablePublicationConfirmed) {
+      await cleanupTransferredSources();
     }
     throw error;
   }
