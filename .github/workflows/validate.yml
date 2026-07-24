@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - dev
   pull_request:
 
 permissions:
@@ -19,10 +20,20 @@ jobs:
           - macos-latest
           - windows-latest
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      - name: Check out repository
+      - name: Check out reviewed head
         uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact checked-out head
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          printf 'Validated HEAD: %s\n' "$ACTUAL_SHA"
+          test "$ACTUAL_SHA" = "$EXPECTED_SHA"
       - name: Set up Node.js
         uses: actions/setup-node@v5
         with:
@@ -34,8 +45,12 @@ jobs:
         run: npm run typecheck
       - name: Run tests
         run: npm test
+      - name: Validate Domain DAG
+        run: npm run domain-dag
       - name: Check package contents
         run: npm run pack:check
+      - name: Smoke-test package tarball
+        run: npm run pack:smoke
       - name: Audit dependencies
         if: matrix.os == 'ubuntu-latest'
         run: npm run audit

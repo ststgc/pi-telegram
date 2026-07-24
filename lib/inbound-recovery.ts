@@ -850,7 +850,11 @@ export function createInboundRecoveryRuntime<
       if (typeof message.message_id !== "number") continue;
       const admitted = recordsByMessageId.get(message.message_id);
       for (const candidate of admitted?.values() ?? []) {
-        if (candidate.admission.kind === "admitted") {
+        if (
+          candidate.admission.kind === "admitted" &&
+          (candidate.record.state === "admitted" ||
+            candidate.record.state === "pre-dispatch")
+        ) {
           matches.set(candidate.record.recordId, candidate);
         }
       }

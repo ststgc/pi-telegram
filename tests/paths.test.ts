@@ -19,7 +19,7 @@ import {
   resolveTelegramTempDir,
 } from "../lib/paths.ts";
 
-await test("resolveAgentDir", async (t) => {
+test("resolveAgentDir", async (t) => {
   await t.test("returns PI_CODING_AGENT_DIR when env is set", () => {
     assert.equal(
       resolveAgentDir({
@@ -57,28 +57,28 @@ await test("resolveAgentDir", async (t) => {
   );
 });
 
-await test("resolveTelegramConfigPath", () => {
+test("resolveTelegramConfigPath", () => {
   assert.ok(
     resolveTelegramConfigPath().endsWith("telegram.json"),
     "config path ends with telegram.json",
   );
 });
 
-await test("resolveTelegramOwnersPath", () => {
+test("resolveTelegramOwnersPath", () => {
   assert.ok(
     resolveTelegramOwnersPath().endsWith(join("tmp", "telegram", "owners.json")),
     "owners path ends with the platform-native tmp/telegram/owners.json suffix",
   );
 });
 
-await test("resolveTelegramTempDir", () => {
+test("resolveTelegramTempDir", () => {
   assert.ok(
     resolveTelegramTempDir().endsWith(join("tmp", "telegram")),
     "temp dir ends with the platform-native tmp/telegram suffix",
   );
 });
 
-await test("resolveTelegramRuntimeLogPath", () => {
+test("resolveTelegramRuntimeLogPath", () => {
   assert.ok(
     resolveTelegramRuntimeLogPath().endsWith(
       join("tmp", "telegram", "logs.jsonl"),
@@ -87,7 +87,7 @@ await test("resolveTelegramRuntimeLogPath", () => {
   );
 });
 
-await test("explicit default profile keeps canonical unsuffixed paths", () => {
+test("explicit default profile keeps canonical unsuffixed paths", () => {
   assert.equal(getTelegramProfilePathSuffix("default"), "");
   assert.equal(
     resolveTelegramProfileTempFilePath("state", "json", "/agent", "default"),

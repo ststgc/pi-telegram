@@ -13,6 +13,7 @@ import type { ClientRequest, IncomingMessage } from "node:http";
 import { request as requestHttps, type RequestOptions } from "node:https";
 import { join } from "node:path";
 import { resolveTelegramTempDir } from "./paths.ts";
+import { isValidTelegramBotIdentity as isValidTelegramSetupBotIdentity } from "./setup.ts";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
@@ -106,18 +107,7 @@ export interface TelegramUser {
 export function isValidTelegramBotIdentity(
   value: unknown,
 ): value is TelegramUser {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const user = value as Record<string, unknown>;
-  return (
-    Number.isSafeInteger(user.id) &&
-    (user.id as number) > 0 &&
-    user.is_bot === true &&
-    typeof user.first_name === "string" &&
-    user.first_name.trim().length > 0 &&
-    (user.username === undefined ||
-      (typeof user.username === "string" &&
-        /^[A-Za-z][A-Za-z0-9_]{0,31}$/u.test(user.username)))
-  );
+  return isValidTelegramSetupBotIdentity(value);
 }
 
 export interface TelegramChat {

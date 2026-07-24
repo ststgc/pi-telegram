@@ -4,11 +4,6 @@
  * Computes token-prefill defaults and prompt mode selection for /telegram-setup
  */
 
-import {
-  isValidTelegramBotIdentity,
-  type TelegramUser,
-} from "./telegram-api.ts";
-
 export interface TelegramSetupConfig {
   botToken?: string;
   botId?: number;
@@ -22,7 +17,29 @@ export interface TelegramBotTokenPromptSpec {
   value: string;
 }
 
-export type TelegramSetupUser = TelegramUser;
+export interface TelegramSetupUser {
+  id: number;
+  is_bot: boolean;
+  first_name: string;
+  username?: string;
+}
+
+export function isValidTelegramBotIdentity(
+  value: unknown,
+): value is TelegramSetupUser {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const user = value as Record<string, unknown>;
+  return (
+    Number.isSafeInteger(user.id) &&
+    (user.id as number) > 0 &&
+    user.is_bot === true &&
+    typeof user.first_name === "string" &&
+    user.first_name.trim().length > 0 &&
+    (user.username === undefined ||
+      (typeof user.username === "string" &&
+        /^[A-Za-z][A-Za-z0-9_]{0,31}$/u.test(user.username)))
+  );
+}
 
 export interface TelegramPollingStartResult {
   ok: boolean;

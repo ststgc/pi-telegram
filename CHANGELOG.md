@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.25.0: Durable Recovery And Long-Running Reliability
 
 - `P1 Async Boundaries`: operation-owned inbound and voice files now clean up only through explicit capabilities after durable transfer and emit sanitized cleanup evidence on failure; `getMe` shares one strict HTTP/envelope/bot-identity validator with setup; public handler failures remain isolated; business deletions preserve exact profile/chat/business and represented-thread scope; and diagnostics use explicitly retired process-generation leases, immutable creation-age rotation, fail-closed lease cleanup, and bounded append-only profile/instance retention.
 

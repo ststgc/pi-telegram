@@ -1,6 +1,6 @@
 {
   "name": "@ststgc/pi-telegram",
-  "version": "0.24.2",
+  "version": "0.25.0",
   "private": true,
   "description": "Telegram runtime adapter for Pi",
   "keywords": [
@@ -29,7 +29,9 @@
     "typecheck": "tsc --noEmit",
     "audit": "node --experimental-strip-types scripts/audit-dependencies.ts",
     "pack:check": "npm pack --dry-run",
-    "validate": "npm run typecheck && npm test && npm run audit && npm run pack:check"
+    "pack:smoke": "node --experimental-strip-types scripts/smoke-package.ts",
+    "domain-dag": "bash -c \"SKILL_DIR=.agents/skills/domain-dag bash .agents/skills/domain-dag/scripts/validate-domain-dag.sh --root .\"",
+    "validate": "npm run typecheck && npm test && npm run audit && npm run domain-dag && npm run pack:check && npm run pack:smoke"
   },
   "files": [
     "index.ts",

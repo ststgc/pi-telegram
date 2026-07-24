@@ -237,7 +237,7 @@ Stable public entrypoints are documented in [Public API](./docs/public-api.md), 
 - Replace Pi session lifecycle without an official Pi API.
 - Let non-owner Telegram users control the bridge.
 
-Telegram is a companion surface around a live Pi runtime, not a second runtime. It can compact the current session, but it cannot create, resume, fork, browse, or switch sessions until Pi exposes safe public extension APIs for those operations.
+Telegram is a companion surface around a live Pi runtime, not a second runtime. It can compact the current session, but it cannot create, resume, fork, browse, or switch sessions until Pi exposes safe public extension APIs for those operations. In particular, Telegram `/new` is intentionally unavailable in `0.25.0`; no hidden process, synthetic input, unsafe cast, or raw TTY fallback is used.
 
 A Telegram prompt is a normal model turn in the active Pi session and therefore inherits that session's active post-compaction context; the bridge does not make token cost proportional only to the new mobile message. Current releases keep per-turn guidance small and transient, with detailed bridge instructions available on demand through `telegram_help` instead of persisted in every user turn. Pi session JSONL contains model history; profile-scoped pi-telegram `logs*.jsonl` contains redacted operational events and is never model context.
 
