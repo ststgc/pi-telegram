@@ -10,7 +10,32 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { createTelegramOperationOwnedPrivateFile } from "../lib/operation-files.ts";
+import {
+  createTelegramOperationOwnedPrivateFile,
+  settleTelegramOperationOwnedFileCleanup,
+} from "../lib/operation-files.ts";
+
+test("cleanup settlement emits only sanitized failure evidence", async () => {
+  const evidence: unknown[] = [];
+  await settleTelegramOperationOwnedFileCleanup(
+    [
+      {
+        path: "/private/voice-secret.ogg",
+        fileName: "voice-secret.ogg",
+        cleanup: async () => {
+          throw new Error("raw cleanup secret");
+        },
+        cleanupSync: () => {},
+      },
+    ],
+    "turn-build-failure-cleanup",
+    (value) => evidence.push(value),
+  );
+  assert.deepEqual(evidence, [
+    { phase: "turn-build-failure-cleanup", failedCount: 1 },
+  ]);
+  assert.doesNotMatch(JSON.stringify(evidence), /voice-secret|raw cleanup/u);
+});
 
 test("operation-owned private files preserve bytes and clean only their own path", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-telegram-operation-file-"));

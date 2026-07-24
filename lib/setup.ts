@@ -4,6 +4,11 @@
  * Computes token-prefill defaults and prompt mode selection for /telegram-setup
  */
 
+import {
+  isValidTelegramBotIdentity,
+  type TelegramUser,
+} from "./telegram-api.ts";
+
 export interface TelegramSetupConfig {
   botToken?: string;
   botId?: number;
@@ -17,10 +22,7 @@ export interface TelegramBotTokenPromptSpec {
   value: string;
 }
 
-export interface TelegramSetupUser {
-  id: number;
-  username?: string;
-}
+export type TelegramSetupUser = TelegramUser;
 
 export interface TelegramPollingStartResult {
   ok: boolean;
@@ -91,18 +93,6 @@ const TELEGRAM_BOT_TOKEN_ENV_VARS = [
   "TELEGRAM_KEY",
 ] as const;
 
-function isValidTelegramSetupUser(value: unknown): value is TelegramSetupUser {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const user = value as { id?: unknown; username?: unknown };
-  return (
-    Number.isSafeInteger(user.id) &&
-    (user.id as number) > 0 &&
-    (user.username === undefined ||
-      (typeof user.username === "string" &&
-        /^[A-Za-z][A-Za-z0-9_]{0,31}$/u.test(user.username)))
-  );
-}
-
 function isTelegramPollingStartResult(
   value: unknown,
 ): value is TelegramPollingStartResult {
@@ -163,7 +153,7 @@ export async function runTelegramSetup(
     deps.notify(`Telegram API check failed: ${message}`, "error");
     return { status: "validation-failed" };
   }
-  if (data.ok !== true || !isValidTelegramSetupUser(data.result)) {
+  if (data.ok !== true || !isValidTelegramBotIdentity(data.result)) {
     deps.notify(data.description || "Invalid Telegram bot token", "error");
     return { status: "validation-failed" };
   }

@@ -1790,7 +1790,11 @@ export default function (pi: Pi.ExtensionAPI) {
         );
       }
       await durableOutboundWorker.suspend();
-      await baseSessionLifecycleRuntime.onSessionShutdown(event, ctx);
+      try {
+        await baseSessionLifecycleRuntime.onSessionShutdown(event, ctx);
+      } finally {
+        await runtimeDiagnostics.onSessionShutdown();
+      }
     },
     async onSessionStart(event: Pi.SessionStartEvent, ctx: Pi.ExtensionContext) {
       const previousContext = telegramSessionContextStore.get();
@@ -1804,7 +1808,13 @@ export default function (pi: Pi.ExtensionAPI) {
           telegramSessionContextStore.getGeneration() + 1,
         );
       }
-      await baseSessionLifecycleRuntime.onSessionStart(event, ctx);
+      await runtimeDiagnostics.onSessionStart();
+      try {
+        await baseSessionLifecycleRuntime.onSessionStart(event, ctx);
+      } catch (error) {
+        await runtimeDiagnostics.onSessionShutdown();
+        throw error;
+      }
       dispatchNextQueuedTelegramTurn(ctx);
     },
   };

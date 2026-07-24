@@ -749,6 +749,7 @@ export interface TelegramUpdateRuntimeDeps<
   TMessage extends TelegramUpdateMessage = TelegramUpdateMessage,
 > {
   ctx: TContext;
+  getEffectiveProfile?: () => string;
   getCurrentInstanceId?: () => string | undefined;
   getMessageOwnership?: TelegramMessageOwnershipLookup;
   getTargetOwnership?: TelegramTargetOwnershipLookup;
@@ -774,6 +775,14 @@ export interface TelegramUpdateRuntimeDeps<
       businessConnectionId?: string;
     },
   ) => number;
+  resolveQueuedTelegramMessageThreadId?: (
+    messageId: number,
+    scope: {
+      profile?: string;
+      chatId?: number;
+      businessConnectionId?: string;
+    },
+  ) => number | null | undefined;
   handleAuthorizedTelegramReactionUpdate: (
     reactionUpdate: TReactionUpdate,
     ctx: TContext,
@@ -833,12 +842,29 @@ export interface TelegramUpdateRuntimeControllerDeps<
     TCallbackQuery,
     TMessage
   >;
-  removePendingMediaGroupMessages: (messageIds: number[]) => void;
+  removePendingMediaGroupMessages: (
+    messageIds: number[],
+    scope?: { chatId?: number; threadId?: number },
+  ) => void;
   removeQueuedTelegramTurnsByMessageIds: (
     messageIds: number[],
     ctx: TContext,
-    scope?: { chatId?: number; threadId?: number },
+    scope?: {
+      profile?: string;
+      chatId?: number;
+      threadId?: number;
+      exactThreadId?: number | null;
+      businessConnectionId?: string;
+    },
   ) => number;
+  resolveQueuedTelegramMessageThreadId?: (
+    messageId: number,
+    scope: {
+      profile?: string;
+      chatId?: number;
+      businessConnectionId?: string;
+    },
+  ) => number | null | undefined;
   clearQueuedTelegramTurnPriorityByMessageId: (
     messageId: number,
     ctx: TContext,
@@ -1035,6 +1061,7 @@ export function createTelegramPairedUpdateRuntime<
 ): TelegramUpdateRuntimeController<TContext, TUpdate> {
   return createTelegramUpdateRuntime({
     getAllowedUserId: deps.getAllowedUserId,
+    getEffectiveProfile: deps.getEffectiveProfile,
     getCurrentInstanceId: deps.getCurrentInstanceId,
     getMessageOwnership: deps.getMessageOwnership,
     getTargetOwnership: deps.getTargetOwnership,
@@ -1044,6 +1071,8 @@ export function createTelegramPairedUpdateRuntime<
     removePendingMediaGroupMessages: deps.removePendingMediaGroupMessages,
     removeQueuedTelegramTurnsByMessageIds:
       deps.removeQueuedTelegramTurnsByMessageIds,
+    resolveQueuedTelegramMessageThreadId:
+      deps.resolveQueuedTelegramMessageThreadId,
     clearQueuedTelegramTurnPriorityByMessageId:
       deps.clearQueuedTelegramTurnPriorityByMessageId,
     prioritizeQueuedTelegramTurnByMessageId:
@@ -1096,6 +1125,7 @@ export function createTelegramUpdateRuntime<
     handleUpdate: (update, ctx) =>
       executeTelegramUpdate(update, deps.getAllowedUserId(), {
         ctx,
+        getEffectiveProfile: deps.getEffectiveProfile,
         getCurrentInstanceId: deps.getCurrentInstanceId,
         getMessageOwnership: deps.getMessageOwnership,
         getTargetOwnership: deps.getTargetOwnership,
@@ -1104,6 +1134,8 @@ export function createTelegramUpdateRuntime<
         removePendingMediaGroupMessages: deps.removePendingMediaGroupMessages,
         removeQueuedTelegramTurnsByMessageIds:
           deps.removeQueuedTelegramTurnsByMessageIds,
+        resolveQueuedTelegramMessageThreadId:
+          deps.resolveQueuedTelegramMessageThreadId,
         handleAuthorizedTelegramReactionUpdate: handleAuthorizedReactionUpdate,
         handleTelegramTopicLifecycleUpdate:
           deps.handleTelegramTopicLifecycleUpdate,
@@ -1328,37 +1360,43 @@ export async function executeTelegramUpdatePlan<
           deps.removeQueuedTelegramTurnsByMessageIds(plan.messageIds, deps.ctx);
           return { kind: "completed", reason: "deleted" };
         }
+        const profile = deps.getEffectiveProfile?.() ?? "default";
         for (const messageId of plan.messageIds) {
           const ownership =
             plan.scope.chatId === undefined
               ? undefined
               : deps.getMessageOwnership?.(plan.scope.chatId, messageId);
-          const threadId = ownership?.target?.threadId;
+          const queueScope = {
+            profile,
+            ...(plan.scope.chatId !== undefined
+              ? { chatId: plan.scope.chatId }
+              : {}),
+            ...(plan.scope.businessConnectionId
+              ? { businessConnectionId: plan.scope.businessConnectionId }
+              : {}),
+          };
+          const representedThreadId = ownership
+            ? (ownership.target?.threadId ?? null)
+            : deps.resolveQueuedTelegramMessageThreadId?.(
+                messageId,
+                queueScope,
+              );
           const targetScope = {
             ...(plan.scope.chatId !== undefined
               ? { chatId: plan.scope.chatId }
               : {}),
-            ...(threadId !== undefined ? { threadId } : {}),
+            ...(typeof representedThreadId === "number"
+              ? { threadId: representedThreadId }
+              : {}),
           };
           if (!plan.scope.businessConnectionId) {
             deps.removePendingMediaGroupMessages([messageId], targetScope);
           }
           deps.removeQueuedTelegramTurnsByMessageIds([messageId], deps.ctx, {
-            ...((deps as unknown as { getEffectiveProfile?: () => string })
-              .getEffectiveProfile
-              ? {
-                  profile:
-                    (
-                      deps as unknown as {
-                        getEffectiveProfile: () => string | undefined;
-                      }
-                    ).getEffectiveProfile() ?? "default",
-                }
-              : {}),
+            ...queueScope,
             ...targetScope,
-            exactThreadId: threadId ?? null,
-            ...(plan.scope.businessConnectionId
-              ? { businessConnectionId: plan.scope.businessConnectionId }
+            ...(representedThreadId !== undefined
+              ? { exactThreadId: representedThreadId }
               : {}),
           });
         }

@@ -406,6 +406,39 @@ export interface TelegramQueueMessageScope {
   businessConnectionId?: string;
 }
 
+/**
+ * Resolves the one thread represented by matching queue/active turn state.
+ * `null` means an explicitly threadless turn; `undefined` means absent or
+ * ambiguous evidence and must not be converted into an exact threadless scope.
+ */
+export function resolveTelegramQueueMessageThreadId<TContext = unknown>(
+  items: readonly TelegramQueueItem<TContext>[],
+  messageId: number,
+  scope: Pick<
+    TelegramQueueMessageScope,
+    "profile" | "chatId" | "businessConnectionId"
+  >,
+): number | null | undefined {
+  const representedThreads = new Set<number | null>();
+  for (const item of items) {
+    if (
+      !isPendingTelegramTurn(item) ||
+      !item.sourceMessageIds.includes(messageId) ||
+      (scope.profile !== undefined &&
+        item.transportStamp?.profile !== scope.profile) ||
+      (scope.chatId !== undefined && item.chatId !== scope.chatId) ||
+      (scope.businessConnectionId !== undefined &&
+        item.businessConnectionId !== scope.businessConnectionId)
+    ) {
+      continue;
+    }
+    representedThreads.add(item.target?.threadId ?? null);
+  }
+  return representedThreads.size === 1
+    ? representedThreads.values().next().value
+    : undefined;
+}
+
 function isTelegramQueueItemInMessageScope<TContext = unknown>(
   item: TelegramQueueItem<TContext>,
   scope: TelegramQueueMessageScope | undefined,

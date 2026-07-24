@@ -25,6 +25,7 @@ import {
 import {
   getTelegramOperationOwnedFiles,
   setTelegramOperationOwnedFiles,
+  settleTelegramOperationOwnedFileCleanup,
   type TelegramOperationOwnedPrivateFile,
 } from "./operation-files.ts";
 import type {
@@ -471,7 +472,10 @@ export function createTelegramPromptTurnRuntimeBuilder<
     const replyFiles = firstMessage?.reply_to_message
       ? await downloadTelegramMessageFiles(
           [firstMessage.reply_to_message as typeof firstMessage],
-          { downloadFile: deps.downloadFile },
+          {
+            downloadFile: deps.downloadFile,
+            recordCleanupFailure: deps.recordCleanupFailure,
+          },
         )
       : [];
     operationFiles.push(
@@ -500,6 +504,7 @@ export function createTelegramPromptTurnRuntimeBuilder<
     });
     const files = await downloadTelegramMessageFiles(messages, {
       downloadFile: deps.downloadFile,
+      recordCleanupFailure: deps.recordCleanupFailure,
     });
     operationFiles.push(
       ...files.flatMap((file) => getTelegramOperationOwnedFiles(file)),
@@ -595,7 +600,11 @@ export function createTelegramPromptTurnRuntimeBuilder<
     setTelegramOperationOwnedFiles(turn, operationFiles);
     return turn;
     } catch (error) {
-      await Promise.allSettled(operationFiles.map((file) => file.cleanup()));
+      await settleTelegramOperationOwnedFileCleanup(
+        operationFiles,
+        "turn-build-failure-cleanup",
+        deps.recordCleanupFailure,
+      );
       throw error;
     }
   };

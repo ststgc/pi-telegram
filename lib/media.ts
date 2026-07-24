@@ -9,6 +9,8 @@ import { basename, dirname } from "node:path";
 import {
   claimTelegramOperationOwnedPrivateFile,
   setTelegramOperationOwnedFiles,
+  settleTelegramOperationOwnedFileCleanup,
+  type TelegramOperationOwnedCleanupFailureEvidence,
   type TelegramOperationOwnedPrivateFile,
 } from "./operation-files.ts";
 import type { TelegramInboundHandlingOutcome } from "./updates.ts";
@@ -208,6 +210,9 @@ export interface DownloadedTelegramMessageFile {
 
 export interface DownloadTelegramMessageFilesDeps {
   downloadFile: (fileId: string, fileName: string) => Promise<string>;
+  recordCleanupFailure?: (
+    evidence: TelegramOperationOwnedCleanupFailureEvidence,
+  ) => void;
 }
 
 export function guessExtensionFromMime(
@@ -775,7 +780,11 @@ export async function downloadTelegramMessageFiles(
     }
     return downloaded;
   } catch (error) {
-    await Promise.allSettled(operationFiles.map((file) => file.cleanup()));
+    await settleTelegramOperationOwnedFileCleanup(
+      operationFiles,
+      "download-failure-cleanup",
+      deps.recordCleanupFailure,
+    );
     throw error;
   }
 }

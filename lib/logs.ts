@@ -48,14 +48,24 @@ export interface TelegramRuntimeJsonlLogOptions {
   getNowMs?: () => number;
   instanceId?: string | (() => string);
   writerGeneration?: string;
+  processGeneration?: string;
   pid?: number;
   isProcessAlive?: (pid: number) => boolean;
+  removeFile?: (path: string) => void;
   canReset?: () => boolean;
   commitReset?: (commit: () => void) => boolean;
 }
 
 export interface TelegramRuntimeJsonlLog {
   getPath: () => string;
+  startGeneration: (
+    reason: string,
+    scope?: Record<string, unknown>,
+  ) => Promise<void>;
+  retireGeneration: (
+    reason: string,
+    scope?: Record<string, unknown>,
+  ) => Promise<void>;
   reset: (reason: string, scope?: Record<string, unknown>) => void;
   resetIfScopeChanged: (
     scopeKey: string,
@@ -105,10 +115,12 @@ function safeJsonLine(value: unknown): string {
 }
 
 interface SegmentLease {
-  version: 1;
+  version: 2;
   pid: number;
+  processGeneration: string;
   instanceId: string;
   writerGeneration: string;
+  createdAt: number;
   heartbeatAt: number;
 }
 
@@ -116,8 +128,18 @@ interface SegmentInfo {
   path: string;
   leasePath: string;
   size: number;
-  mtimeMs: number;
+  createdAt: number;
   live: boolean;
+}
+
+const TELEGRAM_RUNTIME_LOG_PROCESS_GENERATION = randomUUID();
+const liveWriterGenerations = new Set<string>();
+
+function writerGenerationKey(
+  processGeneration: string,
+  writerGeneration: string,
+): string {
+  return `${processGeneration}:${writerGeneration}`;
 }
 
 function defaultIsProcessAlive(pid: number): boolean {
@@ -133,15 +155,32 @@ function defaultIsProcessAlive(pid: number): boolean {
   }
 }
 
+function readSegmentCreatedAt(path: string, fallback: number): number {
+  try {
+    const firstLine = readFileSync(path, "utf8").split("\n", 1)[0];
+    if (!firstLine) return fallback;
+    const value: unknown = JSON.parse(firstLine);
+    const at =
+      value && typeof value === "object" && !Array.isArray(value)
+        ? Reflect.get(value, "at")
+        : undefined;
+    return typeof at === "number" && Number.isFinite(at) ? at : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 function readLease(path: string): SegmentLease | undefined {
   try {
     const value: unknown = JSON.parse(readFileSync(path, "utf8"));
     if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
     const lease = value as Partial<SegmentLease>;
     if (
-      lease.version !== 1 || !Number.isSafeInteger(lease.pid) ||
+      lease.version !== 2 || !Number.isSafeInteger(lease.pid) ||
+      typeof lease.processGeneration !== "string" ||
       typeof lease.instanceId !== "string" ||
       typeof lease.writerGeneration !== "string" ||
+      !Number.isFinite(lease.createdAt) ||
       !Number.isFinite(lease.heartbeatAt)
     ) return undefined;
     return lease as SegmentLease;
@@ -162,7 +201,10 @@ export function createTelegramRuntimeJsonlLog(
       ? options.instanceId()
       : (options.instanceId ?? "instance"),
   );
-  const generation = safeComponent(options.writerGeneration ?? randomUUID());
+  let generation = safeComponent(options.writerGeneration ?? randomUUID());
+  const processGeneration = safeComponent(
+    options.processGeneration ?? TELEGRAM_RUNTIME_LOG_PROCESS_GENERATION,
+  );
   const pid = options.pid ?? process.pid;
   const now = options.getNowMs ?? Date.now;
   const maxSegmentBytes = options.maxBytes ?? DEFAULT_MAX_SEGMENT_BYTES;
@@ -171,14 +213,21 @@ export function createTelegramRuntimeJsonlLog(
   const maxTotalBytes = options.maxTotalBytes ?? TELEGRAM_RUNTIME_LOG_MAX_TOTAL_BYTES;
   const leaseStaleMs = options.leaseStaleMs ?? DEFAULT_LEASE_STALE_MS;
   const isProcessAlive = options.isProcessAlive ?? defaultIsProcessAlive;
+  const removeFile =
+    options.removeFile ?? ((path: string) => rmSync(path, { force: true }));
   const scopeKeys = new Map<string, string | undefined>();
   let rotation = 0;
   let activeBasePath: string | undefined;
   let activePath: string | undefined;
+  let activeCreatedAt: number | undefined;
+  let generationActive = true;
   let incident: TelegramRuntimeLogIncident | undefined;
   let pending: Promise<void> = Promise.resolve();
   let queued: Array<{ basePath: string; line: string }> = [];
   let scheduled = false;
+  liveWriterGenerations.add(
+    writerGenerationKey(processGeneration, generation),
+  );
 
   const segmentPrefix = (basePath: string) => {
     const extension = extname(basePath);
@@ -198,11 +247,17 @@ export function createTelegramRuntimeJsonlLog(
     try { chmodSync(dirname(path), 0o700); } catch { /* unsupported filesystem */ }
   };
   const writeLease = (path: string) => {
+    const createdAt = activeCreatedAt;
+    if (createdAt === undefined) {
+      throw new Error("Telegram diagnostics segment creation time is absent");
+    }
     const lease: SegmentLease = {
-      version: 1,
+      version: 2,
       pid,
+      processGeneration,
       instanceId: resolveInstanceId(),
       writerGeneration: generation,
+      createdAt,
       heartbeatAt: now(),
     };
     writeFileSync(leasePathFor(path), `${safeJsonLine(lease)}\n`, { mode: 0o600 });
@@ -228,10 +283,21 @@ export function createTelegramRuntimeJsonlLog(
               `-${safeComponent(lease.instanceId)}-${safeComponent(lease.writerGeneration)}-`,
             ),
           );
-          const alive = Boolean(
+          const processAlive = Boolean(
             leaseMatchesSegment && lease && isProcessAlive(lease.pid),
           );
+          const exactGenerationLive = Boolean(
+            lease &&
+              (lease.processGeneration !== processGeneration ||
+                liveWriterGenerations.has(
+                  writerGenerationKey(
+                    lease.processGeneration,
+                    lease.writerGeneration,
+                  ),
+                )),
+          );
           const stale = lease ? now() - lease.heartbeatAt > leaseStaleMs : true;
+          const alive = processAlive && exactGenerationLive;
           const classification = !leaseMatchesSegment
             ? "dead"
             : stale
@@ -242,25 +308,39 @@ export function createTelegramRuntimeJsonlLog(
                 ? "live"
                 : "dead";
           const live = classification === "live" || classification === "stale-live";
-          if (lease && !live) rmSync(leasePath, { force: true });
-          return [{ path, leasePath, size: stat.size, mtimeMs: stat.mtimeMs, live }];
+          return [{
+            path,
+            leasePath,
+            size: stat.size,
+            createdAt:
+              lease?.createdAt ?? readSegmentCreatedAt(path, stat.mtimeMs),
+            live,
+          }];
         } catch { return []; }
       });
   };
+  const removeSegment = (entry: SegmentInfo): boolean => {
+    try {
+      if (existsSync(entry.leasePath)) removeFile(entry.leasePath);
+      removeFile(entry.path);
+      return true;
+    } catch {
+      noteDrop("diagnostics-write-failed");
+      return false;
+    }
+  };
   const retain = (basePath: string): SegmentInfo[] => {
-    let segments = listSegments(basePath).sort((a, b) => a.mtimeMs - b.mtimeMs);
+    let segments = listSegments(basePath).sort((a, b) => a.createdAt - b.createdAt);
     const removable = () => segments.filter((entry) => !entry.live && entry.path !== activePath);
     for (const entry of removable()) {
-      if (now() - entry.mtimeMs <= maxAgeMs) continue;
-      rmSync(entry.path, { force: true });
-      rmSync(entry.leasePath, { force: true });
+      if (now() - entry.createdAt <= maxAgeMs) continue;
+      if (!removeSegment(entry)) continue;
       segments = segments.filter((candidate) => candidate.path !== entry.path);
     }
     while (segments.length > maxSegments || segments.reduce((sum, entry) => sum + entry.size, 0) > maxTotalBytes) {
       const candidate = removable()[0];
       if (!candidate) break;
-      rmSync(candidate.path, { force: true });
-      rmSync(candidate.leasePath, { force: true });
+      if (!removeSegment(candidate)) break;
       segments = segments.filter((entry) => entry.path !== candidate.path);
     }
     return segments;
@@ -282,13 +362,19 @@ export function createTelegramRuntimeJsonlLog(
         (entry) => !entry.live && entry.path !== activePath,
       );
       if (!candidate) break;
-      rmSync(candidate.path, { force: true });
-      rmSync(candidate.leasePath, { force: true });
+      if (!removeSegment(candidate)) break;
       current = current.filter((entry) => entry.path !== candidate.path);
     }
     return current;
   };
   const noteDrop = (kind: TelegramRuntimeLogIncident["kind"]) => {
+    if (
+      incident?.kind === "diagnostics-write-failed" &&
+      kind === "diagnostics-overflow"
+    ) {
+      incident = { ...incident, at: now(), dropped: incident.dropped + 1 };
+      return;
+    }
     incident = incident?.kind === kind
       ? { ...incident, at: now(), dropped: incident.dropped + 1 }
       : { kind, at: now(), dropped: 1 };
@@ -298,10 +384,18 @@ export function createTelegramRuntimeJsonlLog(
     let segments = retain(basePath);
     if (!activePath || activeBasePath !== basePath || !existsSync(activePath)) {
       if (activePath && activeBasePath !== basePath) {
-        rmSync(leasePathFor(activePath), { force: true });
+        try {
+          if (existsSync(leasePathFor(activePath))) {
+            removeFile(leasePathFor(activePath));
+          }
+        } catch {
+          noteDrop("diagnostics-write-failed");
+          return;
+        }
       }
       activeBasePath = basePath;
       activePath = makeSegmentPath(basePath);
+      activeCreatedAt = now();
       rotation += 1;
       segments = makeRoom(
         basePath,
@@ -319,16 +413,24 @@ export function createTelegramRuntimeJsonlLog(
         return;
       }
       writeFileSync(activePath, safeJsonLine({
-        at: now(), kind: "boundary", boundary: "writer-start",
-        instanceId: resolveInstanceId(), writerGeneration: generation, pid,
+        at: activeCreatedAt, kind: "boundary", boundary: "writer-start",
+        instanceId: resolveInstanceId(), writerGeneration: generation,
+        processGeneration, pid,
       }) + "\n", { mode: 0o600, flag: "wx" });
       writeLease(activePath);
       segments = listSegments(basePath);
     }
     const activeSize = statSync(activePath).size;
-    if (activeSize > 0 && activeSize + Buffer.byteLength(line) > maxSegmentBytes) {
+    const ageExpired =
+      activeCreatedAt !== undefined && now() - activeCreatedAt > maxAgeMs;
+    if (
+      ageExpired ||
+      (activeSize > 0 && activeSize + Buffer.byteLength(line) > maxSegmentBytes)
+    ) {
       const oldPath = activePath;
+      const oldCreatedAt = activeCreatedAt;
       activePath = makeSegmentPath(basePath);
+      activeCreatedAt = now();
       rotation += 1;
       segments = makeRoom(
         basePath,
@@ -342,14 +444,27 @@ export function createTelegramRuntimeJsonlLog(
         total + Buffer.byteLength(line) + 256 > maxTotalBytes
       ) {
         activePath = oldPath;
+        activeCreatedAt = oldCreatedAt;
         noteDrop("diagnostics-overflow");
         return;
       }
-      rmSync(leasePathFor(oldPath), { force: true });
+      try {
+        if (existsSync(leasePathFor(oldPath))) {
+          removeFile(leasePathFor(oldPath));
+        }
+      } catch {
+        activePath = oldPath;
+        activeCreatedAt = oldCreatedAt;
+        noteDrop("diagnostics-write-failed");
+        return;
+      }
       writeFileSync(activePath, safeJsonLine({
-        at: now(), kind: "boundary", boundary: "rotation",
+        at: activeCreatedAt, kind: "boundary",
+        boundary: ageExpired ? "age-rotation" : "rotation",
         instanceId: resolveInstanceId(), writerGeneration: generation,
+        processGeneration,
       }) + "\n", { mode: 0o600, flag: "wx" });
+      writeLease(activePath);
     }
     segments = retain(basePath);
     const totalBytes = segments.reduce((sum, entry) => sum + entry.size, 0);
@@ -362,6 +477,7 @@ export function createTelegramRuntimeJsonlLog(
     writeLease(activePath);
   };
   const enqueue = (basePath: string, line: string) => {
+    if (!generationActive) return;
     queued.push({ basePath, line });
     if (scheduled) return;
     scheduled = true;
@@ -384,12 +500,54 @@ export function createTelegramRuntimeJsonlLog(
     const basePath = resolveBasePath();
     enqueue(basePath, safeJsonLine({
       at: now(), kind: "boundary", boundary: reason,
-      instanceId: resolveInstanceId(), writerGeneration: generation, scope,
+      instanceId: resolveInstanceId(), writerGeneration: generation,
+      processGeneration, scope,
     }) + "\n");
+  };
+  const retireGeneration = async (
+    reason: string,
+    scope?: Record<string, unknown>,
+  ): Promise<void> => {
+    if (!generationActive) return;
+    boundary(reason, scope);
+    await pending;
+    const retiredGeneration = generation;
+    const retiredPath = activePath;
+    const retiredBasePath = activeBasePath;
+    generationActive = false;
+    liveWriterGenerations.delete(
+      writerGenerationKey(processGeneration, retiredGeneration),
+    );
+    if (retiredPath && retiredBasePath) {
+      try {
+        withTelegramFileTransaction(
+          `${retiredBasePath}.segments.transaction`,
+          () => {
+            const leasePath = leasePathFor(retiredPath);
+            if (existsSync(leasePath)) removeFile(leasePath);
+          },
+        );
+      } catch {
+        noteDrop("diagnostics-write-failed");
+      }
+    }
+    activePath = undefined;
+    activeBasePath = undefined;
+    activeCreatedAt = undefined;
   };
 
   return {
     getPath: () => activePath ?? resolveBasePath(),
+    async startGeneration(reason, scope) {
+      await retireGeneration("writer-replaced");
+      generation = safeComponent(randomUUID());
+      generationActive = true;
+      liveWriterGenerations.add(
+        writerGenerationKey(processGeneration, generation),
+      );
+      boundary(reason, scope);
+    },
+    retireGeneration,
     reset(reason, scope) {
       boundary(reason, scope);
       scopeKeys.set(resolveBasePath(), scope ? safeJsonLine(scope) : undefined);
@@ -426,6 +584,8 @@ export interface TelegramRuntimeDiagnosticsRuntime<TContext> {
     getStatusState(): Status.TelegramBridgeStatusLineState;
     persistSnapshot(snapshot: ReturnType<typeof Status.createTelegramStatusSnapshot>): Promise<void>;
   }): void;
+  onSessionStart(): Promise<void>;
+  onSessionShutdown(): Promise<void>;
   updateStatus(ctx: TContext, error?: string): void;
   getStatusLines(options?: Status.TelegramBridgeStatusLineOptions): string[];
   scheduleSnapshotPersist(): void;
@@ -479,6 +639,12 @@ export function createTelegramRuntimeDiagnosticsRuntime<TContext>(): TelegramRun
           events.record("telegram", error, { phase: "runtime-diagnostics-snapshot-persist" });
         },
       });
+    },
+    async onSessionStart() {
+      await jsonl.startGeneration("session-start");
+    },
+    async onSessionShutdown() {
+      await jsonl.retireGeneration("session-shutdown");
     },
     updateStatus(ctx, error) {
       if (!statusPorts) return;

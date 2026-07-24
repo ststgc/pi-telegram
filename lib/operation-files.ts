@@ -35,6 +35,11 @@ export interface TelegramOperationOwnedPrivateFileCleanupOptions {
   prefix?: string;
 }
 
+export interface TelegramOperationOwnedCleanupFailureEvidence {
+  phase: string;
+  failedCount: number;
+}
+
 function assertOperationFileName(fileName: string): string {
   if (
     !fileName ||
@@ -123,6 +128,24 @@ export function getTelegramOperationOwnedFiles(
   owner: object,
 ): readonly TelegramOperationOwnedPrivateFile[] {
   return operationFilesByOwner.get(owner) ?? [];
+}
+
+/**
+ * Settles best-effort cleanup while projecting only fixed metadata. Cleanup
+ * paths and thrown provider/filesystem values never cross this evidence port.
+ */
+export async function settleTelegramOperationOwnedFileCleanup(
+  files: readonly TelegramOperationOwnedPrivateFile[],
+  phase: string,
+  recordFailure?: (
+    evidence: TelegramOperationOwnedCleanupFailureEvidence,
+  ) => void,
+): Promise<void> {
+  const results = await Promise.allSettled(files.map((file) => file.cleanup()));
+  const failedCount = results.filter(
+    (result) => result.status === "rejected",
+  ).length;
+  if (failedCount > 0) recordFailure?.({ phase, failedCount });
 }
 
 /** Creates one 0600 file in a 0700 directory and returns its sole cleanup capability. */

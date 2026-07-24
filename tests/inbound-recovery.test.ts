@@ -1779,6 +1779,42 @@ test(
   }),
 );
 
+test(
+  "business deletion terminalization preserves exact profile, chat, connection, and represented thread",
+  withTempAgentDir(async (agentDir) => {
+    const harness = createHarness(agentDir);
+    const matching = update(97);
+    matching.message = {
+      ...matching.message!,
+      message_id: 970,
+      message_thread_id: 42,
+      business_connection_id: "business-a",
+      chat: { id: 7 },
+    };
+    const collision = update(98);
+    collision.message = {
+      ...collision.message!,
+      message_id: 970,
+      message_thread_id: 43,
+      business_connection_id: "business-a",
+      chat: { id: 8 },
+    };
+    await harness.runtime.admitUpdate(matching, harness.ctx);
+    await harness.runtime.admitUpdate(collision, harness.ctx);
+
+    harness.runtime.terminalizeDeletedMessageIds([970], {
+      profile: "default",
+      chatId: 7,
+      exactThreadId: 42,
+      businessConnectionId: "business-a",
+    });
+
+    const status = harness.inspect().getStatus();
+    assert.equal(status.counts.completed, 1);
+    assert.equal(status.counts.admitted, 1);
+  }),
+);
+
 const PROCESS_FIXTURE_PATH = join(
   process.cwd(),
   "tests/fixtures/inbound-recovery-process.ts",

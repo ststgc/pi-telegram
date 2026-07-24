@@ -103,6 +103,23 @@ export interface TelegramUser {
   username?: string;
 }
 
+export function isValidTelegramBotIdentity(
+  value: unknown,
+): value is TelegramUser {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const user = value as Record<string, unknown>;
+  return (
+    Number.isSafeInteger(user.id) &&
+    (user.id as number) > 0 &&
+    user.is_bot === true &&
+    typeof user.first_name === "string" &&
+    user.first_name.trim().length > 0 &&
+    (user.username === undefined ||
+      (typeof user.username === "string" &&
+        /^[A-Za-z][A-Za-z0-9_]{0,31}$/u.test(user.username)))
+  );
+}
+
 export interface TelegramChat {
   id: number;
   type: string;
@@ -1421,27 +1438,10 @@ export async function fetchTelegramBotIdentity(
       ) {
         throw new Error("Telegram API getMe returned an invalid response");
       }
-      const user = result as Record<string, unknown>;
-      if (!Number.isSafeInteger(user.id) || (user.id as number) <= 0) {
-        throw new Error("Telegram API getMe returned an invalid bot id");
+      if (!isValidTelegramBotIdentity(result)) {
+        throw new Error("Telegram API getMe returned an invalid bot identity");
       }
-      if (
-        user.username !== undefined &&
-        (typeof user.username !== "string" ||
-          !/^[A-Za-z][A-Za-z0-9_]{0,31}$/u.test(user.username))
-      ) {
-        throw new Error("Telegram API getMe returned an invalid bot username");
-      }
-      return {
-        ok: true,
-        result: {
-          ...(result as TelegramUser),
-          id: user.id as number,
-          ...(typeof user.username === "string"
-            ? { username: user.username }
-            : {}),
-        },
-      };
+      return { ok: true, result };
     },
   );
 }

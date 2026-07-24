@@ -254,6 +254,89 @@ test("Paired update runtime preserves configured-owner routing", async () => {
   assert.deepEqual(events, ["message:ctx:10"]);
 });
 
+test("Paired update runtime propagates profile and represented thread for business deletion", async () => {
+  const scopes: Array<Record<string, unknown> | undefined> = [];
+  const runtime = createTelegramPairedUpdateRuntime({
+    getAllowedUserId: () => 7,
+    getEffectiveProfile: () => "work",
+    resolveQueuedTelegramMessageThreadId: (messageId, scope) => {
+      assert.equal(messageId, 99);
+      assert.deepEqual(scope, {
+        profile: "work",
+        chatId: 100,
+        businessConnectionId: "business-a",
+      });
+      return 42;
+    },
+    removePendingMediaGroupMessages: () => {},
+    removeQueuedTelegramTurnsByMessageIds: (_ids, _ctx, scope) => {
+      scopes.push(scope);
+      return 1;
+    },
+    clearQueuedTelegramTurnPriorityByMessageId: () => false,
+    prioritizeQueuedTelegramTurnByMessageId: () => false,
+    answerCallbackQuery: async () => {},
+    answerGuestQuery: async () => {},
+    handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
+    sendTextReply: async () => undefined,
+    handleAuthorizedTelegramMessage: async () => promptMaterialized(),
+    handleAuthorizedTelegramEditedMessage: () => completed("ignored"),
+  });
+
+  await runtime.handleUpdate(
+    {
+      deleted_business_messages: {
+        business_connection_id: "business-a",
+        chat: { id: 100 },
+        message_ids: [99],
+      },
+    },
+    TEST_CONTEXT,
+  );
+
+  assert.deepEqual(scopes, [
+    {
+      profile: "work",
+      chatId: 100,
+      businessConnectionId: "business-a",
+      threadId: 42,
+      exactThreadId: 42,
+    },
+  ]);
+});
+
+test("Business deletion leaves thread inexact when no ownership or turn evidence exists", async () => {
+  let capturedScope: Record<string, unknown> | undefined;
+  await executeTelegramUpdatePlan(
+    {
+      kind: "deleted",
+      messageIds: [99],
+      scope: { chatId: 100, businessConnectionId: "business-a" },
+    },
+    {
+      ctx: TEST_CONTEXT,
+      getEffectiveProfile: () => "work",
+      removePendingMediaGroupMessages: () => {},
+      removeQueuedTelegramTurnsByMessageIds: (_ids, _ctx, scope) => {
+        capturedScope = scope;
+        return 0;
+      },
+      handleAuthorizedTelegramReactionUpdate: async () => completed("reaction"),
+      answerCallbackQuery: async () => {},
+      answerGuestQuery: async () => {},
+      handleAuthorizedTelegramCallbackQuery: async () => completed("callback"),
+      sendTextReply: async () => undefined,
+      handleAuthorizedTelegramMessage: async () => promptMaterialized(),
+      handleAuthorizedTelegramEditedMessage: async () => completed("ignored"),
+    },
+  );
+  assert.deepEqual(capturedScope, {
+    profile: "work",
+    chatId: 100,
+    businessConnectionId: "business-a",
+  });
+});
+
 test("Paired update runtime preserves follower target ownership forwarding", async () => {
   const events: string[] = [];
   const runtime = createTelegramPairedUpdateRuntime({

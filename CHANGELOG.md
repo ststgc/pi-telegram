@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- `P1 Async Boundaries`: operation-owned inbound and voice files now clean up only through explicit capabilities after durable transfer, `getMe` validates HTTP/schema identity strictly, public handler failures are isolated and sanitized, business deletions are exact-scope, and diagnostics use leased append-only profile/instance segments with bounded retention.
+- `P1 Async Boundaries`: operation-owned inbound and voice files now clean up only through explicit capabilities after durable transfer and emit sanitized cleanup evidence on failure; `getMe` shares one strict HTTP/envelope/bot-identity validator with setup; public handler failures remain isolated; business deletions preserve exact profile/chat/business and represented-thread scope; and diagnostics use explicitly retired process-generation leases, immutable creation-age rotation, fail-closed lease cleanup, and bounded append-only profile/instance retention.
 
 - `Breaking Fork Identity`: Moved the canonical repository to `ststgc/pi-telegram` and the package/public import namespace from `@llblab/pi-telegram` to `@ststgc/pi-telegram`. Impact: Git installations and companion-extension imports must use the new coordinates; the private manifest fails closed against npm publication, and this release remains GitHub-only.
 - `Model Menu`: The Telegram model menu now opens on all authenticated models while keeping configured scoped models as an optional view. Impact: model discovery is complete by default without removing operator-curated shortcuts.

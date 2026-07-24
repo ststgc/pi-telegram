@@ -50,6 +50,7 @@ import {
 interface TelegramInboundRecoveryMessage {
   message_id?: number;
   message_thread_id?: number;
+  business_connection_id?: string;
   date?: number;
   chat?: { id?: number; type?: string };
   from?: { id?: number; is_bot?: boolean };
@@ -261,7 +262,15 @@ export interface InboundRecoveryRuntime<
     messages: readonly TelegramInboundRecoveryMessage[],
     error: unknown,
   ): void;
-  terminalizeDeletedMessageIds(messageIds: readonly number[]): void;
+  terminalizeDeletedMessageIds(
+    messageIds: readonly number[],
+    scope?: {
+      profile?: string;
+      chatId?: number;
+      exactThreadId?: number | null;
+      businessConnectionId?: string;
+    },
+  ): void;
   publishSessionHandoffs(toSessionGeneration: number): number;
   rehydrateOutbound(
     ctx: TContext,
@@ -678,7 +687,7 @@ export function createInboundRecoveryRuntime<
   let store: RecoveryStore | undefined;
   let storeProfile: string | undefined;
   const admittedByUpdate = new Map<number, AdmittedUpdate>();
-  const recordsByMessageId = new Map<number, AdmittedUpdate>();
+  const recordsByMessageId = new Map<number, Map<string, AdmittedUpdate>>();
   const identityByRecordId = new Map<string, RecoveryIdentity>();
   const followerProofByUpdate = new Map<
     number,
@@ -821,10 +830,9 @@ export function createInboundRecoveryRuntime<
     admittedByUpdate.set(update.update_id, admitted);
     identityByRecordId.set(admitted.record.recordId, admitted.identity);
     for (const messageId of getSourceMessageIds(update)) {
-      const current = recordsByMessageId.get(messageId);
-      if (!current || current.record.recordId === admitted.record.recordId) {
-        recordsByMessageId.set(messageId, admitted);
-      }
+      const matches = recordsByMessageId.get(messageId) ?? new Map();
+      matches.set(admitted.record.recordId, admitted);
+      recordsByMessageId.set(messageId, matches);
     }
   };
 
@@ -841,8 +849,10 @@ export function createInboundRecoveryRuntime<
     for (const message of messages) {
       if (typeof message.message_id !== "number") continue;
       const admitted = recordsByMessageId.get(message.message_id);
-      if (admitted?.admission.kind === "admitted") {
-        matches.set(admitted.record.recordId, admitted);
+      for (const candidate of admitted?.values() ?? []) {
+        if (candidate.admission.kind === "admitted") {
+          matches.set(candidate.record.recordId, candidate);
+        }
       }
     }
     return [...matches.values()];
@@ -1545,23 +1555,58 @@ export function createInboundRecoveryRuntime<
       });
     },
 
-    terminalizeDeletedMessageIds(messageIds) {
+    terminalizeDeletedMessageIds(messageIds, scope) {
       runGatedOperationSync(() => {
-      const matches = new Map<string, AdmittedUpdate>();
-      for (const messageId of messageIds) {
-        const admitted = recordsByMessageId.get(messageId);
-        if (
-          admitted &&
-          (admitted.record.state === "admitted" ||
-            admitted.record.state === "pre-dispatch")
-        ) {
-          matches.set(admitted.record.recordId, admitted);
+        const matches = new Map<string, AdmittedUpdate>();
+        for (const messageId of messageIds) {
+          for (const admitted of recordsByMessageId.get(messageId)?.values() ?? []) {
+            if (
+              admitted.record.state !== "admitted" &&
+              admitted.record.state !== "pre-dispatch"
+            ) {
+              continue;
+            }
+            if (
+              scope?.profile !== undefined &&
+              admitted.identity.profile !== scope.profile
+            ) {
+              continue;
+            }
+            if (
+              scope?.chatId !== undefined &&
+              admitted.identity.target.chatId !== scope.chatId
+            ) {
+              continue;
+            }
+            if (
+              scope?.exactThreadId !== undefined &&
+              (admitted.identity.target.threadId ?? null) !==
+                scope.exactThreadId
+            ) {
+              continue;
+            }
+            if (scope?.businessConnectionId !== undefined) {
+              const envelope = admitted.sourcePayload
+                ? decodeEnvelope(admitted.sourcePayload)
+                : undefined;
+              const sourceMessage =
+                envelope?.kind === "update"
+                  ? getUpdateMessage(envelope.update)
+                  : undefined;
+              if (
+                sourceMessage?.business_connection_id !==
+                scope.businessConnectionId
+              ) {
+                continue;
+              }
+            }
+            matches.set(admitted.record.recordId, admitted);
+          }
         }
-      }
-      settleMatches([...matches.values()], {
-        kind: "completed",
-        reason: "deleted",
-      });
+        settleMatches([...matches.values()], {
+          kind: "completed",
+          reason: "deleted",
+        });
       });
     },
 
