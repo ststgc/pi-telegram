@@ -11,8 +11,9 @@ import { Type } from "@sinclair/typebox";
 
 import type { ExtensionAPI } from "./pi.ts";
 import {
-  buildTelegramMultipartReplyParameters,
   normalizeTelegramNativeMarkdown,
+  reserveTelegramReplyParameters,
+  type TelegramReplyParametersReservation,
 } from "./replies.ts";
 import {
   getTelegramTargetThreadParams,
@@ -976,6 +977,7 @@ export async function sendQueuedTelegramOutboundAttachments(
   deps: TelegramQueuedOutboundAttachmentDeliveryDeps,
 ): Promise<void> {
   for (const attachment of turn.queuedAttachments) {
+    let reservation: TelegramReplyParametersReservation | undefined;
     try {
       if (deps.maxAttachmentSizeBytes !== undefined) {
         const stats = await (deps.statPath ?? stat)(attachment.path);
@@ -991,7 +993,7 @@ export async function sendQueuedTelegramOutboundAttachments(
       const isPhoto = isTelegramOutboundPhotoAttachmentPath(attachment.path);
       const method = isPhoto ? "sendPhoto" : "sendDocument";
       const fieldName = isPhoto ? "photo" : "document";
-      const replyParameters = buildTelegramMultipartReplyParameters(
+      reservation = reserveTelegramReplyParameters(
         turn.chatId,
         turn.replyToMessageId,
         turn.target,
@@ -1000,14 +1002,18 @@ export async function sendQueuedTelegramOutboundAttachments(
         method,
         {
           chat_id: String(turn.chatId),
-          ...(replyParameters ? { reply_parameters: replyParameters } : {}),
+          ...(reservation.multipartParameters
+            ? { reply_parameters: reservation.multipartParameters }
+            : {}),
           ...getTelegramMultipartTargetFields(turn.target),
         },
         fieldName,
         attachment.path,
         attachment.fileName,
       );
+      reservation.confirm();
     } catch (error) {
+      reservation?.releaseKnownFailure(error);
       const message = error instanceof Error ? error.message : String(error);
       deps.recordRuntimeEvent?.("attachment", error, {
         fileName: attachment.fileName,

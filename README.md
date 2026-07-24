@@ -165,7 +165,7 @@ Messages sent while Pi is busy become queued turns. Priority lanes support contr
 
 ### Native Rich Markdown
 
-Rich Markdown is the default model-answer membrane. Complete assistant and guest model replies use Telegram's native Rich Message APIs, while tool-call rows, reasoning/thinking blocks, menus, status rows, queue controls, settings, diagnostics, and other harness-owned surfaces use explicit Telegram HTML/plain rendering. This keeps meaningful model-authored answers visually distinct from bridge-owned operational UI. Two Settings controls keep the layers separate: `Draft previews` toggles live `sendRichMessageDraft` frames, while `Assistant rendering` chooses final-answer delivery (`rich` Native Rich Markdown or `html` legacy Markdown-to-HTML).
+Rich Markdown is the default model-answer membrane. Complete assistant and guest model replies use Telegram's native Rich Message APIs, while tool-call rows, reasoning/thinking blocks, menus, status rows, queue controls, settings, diagnostics, and other harness-owned surfaces use explicit Telegram HTML/plain rendering. This keeps meaningful model-authored answers visually distinct from bridge-owned operational UI. Two Settings controls keep the layers separate: `Draft previews` toggles live `sendRichMessageDraft` frames, while `Assistant rendering` chooses final-answer delivery (`rich` Native Rich Markdown or `html` legacy Markdown-to-HTML). A text-only Guest answer that exceeds one inline Rich result is delivered as a complete `full-response.md` document captioned `Full response attached.` instead of truncating the first chunk.
 
 ### Files And Artifacts
 

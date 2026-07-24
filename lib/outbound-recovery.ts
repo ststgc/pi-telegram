@@ -11,6 +11,12 @@ import { mkdir, open, unlink, writeFile } from "node:fs/promises";
 import { basename, isAbsolute, join } from "node:path";
 
 import {
+  cleanupTelegramOperationOwnedPrivateFiles,
+  createTelegramOperationOwnedPrivateFile,
+  type TelegramOperationOwnedPrivateFile,
+} from "./operation-files.ts";
+export type { TelegramOperationOwnedPrivateFile } from "./operation-files.ts";
+import {
   getTelegramGuestAttachmentTransport,
   getTelegramMultipartTargetFields,
   getTelegramRichOutboundAttachmentMediaKind,
@@ -102,6 +108,7 @@ export interface TelegramDurableOutboundCommitDeps {
     "planOutbound" | "listClaimableOutboundRecords"
   >;
   transformReply: (text: string) => Promise<string>;
+  operationTempDir?: string;
   maxSourceBytes?: number;
   openSource?: (
     path: string,
@@ -150,6 +157,10 @@ function cloneSource(
     ...(source.caption !== undefined ? { caption: source.caption } : {}),
   };
 }
+
+export const TELEGRAM_GUEST_FULL_RESPONSE_CAPTION =
+  "Full response attached.";
+const TELEGRAM_GUEST_FULL_RESPONSE_FILE_NAME = "full-response.md";
 
 function capGuestCaption(caption: string): string {
   return Array.from(caption).slice(0, 1024).join("");
@@ -295,7 +306,11 @@ function planTelegramDurableOutboundFromReply(
         stageOperationId,
         fileName: guestSource.fileName,
         mediaKind: guestMediaKind,
-        ...(reply.markdown ? { caption: capGuestCaption(reply.markdown) } : {}),
+        ...(guestSource.caption !== undefined
+          ? { caption: capGuestCaption(guestSource.caption) }
+          : reply.markdown
+            ? { caption: capGuestCaption(reply.markdown) }
+            : {}),
         branch: {
           success: { kind: "operation", operationId: cleanupOperationId },
         },
@@ -674,6 +689,71 @@ async function transformTelegramDurableOutboundReply(
   };
 }
 
+export interface TelegramDurableOutboundCommittedIntent
+  extends RecoveryOutboundDrainItem {
+  operationOwnedFiles: readonly TelegramOperationOwnedPrivateFile[];
+}
+
+export interface TelegramDurableOutboundOperationFileRuntime {
+  track(
+    turnId: string,
+    files: readonly TelegramOperationOwnedPrivateFile[],
+  ): void;
+  resolveTerminal(turnId: string): Promise<void>;
+}
+
+/** Retains only this operation's cleanup capabilities until durable terminal state. */
+export function createTelegramDurableOutboundOperationFileRuntime(deps: {
+  operationTempDir?: string;
+  recordCleanupFailure?: (error: unknown, turnId: string) => void;
+} = {}): TelegramDurableOutboundOperationFileRuntime {
+  const filesByTurnId = new Map<
+    string,
+    readonly TelegramOperationOwnedPrivateFile[]
+  >();
+  return {
+    track(turnId, files): void {
+      if (files.length === 0) return;
+      if (filesByTurnId.has(turnId)) {
+        throw new Error("Durable outbound turn already owns operation files");
+      }
+      filesByTurnId.set(turnId, [...files]);
+    },
+    async resolveTerminal(turnId): Promise<void> {
+      const files = filesByTurnId.get(turnId) ?? [];
+      filesByTurnId.delete(turnId);
+      for (const file of files) {
+        try {
+          await file.cleanup();
+        } catch (error) {
+          deps.recordCleanupFailure?.(error, turnId);
+        }
+      }
+      if (deps.operationTempDir) {
+        try {
+          await cleanupTelegramOperationOwnedPrivateFiles({
+            directory: deps.operationTempDir,
+            operationKey: turnId,
+            prefix: "guest-response",
+          });
+        } catch (error) {
+          deps.recordCleanupFailure?.(error, turnId);
+        }
+      }
+    },
+  };
+}
+
+async function cleanupTelegramOperationOwnedFiles(
+  files: readonly TelegramOperationOwnedPrivateFile[],
+): Promise<void> {
+  const results = await Promise.allSettled(files.map((file) => file.cleanup()));
+  const failure = results.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
+  if (failure) throw failure.reason;
+}
+
 /**
  * Transform the semantic reply, capture every source, publish payload and
  * spools atomically, then re-read the plan through digest verification.
@@ -681,48 +761,86 @@ async function transformTelegramDurableOutboundReply(
 export async function commitTelegramDurableOutbound(
   options: TelegramDurableOutboundPlanOptions,
   deps: TelegramDurableOutboundCommitDeps,
-): Promise<RecoveryOutboundDrainItem> {
-  let semanticReply = planTelegramDurableOutboundReply(options.finalMarkdown, {
-    automaticVoice: options.automaticVoice,
-  });
-  if (options.voiceFallbackToText && semanticReply.voiceReplies.length > 0) {
-    const fallbackMarkdown = [
-      semanticReply.markdown,
-      ...semanticReply.voiceReplies.map((reply) => reply.text),
-    ].filter((part) => part.trim().length > 0).join("\n\n");
-    semanticReply = {
-      markdown: fallbackMarkdown,
-      buttons: semanticReply.buttons,
-      voiceReplies: [],
-      automaticVoice: false,
-    };
-  }
-  const transformedReply = await transformTelegramDurableOutboundReply(
-    semanticReply,
-    deps.transformReply,
-  );
-  const planned = planTelegramDurableOutboundFromReply(options, transformedReply);
-  const captured: TelegramDurableOutboundSourceBytes[] = [];
-  for (const [index, source] of planned.spoolSources.entries()) {
-    captured.push(
-      await readTelegramDurableOutboundSource(source, {
-        maxSourceBytes: deps.maxSourceBytes,
-        openSource: deps.openSource,
-        afterRead: () => deps.afterSourceRead?.(source, index),
-      }),
+): Promise<TelegramDurableOutboundCommittedIntent> {
+  const operationOwnedFiles: TelegramOperationOwnedPrivateFile[] = [];
+  try {
+    let semanticReply = planTelegramDurableOutboundReply(options.finalMarkdown, {
+      automaticVoice: options.automaticVoice,
+    });
+    if (options.voiceFallbackToText && semanticReply.voiceReplies.length > 0) {
+      const fallbackMarkdown = [
+        semanticReply.markdown,
+        ...semanticReply.voiceReplies.map((reply) => reply.text),
+      ].filter((part) => part.trim().length > 0).join("\n\n");
+      semanticReply = {
+        markdown: fallbackMarkdown,
+        buttons: semanticReply.buttons,
+        voiceReplies: [],
+        automaticVoice: false,
+      };
+    }
+    const transformedReply = await transformTelegramDurableOutboundReply(
+      semanticReply,
+      deps.transformReply,
     );
+    let planningOptions = options;
+    if (
+      options.guestQueryId &&
+      options.queuedAttachments.length === 0 &&
+      splitTelegramNativeMarkdown(transformedReply.markdown).length > 1
+    ) {
+      if (!deps.operationTempDir) {
+        throw new Error(
+          "Oversized durable Guest response requires an operation temp directory",
+        );
+      }
+      const document = await createTelegramOperationOwnedPrivateFile({
+        directory: deps.operationTempDir,
+        fileName: TELEGRAM_GUEST_FULL_RESPONSE_FILE_NAME,
+        bytes: new TextEncoder().encode(transformedReply.markdown),
+        operationKey: options.turnId,
+        prefix: "guest-response",
+      });
+      operationOwnedFiles.push(document);
+      planningOptions = {
+        ...options,
+        queuedAttachments: [{
+          path: document.path,
+          fileName: document.fileName,
+          caption: TELEGRAM_GUEST_FULL_RESPONSE_CAPTION,
+        }],
+        generatedVoice: [],
+      };
+    }
+    const planned = planTelegramDurableOutboundFromReply(
+      planningOptions,
+      transformedReply,
+    );
+    const captured: TelegramDurableOutboundSourceBytes[] = [];
+    for (const [index, source] of planned.spoolSources.entries()) {
+      captured.push(
+        await readTelegramDurableOutboundSource(source, {
+          maxSourceBytes: deps.maxSourceBytes,
+          openSource: deps.openSource,
+          afterRead: () => deps.afterSourceRead?.(source, index),
+        }),
+      );
+    }
+    const record: RecoveryOutboundRecord = deps.store.planOutbound({
+      ...planned.recoveryPlan,
+      spool: captured.map((entry) => entry.bytes),
+    });
+    const committed = deps.store
+      .listClaimableOutboundRecords(options.claim)
+      .find((item) => item.record.recordId === record.recordId);
+    if (!committed) {
+      throw new Error("Committed durable outbound plan could not be verified");
+    }
+    return { ...committed, operationOwnedFiles };
+  } catch (error) {
+    await cleanupTelegramOperationOwnedFiles(operationOwnedFiles).catch(() => {});
+    throw error;
   }
-  const record: RecoveryOutboundRecord = deps.store.planOutbound({
-    ...planned.recoveryPlan,
-    spool: captured.map((entry) => entry.bytes),
-  });
-  const committed = deps.store
-    .listClaimableOutboundRecords(options.claim)
-    .find((item) => item.record.recordId === record.recordId);
-  if (!committed) {
-    throw new Error("Committed durable outbound plan could not be verified");
-  }
-  return committed;
 }
 
 export type TelegramDurableOutboundAdapterOutcome =

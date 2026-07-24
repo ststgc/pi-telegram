@@ -8,13 +8,14 @@
 import assert from "node:assert/strict";
 import { fork, type ChildProcess } from "node:child_process";
 import type { Stats } from "node:fs";
-import { mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import {
   commitTelegramDurableOutbound,
+  createTelegramDurableOutboundOperationFileRuntime,
   createTelegramDurableOutboundUnitAdapter,
   createTelegramDurableOutboundWorker,
   executeNextTelegramDurableOutboundUnit,
@@ -22,6 +23,7 @@ import {
   readTelegramDurableOutboundSource,
   type TelegramDurableOutboundAdapterInput,
   type TelegramDurableOutboundPlanOptions,
+  TELEGRAM_GUEST_FULL_RESPONSE_CAPTION,
   type TelegramDurableOutboundUnitAdapterDeps,
 } from "../lib/outbound-recovery.ts";
 import {
@@ -481,6 +483,85 @@ test("commit transforms Markdown and button labels before rendering and publicat
       label: "translated:Continue",
       prompt: "Continue safely.",
     }]);
+  } finally {
+    await removeHarness(harness);
+  }
+});
+
+test("oversized Guest response stages one complete private document and cleans it only after terminal", async () => {
+  const harness = await createHarness();
+  try {
+    const markdown = `${"a".repeat(32_000)}\n\n${"b".repeat(2_000)}`;
+    const committed = await commitTelegramDurableOutbound(
+      baseOptions(harness, {
+        replyToMessageId: 0,
+        guestQueryId: "guest-complete-document",
+        guestStagingTarget: { chatId: 840585 },
+        finalMarkdown: markdown,
+      }),
+      {
+        store: harness.store,
+        operationTempDir: harness.tempDir,
+        transformReply: identityTransform,
+      },
+    );
+    assert.equal(committed.operationOwnedFiles.length, 1);
+    const owned = committed.operationOwnedFiles[0];
+    assert.ok(owned);
+    assert.equal(await readFile(owned.path, "utf8"), markdown);
+    assert.equal(Buffer.from(committed.spool[0] ?? []).toString("utf8"), markdown);
+
+    const payload = JSON.parse(Buffer.from(committed.payload).toString("utf8")) as {
+      units: Array<{ kind: string; caption?: string }>;
+    };
+    assert.deepEqual(
+      payload.units.slice(0, 3).map((unit) => [unit.kind, unit.caption]),
+      [
+        ["guest-stage", undefined],
+        ["guest-answer", TELEGRAM_GUEST_FULL_RESPONSE_CAPTION],
+        ["guest-cleanup", undefined],
+      ],
+    );
+
+    const guestAnswers: unknown[] = [];
+    const adapter = createTelegramDurableOutboundUnitAdapter({
+      gate: { canStart: () => true, isActive: () => true },
+      sendMessage: async () => ({ message_id: 1 }),
+      sendRichMessage: async () => ({ message_id: 2 }),
+      sendMultipartBytes: async () => ({
+        message_id: 710,
+        document: { file_id: "complete-document-file-id" },
+      }),
+      answerGuestQuery: async (_queryId, _text, options) => {
+        guestAnswers.push(options?.result);
+      },
+      deleteMessage: async () => {},
+    });
+    let result = await executeNextTelegramDurableOutboundUnit(
+      committed.record.recordId,
+      { store: harness.store, claim: { identity: IDENTITY }, adapter },
+    );
+    while (result.record.state === "pending") {
+      result = await executeNextTelegramDurableOutboundUnit(
+        committed.record.recordId,
+        { store: harness.store, claim: { identity: IDENTITY }, adapter },
+      );
+    }
+    assert.equal(result.record.state, "delivered");
+    assert.deepEqual(guestAnswers, [{
+      type: "document",
+      id: "attachment-1",
+      title: "full-response.md",
+      document_file_id: "complete-document-file-id",
+      caption: TELEGRAM_GUEST_FULL_RESPONSE_CAPTION,
+    }]);
+    await access(owned.path);
+
+    const operationFiles = createTelegramDurableOutboundOperationFileRuntime({
+      operationTempDir: harness.tempDir,
+    });
+    await operationFiles.resolveTerminal(result.record.turnId);
+    await assert.rejects(access(owned.path));
   } finally {
     await removeHarness(harness);
   }
@@ -1788,6 +1869,44 @@ test("Guest media faults are phase-exact across reopen and ambiguity never selec
   }
 });
 
+
+test("durable worker turns a thrown sender into uncertainty before one queue-terminal callback", async () => {
+  const harness = await createHarness();
+  try {
+    const committed = await commitTelegramDurableOutbound(
+      baseOptions(harness),
+      { store: harness.store, transformReply: identityTransform },
+    );
+    const terminalStates: string[] = [];
+    const worker = createTelegramDurableOutboundWorker({
+      getStore: () => harness.store,
+      operationGate: new RecoveryProfileOperationGate(),
+      adapter: createUnitAdapterHarness({
+        sendRichMessage: async () => {
+          throw new Error("sender threw after mutation start");
+        },
+      }).adapter,
+      onTerminal: ({ record }) => {
+        terminalStates.push(record.state);
+      },
+    });
+    worker.register(committed.record, { identity: IDENTITY });
+    worker.schedule(committed.record.recordId);
+    for (let attempt = 0; attempt < 100 && terminalStates.length === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.deepEqual(terminalStates, ["delivery-uncertain"]);
+    assert.equal(
+      harness.store.getStatus().items.filter(
+        (item) =>
+          item.family === "outbound" && item.state === "delivery-uncertain",
+      ).length,
+      1,
+    );
+  } finally {
+    await removeHarness(harness);
+  }
+});
 
 test("durable worker registers and schedules a confirmed linked uncertain retry", async () => {
   const harness = await createHarness();

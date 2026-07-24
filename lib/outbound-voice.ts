@@ -8,7 +8,10 @@ import { unlink } from "node:fs/promises";
 import { basename, extname } from "node:path";
 
 import { assertTelegramInlineKeyboardCallbackData } from "./keyboard.ts";
-import { buildTelegramMultipartReplyParameters } from "./replies.ts";
+import {
+  reserveTelegramReplyParameters,
+  type TelegramReplyParametersReservation,
+} from "./replies.ts";
 import {
   getTelegramTargetThreadParams,
   type TelegramTarget,
@@ -78,15 +81,17 @@ export interface TelegramVoiceReplySenderPorts<THandler = unknown> {
   getProgrammaticVoiceHandlers?: () => TelegramOutboundProgrammaticVoiceHandler[];
 }
 
-function buildVoiceReplyParameters(
+function reserveVoiceReplyParameters(
   chatId: number,
   replyToPrompt: boolean | undefined,
   replyToMessageId: number | undefined,
   target?: TelegramTarget,
-): string | undefined {
-  if (replyToPrompt === false || replyToMessageId === undefined)
-    return undefined;
-  return buildTelegramMultipartReplyParameters(chatId, replyToMessageId, target);
+): TelegramReplyParametersReservation {
+  return reserveTelegramReplyParameters(
+    chatId,
+    replyToPrompt === false ? undefined : replyToMessageId,
+    target,
+  );
 }
 
 async function ensureTelegramVoiceFileFormat(
@@ -138,38 +143,46 @@ export function createTelegramVoiceReplySender<THandler = unknown>(
     const voiceFilePath = await ensureTelegramVoiceFileFormat(filePath);
     assertTelegramInlineKeyboardCallbackData(options?.replyMarkup);
     await sendVoiceChatAction(deps, turn.chatId);
-    const replyParameters = buildVoiceReplyParameters(
+    const reservation = reserveVoiceReplyParameters(
       turn.chatId,
       options?.replyToPrompt,
       turn.replyToMessageId,
       turn.target,
     );
-    await deps.sendMultipart(
-      "sendVoice",
-      {
-        chat_id: String(turn.chatId),
-        ...(options?.transcriptText ? { caption: options.transcriptText } : {}),
-        ...(replyParameters ? { reply_parameters: replyParameters } : {}),
-        ...(turn.target
-          ? Object.fromEntries(
-              Object.entries(getTelegramTargetThreadParams(turn.target)).map(
-                ([key, value]) => [key, String(value)],
-              ),
-            )
-          : {}),
-        ...(options?.replyMarkup !== undefined && options.replyMarkup !== null
-          ? {
-              reply_markup:
-                typeof options.replyMarkup === "string"
-                  ? options.replyMarkup
-                  : JSON.stringify(options.replyMarkup),
-            }
-          : {}),
-      },
-      "voice",
-      voiceFilePath,
-      basename(voiceFilePath),
-    );
+    try {
+      await deps.sendMultipart(
+        "sendVoice",
+        {
+          chat_id: String(turn.chatId),
+          ...(options?.transcriptText ? { caption: options.transcriptText } : {}),
+          ...(reservation.multipartParameters
+            ? { reply_parameters: reservation.multipartParameters }
+            : {}),
+          ...(turn.target
+            ? Object.fromEntries(
+                Object.entries(getTelegramTargetThreadParams(turn.target)).map(
+                  ([key, value]) => [key, String(value)],
+                ),
+              )
+            : {}),
+          ...(options?.replyMarkup !== undefined && options.replyMarkup !== null
+            ? {
+                reply_markup:
+                  typeof options.replyMarkup === "string"
+                    ? options.replyMarkup
+                    : JSON.stringify(options.replyMarkup),
+              }
+            : {}),
+        },
+        "voice",
+        voiceFilePath,
+        basename(voiceFilePath),
+      );
+      reservation.confirm();
+    } catch (error) {
+      reservation.releaseKnownFailure(error);
+      throw error;
+    }
   };
 
   return async (
