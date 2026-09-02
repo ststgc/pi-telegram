@@ -12,6 +12,7 @@ import {
   buildTelegramUpdateFlowAction,
   collectTelegramReactionEmojis,
   createTelegramPairedUpdateRuntime,
+  createTelegramInteractionPriorityHandle,
   createTelegramUpdateHandle,
   createTelegramUpdateRuntime,
   executeTelegramUpdate,
@@ -2547,4 +2548,91 @@ test("Public update handler failures are isolated and expose only generated id/c
   } finally {
     dispose();
   }
+});
+
+test("Interaction priority privately settles local answers and exactly forwards foreign owners", async () => {
+  const publicSeen: unknown[] = [];
+  const defaultSeen: unknown[] = [];
+  const routedInputs: unknown[] = [];
+  const forwarded: unknown[] = [];
+  const records = new Map<number, {
+    instanceId: string;
+    ownerGeneration?: string;
+    target: { chatId: number; threadId?: number };
+    purpose?: "interaction";
+  }>([
+    [101, { instanceId: "local", target: { chatId: 7 }, purpose: "interaction" }],
+    [201, { instanceId: "follower", ownerGeneration: "generation-a", target: { chatId: 7, threadId: 42 }, purpose: "interaction" }],
+  ]);
+  const priorityHandle = createTelegramInteractionPriorityHandle({
+    getCurrentInstanceId: () => "local",
+    getCurrentProfile: () => "default",
+    getMessageOwnership: (_chatId, messageId) => records.get(messageId),
+    classifyMessageOwnership: (_chatId, messageId) =>
+      messageId === 301 ? { purpose: "interaction" } : undefined,
+    isInteractionPending: () => true,
+    foreignOwnedUpdateForwarder: {
+      async forwardUpdate(input) { forwarded.push(input.ownership); return true; },
+    },
+    prepareCallback(input) {
+      routedInputs.push(input);
+      return {
+        acknowledgement: "",
+        async commit() { return { handled: true }; },
+      };
+    },
+    async handleInput(input) { routedInputs.push(input); return { handled: true }; },
+    async answerCallbackQuery() {},
+  });
+  const handler = createTelegramUpdateHandle({
+    pairingGate: createPairedGate(),
+    priorityHandle,
+    registry: {
+      version: 1,
+      add: () => () => {},
+      async dispatch(update) { publicSeen.push(update); return "consume"; },
+    },
+    async defaultHandle(update) {
+      defaultSeen.push(update);
+      return completed("ignored");
+    },
+  });
+  await handler({ callback_query: {
+    id: "cb-local", data: "interact:AbCdEf0123_-xyZ9:pick:0",
+    from: { id: 7, is_bot: false },
+    message: { chat: { id: 7, type: "private" }, message_id: 101 },
+  } }, TEST_CONTEXT);
+  const botReply = (messageId: number) => ({
+    chat: { id: 7, type: "private" }, from: { id: 99, is_bot: true }, message_id: messageId,
+  });
+  await handler({ message: {
+    chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false },
+    message_id: 102, text: "Answer", reply_to_message: botReply(101),
+  } }, TEST_CONTEXT);
+  await handler({ update_id: 3, message: {
+    chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false },
+    message_id: 202, message_thread_id: 42, text: "Foreign", reply_to_message: botReply(201),
+  } }, TEST_CONTEXT);
+  await handler({ message: {
+    chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false },
+    message_id: 103, text: "/abort", reply_to_message: botReply(101),
+  } }, TEST_CONTEXT);
+  await handler({ message: {
+    chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false },
+    message_id: 104, text: "ordinary", reply_to_message: botReply(999),
+  } }, TEST_CONTEXT);
+  await handler({ update_id: 5, message: {
+    chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false },
+    message_id: 302, text: "stale answer", reply_to_message: botReply(301),
+  } }, TEST_CONTEXT);
+  for (const [messageId, text] of [[105, "/next"], [106, "/compact"]] as const) {
+    await handler({ message: {
+      chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false },
+      message_id: messageId, text, reply_to_message: botReply(101),
+    } }, TEST_CONTEXT);
+  }
+  assert.deepEqual(routedInputs.map((input) => (input as { kind: string }).kind), ["callback", "text"]);
+  assert.deepEqual(forwarded, [records.get(201)]);
+  assert.equal(defaultSeen.length, 1, "pending /abort routes directly to the default command seam");
+  assert.equal(publicSeen.length, 3, "ordinary replies and non-safety commands preserve public ordering");
 });

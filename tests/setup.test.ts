@@ -273,6 +273,78 @@ test("Setup prompt runtime rolls memory back when persistence fails", async () =
   ]);
 });
 
+test("Setup prompt runtime keeps persisted config in memory when post-publication rebind fails", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-setup-rebind-fail-"));
+  const configPath = join(dir, "telegram.json");
+  try {
+    const store = createTelegramConfigStore({
+      agentDir: dir,
+      configPath,
+      initialConfig: { botToken: "previous-token", botId: 1 },
+    });
+    await store.persist();
+    let failRebind = true;
+    let pollingStarts = 0;
+    const recordedErrors: string[] = [];
+    const runtime = createTelegramSetupPromptRuntime({
+      env: {},
+      getConfig: store.get,
+      setConfig: store.set,
+      setupGuard: { start: () => true, finish: () => {} },
+      getMe: async () => ({
+        ok: true,
+        result: {
+          id: 77,
+          is_bot: true,
+          first_name: "Demo",
+          username: "rebound_bot",
+        },
+      }),
+      persistConfig: async () => store.persist(),
+      afterConfigPublication: () => {
+        if (failRebind) throw new Error("rebind failed");
+      },
+      startPolling: () => {
+        pollingStarts += 1;
+        return { ok: true };
+      },
+      updateStatus: () => {},
+      recordRuntimeEvent: (category, error) => {
+        recordedErrors.push(`${category}:${String(error)}`);
+      },
+    });
+    const ctx = {
+      hasUI: true,
+      ui: {
+        input: async () => "new-token",
+        editor: async () => "new-token",
+        notify: () => {},
+      },
+    };
+
+    await assert.rejects(runtime(ctx), /rebind failed/);
+    assert.equal(store.get().botToken, "new-token");
+    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), {
+      profiles: {
+        default: {
+          botToken: "new-token",
+          botUsername: "rebound_bot",
+          botId: 77,
+        },
+      },
+    });
+    assert.deepEqual(recordedErrors, ["setup:Error: rebind failed"]);
+    assert.equal(pollingStarts, 0);
+
+    failRebind = false;
+    assert.equal((await runtime(ctx)).status, "success");
+    assert.equal(store.get().botToken, "new-token");
+    assert.equal(pollingStarts, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("Setup prompt runtime persists the first validated config to missing or empty files", async () => {
   for (const initialFile of [undefined, "{}\n"]) {
     const dir = await mkdtemp(join(tmpdir(), "pi-telegram-setup-first-run-"));

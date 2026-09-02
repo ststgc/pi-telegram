@@ -150,6 +150,7 @@ export interface TelegramBusFollowerRegistrationState {
   markLeaderAck: (nowMs?: number) => void;
   getEligibleElectionSlots: () => readonly string[];
   setEligibleElectionSlots: (slots: readonly string[]) => void;
+  subscribeAuthorityChange: (listener: () => void) => () => void;
   setRegistered: (
     registered: boolean,
     target?: TelegramTarget,
@@ -915,6 +916,7 @@ export function createTelegramBusFollowerRegistrationState(): TelegramBusFollowe
   let generation: string | undefined;
   let lastLeaderAckAtMs: number | undefined;
   let eligibleElectionSlots: string[] = [];
+  const authorityChangeListeners = new Set<() => void>();
   return {
     isRegistered: () => registered,
     getTarget: () => (target ? { ...target } : undefined),
@@ -935,12 +937,30 @@ export function createTelegramBusFollowerRegistrationState(): TelegramBusFollowe
         new Set(slots.filter((slot) => /^[A-Z]$/.test(slot))),
       ).sort();
     },
+    subscribeAuthorityChange: (listener) => {
+      authorityChangeListeners.add(listener);
+      return () => authorityChangeListeners.delete(listener);
+    },
     setRegistered: (next, nextTarget, metadata) => {
+      const publishedTarget = next
+        ? nextTarget
+          ? { ...nextTarget }
+          : undefined
+        : undefined;
+      const publishedGeneration = next ? metadata?.generation : undefined;
+      const authorityChanged =
+        registered !== next ||
+        target?.chatId !== publishedTarget?.chatId ||
+        target?.threadId !== publishedTarget?.threadId ||
+        generation !== publishedGeneration;
+      if (authorityChanged) {
+        for (const listener of authorityChangeListeners) listener();
+      }
       registered = next;
-      target = next ? (nextTarget ? { ...nextTarget } : undefined) : undefined;
+      target = publishedTarget;
       slot = next ? metadata?.slot : undefined;
       threadName = next ? metadata?.threadName : undefined;
-      generation = next ? metadata?.generation : undefined;
+      generation = publishedGeneration;
       lastLeaderAckAtMs = next ? Date.now() : undefined;
     },
   };
@@ -1213,7 +1233,9 @@ export function createTelegramBusFollowerRegistrationRuntime<
   let activeLeaderSocketPath: string | undefined;
   let activeAuthSecret: string | undefined;
   let activeRegistrationGeneration: string | undefined;
+  let activeRegistrationOperationGeneration: number | undefined;
   let activeContext: TContext | undefined;
+  let registrationOperationGeneration = 0;
   let lastKnownTarget: TelegramTarget | undefined;
   let lastKnownSlot: string | undefined;
   let lastKnownThreadName: string | undefined;
@@ -1223,9 +1245,11 @@ export function createTelegramBusFollowerRegistrationRuntime<
     heartbeatInterval = undefined;
   };
   const stop = () => {
+    registrationOperationGeneration += 1;
     stopHeartbeat();
     activeAuthSecret = undefined;
     activeRegistrationGeneration = undefined;
+    activeRegistrationOperationGeneration = undefined;
     deps.setActiveAuthSecret?.(undefined);
     deps.registrationState?.setRegistered(false);
     lastKnownTarget = undefined;
@@ -1234,27 +1258,75 @@ export function createTelegramBusFollowerRegistrationRuntime<
     activeContext = undefined;
     void deps.stopReceiving?.();
   };
-  const sendHeartbeat = async () => {
-    if (!activeLeaderSocketPath) return;
+  const isRegistrationOperationCurrent = (generation: number): boolean =>
+    generation === registrationOperationGeneration;
+  const clearFailedRegistration = async (
+    operationGeneration: number,
+  ): Promise<boolean> => {
+    if (!isRegistrationOperationCurrent(operationGeneration)) return false;
+    stopHeartbeat();
+    activeLeaderSocketPath = undefined;
+    activeAuthSecret = undefined;
+    activeRegistrationGeneration = undefined;
+    activeRegistrationOperationGeneration = undefined;
+    deps.registrationState?.setRegistered(false);
+    deps.setActiveAuthSecret?.(undefined);
+    activeContext = undefined;
+    await deps.stopReceiving?.();
+    return true;
+  };
+  const captureHeartbeatBinding = () => {
+    if (
+      !activeLeaderSocketPath ||
+      !activeRegistrationGeneration ||
+      activeRegistrationOperationGeneration === undefined ||
+      !activeContext
+    ) {
+      return undefined;
+    }
+    return {
+      operationGeneration: activeRegistrationOperationGeneration,
+      leaderSocketPath: activeLeaderSocketPath,
+      authSecret: activeAuthSecret,
+      registrationGeneration: activeRegistrationGeneration,
+      context: activeContext,
+    };
+  };
+  const isHeartbeatBindingCurrent = (
+    binding: NonNullable<ReturnType<typeof captureHeartbeatBinding>>,
+  ): boolean =>
+    isRegistrationOperationCurrent(binding.operationGeneration) &&
+    activeLeaderSocketPath === binding.leaderSocketPath &&
+    activeAuthSecret === binding.authSecret &&
+    activeRegistrationGeneration === binding.registrationGeneration &&
+    activeContext === binding.context &&
+    (!deps.isContextActive || deps.isContextActive(binding.context)) &&
+    (!deps.registrationState ||
+      (deps.registrationState.isRegistered() &&
+        deps.registrationState.getGeneration() ===
+          binding.registrationGeneration));
+  const sendHeartbeat = async (
+    binding: NonNullable<ReturnType<typeof captureHeartbeatBinding>>,
+  ) => {
+    if (!isHeartbeatBindingCurrent(binding)) return;
     try {
       const response = await sendTelegramBusLocalEnvelope({
-        socketPath: activeLeaderSocketPath,
+        socketPath: binding.leaderSocketPath,
         timeoutMs: deps.timeoutMs,
         retry: getTelegramBusTransportRetryPolicy({
-          endpoint: activeLeaderSocketPath,
+          endpoint: binding.leaderSocketPath,
           operation: "operation",
         }),
         envelope: {
           kind: "follower.heartbeat",
           requestId: deps.createRequestId(),
-          auth: activeAuthSecret,
+          auth: binding.authSecret,
           instanceId: deps.instanceId,
-          ...(activeRegistrationGeneration
-            ? { registrationGeneration: activeRegistrationGeneration }
-            : {}),
+          registrationGeneration: binding.registrationGeneration,
           sentAtMs: getNowMs(),
         },
       });
+      if (!isHeartbeatBindingCurrent(binding)) return;
       if (response?.kind === "bus.ack" && response.ok) {
         const heartbeatResult = isRecord(response.result)
           ? response.result
@@ -1273,25 +1345,29 @@ export function createTelegramBusFollowerRegistrationRuntime<
         );
       }
     } catch (error) {
+      if (!isHeartbeatBindingCurrent(binding)) return;
       deps.recordRuntimeEvent?.("bus", error, { phase: "follower-heartbeat" });
-      if (activeContext) await deps.onHeartbeatFailure?.(error, activeContext);
+      await deps.onHeartbeatFailure?.(error, binding.context);
     }
   };
   const startHeartbeat = (socketPath: string) => {
     stopHeartbeat();
     activeLeaderSocketPath = socketPath;
     heartbeatInterval = setInterval(() => {
-      void sendHeartbeat();
+      const binding = captureHeartbeatBinding();
+      if (binding) void sendHeartbeat(binding);
     }, heartbeatMs);
     heartbeatInterval.unref?.();
   };
   return {
     registerWithLeader: async (ctx, leader, options) => {
+      const operationGeneration = ++registrationOperationGeneration;
       const leaderSocketPath =
         leader.busSocketPath ??
         deps.getLeaderSocketPath?.() ??
         getTelegramBusSocketPath();
       await deps.startReceiving?.();
+      if (!isRegistrationOperationCurrent(operationGeneration)) return false;
       activeAuthSecret = deps.getLeaderAuthSecret?.(leader);
       deps.setActiveAuthSecret?.(activeAuthSecret);
       const requestId = deps.createRequestId();
@@ -1355,29 +1431,16 @@ export function createTelegramBusFollowerRegistrationRuntime<
           },
         });
       } catch (error) {
-        stopHeartbeat();
-        activeLeaderSocketPath = undefined;
-        activeAuthSecret = undefined;
-        deps.registrationState?.setRegistered(false);
-        deps.setActiveAuthSecret?.(undefined);
-        await deps.stopReceiving?.();
+        await clearFailedRegistration(operationGeneration);
         throw error;
       }
+      if (!isRegistrationOperationCurrent(operationGeneration)) return false;
       if (deps.isContextActive && !deps.isContextActive(ctx)) {
-        stopHeartbeat();
-        activeLeaderSocketPath = undefined;
-        activeAuthSecret = undefined;
-        deps.setActiveAuthSecret?.(undefined);
-        await deps.stopReceiving?.();
+        await clearFailedRegistration(operationGeneration);
         return false;
       }
       if (response?.kind === "bus.ack" && !response.ok) {
-        stopHeartbeat();
-        activeLeaderSocketPath = undefined;
-        activeAuthSecret = undefined;
-        deps.registrationState?.setRegistered(false);
-        deps.setActiveAuthSecret?.(undefined);
-        await deps.stopReceiving?.();
+        await clearFailedRegistration(operationGeneration);
         throw new Error(
           response.message ??
             "Telegram bus follower registration was rejected.",
@@ -1395,17 +1458,16 @@ export function createTelegramBusFollowerRegistrationRuntime<
         lastKnownThreadName = registrationResult.threadName;
         activeLeaderSocketPath = leaderSocketPath;
         activeRegistrationGeneration = registrationGeneration;
+        activeRegistrationOperationGeneration = operationGeneration;
         activeContext = ctx;
-        await sendHeartbeat();
+        const heartbeatBinding = captureHeartbeatBinding();
+        if (!heartbeatBinding) return false;
+        await sendHeartbeat(heartbeatBinding);
+        if (!isRegistrationOperationCurrent(operationGeneration)) return false;
         startHeartbeat(leaderSocketPath);
         return true;
       }
-      stopHeartbeat();
-      activeLeaderSocketPath = undefined;
-      activeAuthSecret = undefined;
-      deps.registrationState?.setRegistered(false);
-      deps.setActiveAuthSecret?.(undefined);
-      await deps.stopReceiving?.();
+      await clearFailedRegistration(operationGeneration);
       return false;
     },
     setContext(ctx) {

@@ -128,6 +128,7 @@ export type RecoveryReassignmentState =
 
 export const RECOVERY_STORE_MODES = ["active", "downgrade-exclusive"] as const;
 export type RecoveryStoreMode = (typeof RECOVERY_STORE_MODES)[number];
+export type RecoveryInFlightFamily = "inbound" | "outbound" | "bus";
 
 export const RECOVERY_OPERATION_GATE_PHASES = [
   "active",
@@ -2844,6 +2845,11 @@ export interface RecoveryStoreOpenOptions {
   /** Deterministic test seam; production remains capped by the frozen 512 MiB limit. */
   quotaBytes?: number;
   isIdentityAuthenticated?: (identity: RecoveryIdentity) => boolean;
+  /** Limits reopen recovery to in-flight work owned by this runtime's authority. */
+  shouldRecoverInFlight?: (
+    family: RecoveryInFlightFamily,
+    identity: RecoveryIdentity,
+  ) => boolean;
   validateReassignmentBinding?: (
     input: RecoveryReassignmentBindingValidation,
   ) => boolean;
@@ -3506,6 +3512,10 @@ export class RecoveryStore {
   readonly #randomId: () => string;
   readonly #fault?: (faultId: RecoveryStorageFaultId) => void;
   readonly #isIdentityAuthenticated?: (identity: RecoveryIdentity) => boolean;
+  readonly #shouldRecoverInFlight: (
+    family: RecoveryInFlightFamily,
+    identity: RecoveryIdentity,
+  ) => boolean;
   readonly #validateReassignmentBinding?: (
     input: RecoveryReassignmentBindingValidation,
   ) => boolean;
@@ -3543,6 +3553,7 @@ export class RecoveryStore {
     this.#randomId = options.randomId ?? randomUUID;
     this.#fault = options.fault;
     this.#isIdentityAuthenticated = options.isIdentityAuthenticated;
+    this.#shouldRecoverInFlight = options.shouldRecoverInFlight ?? (() => true);
     this.#validateReassignmentBinding = options.validateReassignmentBinding;
     this.#actionId = options.actionId ?? stableRedactedId;
     this.#terminalMetadataMaxRecords =
@@ -3616,13 +3627,19 @@ export class RecoveryStore {
       const dispatching = snapshot.inbound.filter(
         (record) =>
           record.state === "dispatching" &&
-          !outboundSourceIds.has(record.recordId),
+          !outboundSourceIds.has(record.recordId) &&
+          this.#shouldRecoverInFlight("inbound", record.identity),
       );
       const sendingOutbound = snapshot.outbound.filter(
-        (record) => record.state === "sending",
+        (record) =>
+          record.state === "sending" &&
+          this.#shouldRecoverInFlight("outbound", record.identity),
       );
       const startedBus = snapshot.bus.filter(
-        (record) => record.state === "pending" && record.startedAtMs !== undefined,
+        (record) =>
+          record.state === "pending" &&
+          record.startedAtMs !== undefined &&
+          this.#shouldRecoverInFlight("bus", record.identity),
       );
       if (
         dispatching.length > 0 ||
@@ -3636,14 +3653,19 @@ export class RecoveryStore {
         for (const record of snapshot.inbound) {
           if (
             record.state !== "dispatching" ||
-            outboundSourceIds.has(record.recordId)
+            outboundSourceIds.has(record.recordId) ||
+            !this.#shouldRecoverInFlight("inbound", record.identity)
           ) continue;
           record.state = "execution-uncertain";
           record.stateRevision = revision;
           record.updatedAtMs = nowMs;
         }
         for (const outbound of snapshot.outbound) {
-          if (outbound.state !== "sending" || !outbound.activeUnit) continue;
+          if (
+            outbound.state !== "sending" ||
+            !outbound.activeUnit ||
+            !this.#shouldRecoverInFlight("outbound", outbound.identity)
+          ) continue;
           const unitIndex = outbound.activeUnit.unitIndex;
           outbound.state = "delivery-uncertain";
           outbound.uncertainty = {
@@ -3681,7 +3703,11 @@ export class RecoveryStore {
           }
         }
         for (const bus of snapshot.bus) {
-          if (bus.state !== "pending" || bus.startedAtMs === undefined) continue;
+          if (
+            bus.state !== "pending" ||
+            bus.startedAtMs === undefined ||
+            !this.#shouldRecoverInFlight("bus", bus.identity)
+          ) continue;
           bus.state = "bus-uncertain";
           delete bus.startedAtMs;
           bus.stateRevision = revision;

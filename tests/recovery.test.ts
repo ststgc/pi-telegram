@@ -406,6 +406,10 @@ function reopenStore(
   options: {
     fault?: (faultId: ReliabilityFaultId) => void;
     authenticated?: (identity: RecoveryIdentity) => boolean;
+    shouldRecoverInFlight?: (
+      family: "inbound" | "outbound" | "bus",
+      identity: RecoveryIdentity,
+    ) => boolean;
     validateReassignmentBinding?: Parameters<typeof openRecoveryStore>[0]["validateReassignmentBinding"];
     actionId?: (stableInput: string) => string;
     terminalMetadataMaxRecords?: number;
@@ -422,6 +426,7 @@ function reopenStore(
     fault: options.fault,
     isIdentityAuthenticated:
       options.authenticated ?? ((identity) => identitiesMatch(identity, OLD_IDENTITY)),
+    shouldRecoverInFlight: options.shouldRecoverInFlight,
     validateReassignmentBinding: options.validateReassignmentBinding,
     actionId: options.actionId,
     terminalMetadataMaxRecords: options.terminalMetadataMaxRecords,
@@ -1933,6 +1938,37 @@ test("reopen marks dispatching uncertain, never drains it, and explicit retry is
       "explicitly-discarded",
     );
     assert.deepEqual(readdirSync(join(harness.rootPath, "payloads")), []);
+  } finally {
+    removeHarness(harness);
+  }
+});
+
+test("foreign store open preserves in-flight work owned by another live runtime", () => {
+  const harness = createStoreHarness();
+  try {
+    const observed = harness.store.observeInbound(104, OLD_IDENTITY);
+    harness.store.admitInbound({
+      recordId: observed.recordId,
+      payload: Buffer.from("live foreign prompt"),
+    });
+    const claim = { identity: OLD_IDENTITY };
+    harness.store.markPreDispatch(observed.recordId, claim);
+    harness.store.markDispatching(observed.recordId, claim);
+
+    let ownsRecoveryAuthority = false;
+    const foreign = reopenStore(harness, {
+      authenticated: () => false,
+      shouldRecoverInFlight: () => ownsRecoveryAuthority,
+    });
+    const passiveStatus = foreign.getStatus();
+    assert.equal(passiveStatus.counts.dispatching, 1);
+    assert.equal(passiveStatus.counts["execution-uncertain"], 0);
+
+    ownsRecoveryAuthority = true;
+    foreign.initialize();
+    const authoritativeStatus = foreign.getStatus();
+    assert.equal(authoritativeStatus.counts.dispatching, 0);
+    assert.equal(authoritativeStatus.counts["execution-uncertain"], 1);
   } finally {
     removeHarness(harness);
   }

@@ -26,6 +26,7 @@ import {
   isTelegramBusEnvelopeAuthorized,
   isTelegramFollowerDurableAdmissionAckV1,
   isTelegramRecoveryFenceAckV1,
+  isTelegramBusInteractionDelivery,
   getTelegramBusFollowerSocketPath,
   sendTelegramBusLocalEnvelope,
   stripTelegramBusApiMetadata,
@@ -243,6 +244,7 @@ export interface TelegramBusFollowerMessageOwnershipRecord {
   chatId: number;
   messageId: number;
   target?: TelegramTarget;
+  purpose?: "interaction";
 }
 
 export type TelegramBusFollowerMessageOwnershipRecorder = (
@@ -989,6 +991,24 @@ export function createTelegramBusLeaderEnvelopeHandler(deps: {
           message: "Stale Telegram follower update responsibility.",
         };
       }
+    } else if (
+      (envelope.kind === "leader.forwardCallback" ||
+        envelope.kind === "leader.forwardMessage") &&
+      envelope.recipientRegistrationGeneration !== undefined
+    ) {
+      if (
+        !follower ||
+        !follower.busSocketPath ||
+        follower.registrationGeneration !==
+          envelope.recipientRegistrationGeneration
+      ) {
+        return {
+          kind: "bus.ack",
+          requestId: envelope.requestId,
+          ok: false,
+          message: "Stale Telegram follower interaction responsibility.",
+        };
+      }
     }
     const followerSocketPath =
       follower?.busSocketPath ??
@@ -1325,6 +1345,9 @@ function recordFollowerApiMessageOwnership(input: {
       chatId,
       messageId,
       target,
+      ...(isTelegramBusInteractionDelivery(body)
+        ? { purpose: "interaction" as const }
+        : {}),
     });
   }
 }

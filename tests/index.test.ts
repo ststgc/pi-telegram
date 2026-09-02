@@ -4,6 +4,7 @@
  */
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import telegramExtension from "../index.ts";
@@ -63,6 +64,18 @@ function assertSystemPromptResult(
 
 test("Extension entrypoint exposes only the default composition root", () => {
   assert.deepEqual(Object.keys(telegramEntrypoint), ["default"]);
+});
+
+test("Extension entrypoint delegates interaction snapshot and lifecycle policy", () => {
+  const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+  assert.match(
+    source,
+    /Interactions\.createTelegramInteractionBridgeLifecycleRuntime\(\{/,
+  );
+  assert.match(source, /activeTurn: activeTurnRuntime/);
+  assert.match(source, /deliveryLifecycle: deliveryLifecycleRuntime/);
+  assert.doesNotMatch(source, /authorityGeneration/);
+  assert.doesNotMatch(source, /interactionGenerationSequence/);
 });
 
 test("Extension entrypoint wires domain bindings into the pi API", () => {

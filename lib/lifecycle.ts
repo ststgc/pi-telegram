@@ -298,24 +298,26 @@ export function createTelegramBridgeSessionLifecycleAssembly<
     { onSessionStart: deps.services.recovery.onSessionStart },
     isSessionActive,
   );
-  const servicesLifecycle = appendTelegramLifecycleHooks(
-    recoveryLifecycle,
-    {
-      async onSessionStart(event, ctx) {
-        deps.services.resumeGroupedInput(ctx);
-        await deps.services.delivery.onSessionStart();
-        await deps.services.polling.onSessionStart(event, ctx);
-        deps.services.capabilityMonitor.start(ctx);
-        deps.services.queueWatchdog.start(ctx);
-      },
-      async onSessionShutdown() {
+  const servicesLifecycle: TelegramSessionLifecycleHooks = {
+    async onSessionStart(event, ctx) {
+      await recoveryLifecycle.onSessionStart(event, ctx);
+      if (!isSessionActive(ctx)) return;
+      deps.services.resumeGroupedInput(ctx);
+      await deps.services.delivery.onSessionStart();
+      await deps.services.polling.onSessionStart(event, ctx);
+      deps.services.capabilityMonitor.start(ctx);
+      deps.services.queueWatchdog.start(ctx);
+    },
+    async onSessionShutdown(event, ctx) {
+      try {
         await deps.services.delivery.onSessionShutdown();
+      } finally {
         deps.services.queueWatchdog.stop();
         deps.services.capabilityMonitor.stop();
-      },
+        await recoveryLifecycle.onSessionShutdown(event, ctx);
+      }
     },
-    isSessionActive,
-  );
+  };
   return createTelegramSessionGenerationFence(
     deps.contextStore,
     servicesLifecycle,

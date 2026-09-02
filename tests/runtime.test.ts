@@ -242,6 +242,121 @@ test("Typing loop sends chat actions into thread target and aggregate surface", 
   assert.equal(Runtime.stopTelegramTypingLoop(state), true);
 });
 
+test("Typing waiting acquisition fences same-tick direct and aggregate sends", async () => {
+  const runtime = Runtime.createTelegramBridgeRuntime();
+  const actions: string[] = [];
+  runtime.typing.start({
+    chatId: 42,
+    target: { chatId: 42, threadId: 9 },
+    intervalMs: 60_000,
+    async sendTypingAction() {
+      actions.push("direct");
+    },
+    async sendAggregateTypingAction() {
+      actions.push("aggregate");
+    },
+  });
+
+  const lease = await runtime.typing.acquireWaitingLease({
+    correlationId: "waiting-1",
+    isActive: () => true,
+  });
+  await flushMicrotasks();
+
+  assert.equal(actions.length, 0);
+  assert.equal(runtime.typing.isWaiting(), true);
+  assert.equal(runtime.typing.start({
+    chatId: 42,
+    intervalMs: 60_000,
+    async sendTypingAction() {
+      actions.push("rearm");
+    },
+  }), false);
+  lease.release({ resumeIfActive: false });
+  assert.equal(runtime.typing.isWaiting(), false);
+});
+
+test("Typing waiting lease drains started work boundedly and suppresses aggregate continuation", async () => {
+  const runtime = Runtime.createTelegramBridgeRuntime();
+  const actions: string[] = [];
+  let releaseDirect!: () => void;
+  const directGate = new Promise<void>((resolve) => {
+    releaseDirect = resolve;
+  });
+  runtime.typing.start({
+    chatId: 42,
+    target: { chatId: 42, threadId: 9 },
+    intervalMs: 60_000,
+    async sendTypingAction() {
+      actions.push("direct");
+      await directGate;
+    },
+    async sendAggregateTypingAction() {
+      actions.push("aggregate");
+    },
+  });
+  await Promise.resolve();
+  const startedAt = Date.now();
+
+  const lease = await runtime.typing.acquireWaitingLease({
+    correlationId: "waiting-2",
+    isActive: () => true,
+  });
+
+  assert.ok(Date.now() - startedAt < 500);
+  assert.deepEqual(actions, ["direct"]);
+  releaseDirect();
+  await flushMicrotasks();
+  assert.deepEqual(actions, ["direct"]);
+  lease.release({ resumeIfActive: false });
+});
+
+test("Typing waiting release resumes only captured live activity and stale release is inert", async () => {
+  const runtime = Runtime.createTelegramBridgeRuntime();
+  const actions: string[] = [];
+  let active = true;
+  runtime.typing.start({
+    chatId: 42,
+    intervalMs: 60_000,
+    async sendTypingAction() {
+      actions.push("typing");
+    },
+  });
+  await flushMicrotasks();
+  const first = await runtime.typing.acquireWaitingLease({
+    correlationId: "waiting-3",
+    isActive: () => active,
+  });
+  const replacement = await runtime.typing.acquireWaitingLease({
+    correlationId: "waiting-4",
+    isActive: () => active,
+  });
+
+  first.release({ resumeIfActive: true });
+  assert.equal(runtime.typing.isWaiting(), true);
+  assert.deepEqual(actions, ["typing"]);
+  replacement.release({ resumeIfActive: true });
+  await flushMicrotasks();
+  assert.deepEqual(actions, ["typing"]);
+
+  runtime.typing.start({
+    chatId: 42,
+    intervalMs: 60_000,
+    async sendTypingAction() {
+      actions.push("replacement");
+    },
+  });
+  await flushMicrotasks();
+  const inactiveLease = await runtime.typing.acquireWaitingLease({
+    correlationId: "waiting-5",
+    isActive: () => active,
+  });
+  active = false;
+  inactiveLease.release({ resumeIfActive: true });
+  await flushMicrotasks();
+  assert.deepEqual(actions, ["typing", "replacement"]);
+});
+
 test("Typing loop idle wait is bounded for slow in-flight chat actions", async () => {
   const state = Runtime.createTelegramBridgeRuntimeState();
   state.typingInFlight = new Promise(() => {});
@@ -250,6 +365,50 @@ test("Typing loop idle wait is bounded for slow in-flight chat actions", async (
   await Runtime.waitForTelegramTypingLoopIdle(state, 1);
 
   assert.ok(Date.now() - startedAt < 100);
+});
+
+test("Abort and agent-end clear waiting without resuming captured activity", async () => {
+  const runtime = Runtime.createTelegramBridgeRuntime();
+  const actions: string[] = [];
+  runtime.typing.start({
+    chatId: 42,
+    intervalMs: 60_000,
+    async sendTypingAction() {
+      actions.push("typing");
+    },
+  });
+  await flushMicrotasks();
+  await runtime.typing.acquireWaitingLease({
+    correlationId: "agent-end-wait",
+    isActive: () => true,
+  });
+  runtime.abort.setHandler(() => {});
+  assert.equal(runtime.abort.abortTurn(), true);
+  assert.equal(runtime.typing.isWaiting(), false);
+  assert.deepEqual(actions, ["typing"]);
+
+  runtime.typing.start({
+    chatId: 42,
+    intervalMs: 60_000,
+    async sendTypingAction() {
+      actions.push("typing-after-abort");
+    },
+  });
+  await flushMicrotasks();
+  await runtime.typing.acquireWaitingLease({
+    correlationId: "agent-end-wait-2",
+    isActive: () => true,
+  });
+  Runtime.createTelegramAgentEndResetter({
+    abort: runtime.abort,
+    typing: runtime.typing,
+    clearActiveTurn: () => {},
+    resetToolExecutions: () => {},
+    clearPendingModelSwitch: () => {},
+    clearDispatchPending: () => {},
+  })();
+  assert.equal(runtime.typing.isWaiting(), false);
+  assert.deepEqual(actions, ["typing", "typing-after-abort"]);
 });
 
 test("Abort handler setter and agent-end resetter bind runtime cleanup", () => {
@@ -389,6 +548,9 @@ test("Typing loop starter uses a conservative native keepalive interval", () => 
       },
       stop: () => true,
       waitForIdle: async () => {},
+      acquireWaitingLease: async () => ({ release: () => {} }),
+      clearWaitingLease: () => false,
+      isWaiting: () => false,
     },
     getDefaultChatId: () => 7,
     sendTypingAction: async () => {},

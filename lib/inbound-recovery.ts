@@ -95,6 +95,9 @@ export interface InboundRecoveryRuntimeDeps<
     ctx?: TContext,
   ) => RecoveryIdentity | undefined;
   isIdentityAuthenticated: (identity: RecoveryIdentity) => boolean;
+  shouldRecoverInFlight?: Parameters<
+    typeof openRecoveryStore
+  >[0]["shouldRecoverInFlight"];
   resolveOperatorIdentity?: (ctx: TContext) => RecoveryIdentity | undefined;
   refreshReassignmentBinding?: () => Promise<void>;
   validateReassignmentBinding?: (
@@ -285,6 +288,7 @@ export interface InboundRecoveryRuntime<
     appendTurn: (turn: PendingTelegramTurn) => void,
   ): Promise<void>;
   getRecoveryStatus(): RecoveryMetadataStatus;
+  recoverInFlight(): void;
   getOrphanReassignmentCandidates(): RecoveryOrphanReassignmentCandidate[];
   drainSafeForOperator(
     ctx: TContext,
@@ -785,6 +789,7 @@ export function createInboundRecoveryRuntime<
         profile,
         agentDir: deps.agentDir,
         isIdentityAuthenticated,
+        shouldRecoverInFlight: deps.shouldRecoverInFlight,
         validateReassignmentBinding: deps.validateReassignmentBinding,
       });
       opened.compact();
@@ -1114,6 +1119,15 @@ export function createInboundRecoveryRuntime<
       const lease = requireOperation();
       try {
         return getStore().getStatus();
+      } finally {
+        lease.release();
+      }
+    },
+
+    recoverInFlight() {
+      const lease = requireOperation();
+      try {
+        getStore().initialize();
       } finally {
         lease.release();
       }

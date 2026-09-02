@@ -59,6 +59,19 @@ const ALLOWED_ADVISORIES = new Map<number, AllowedAdvisory>([
     },
   ],
   [
+    1124334,
+    {
+      source: 1124334,
+      packageName: "brace-expansion",
+      version: "5.0.6",
+      severity: "high",
+      url: "https://github.com/advisories/GHSA-mh99-v99m-4gvg",
+      nodes: [
+        "node_modules/@earendil-works/pi-coding-agent/node_modules/brace-expansion",
+      ],
+    },
+  ],
+  [
     1123964,
     {
       source: 1123964,
@@ -226,24 +239,34 @@ export function evaluateDependencyAudit(
       }
       continue;
     }
-    if (parentEdges.length > 0 || advisories.length !== 1) {
+    if (parentEdges.length > 0 || advisories.length === 0) {
       throw new Error(`audit leaf shape differs for ${name}`);
     }
-    const advisory = advisories[0];
-    const allowed = ALLOWED_ADVISORIES.get(advisory.source);
-    if (
-      !allowed ||
-      advisory.name !== allowed.packageName ||
-      advisory.url !== allowed.url ||
-      advisory.severity !== allowed.severity ||
-      name !== allowed.packageName ||
-      vulnerability.severity !== allowed.severity
-    ) {
+    const expectedSources = [...ALLOWED_ADVISORIES.values()]
+      .filter((allowed) => allowed.packageName === name)
+      .map((allowed) => allowed.source);
+    const actualSources = advisories.map((advisory) => advisory.source);
+    if (!hasExactMembers(actualSources.map(String), expectedSources.map(String))) {
       throw new Error(
-        `unapproved advisory for ${name}: source=${String(advisory.source)} url=${advisory.url}`,
+        `advisory sources differ for ${name}: expected ${expectedSources.join(",")}, got ${actualSources.join(",")}`,
       );
     }
-    acceptedSources.add(advisory.source);
+    for (const advisory of advisories) {
+      const allowed = ALLOWED_ADVISORIES.get(advisory.source);
+      if (
+        !allowed ||
+        advisory.name !== allowed.packageName ||
+        advisory.url !== allowed.url ||
+        advisory.severity !== allowed.severity ||
+        name !== allowed.packageName ||
+        vulnerability.severity !== allowed.severity
+      ) {
+        throw new Error(
+          `unapproved advisory for ${name}: source=${String(advisory.source)} url=${advisory.url}`,
+        );
+      }
+      acceptedSources.add(advisory.source);
+    }
   }
 
   const rootsByPackage = new Map<string, Set<number>>();

@@ -4,7 +4,7 @@
 
 `pi-telegram` owns a single `getUpdates` long-poll connection per bot. Other pi extensions cannot open a competing polling connection against the same bot — the Telegram Bot API uses a per-bot `offset` cursor, and two loops race each other and lose updates.
 
-This document describes the registry that lets layered pi extensions running in the same pi process hook into `pi-telegram`'s polling loop and react to paired inbound Telegram updates **before** `pi-telegram`'s default routing fires. While a profile is unpaired, a security gate runs first: only an exact private-human text `/start <code>` claim is eligible, and neither the proof nor any rejected unpaired update reaches this registry.
+This document describes the registry that lets layered pi extensions running in the owning Pi process react to paired inbound Telegram updates before ordinary built-in routing. Two private boundaries run first: first-contact proof plus exact paired-sender authorization, then active-turn interaction-priority routing. Neither pairing/proof traffic nor interaction answers reaches this registry. In Threaded Mode, the leader may forward an exact full update to its owning follower; that follower applies the same private priority boundary before its process-local public registry.
 
 It is the runtime counterpart to [Callback Namespaces](./callback-namespaces.md): callback namespaces define how to share `callback_data` cleanly; update handlers define how to observe and optionally short-circuit the dispatch of those updates.
 
@@ -12,7 +12,7 @@ It is the runtime counterpart to [Callback Namespaces](./callback-namespaces.md)
 
 Use it when a layered extension needs to:
 
-- Resolve out-of-band state, for example a `tool_call` approval Promise, the moment a Telegram callback arrives, rather than waiting for the next agent turn.
+- Resolve extension-owned out-of-band state for a custom callback namespace, rather than waiting for the next agent turn. For bounded questions inside an active Telegram-originated tool flow, prefer the ownership-gated [Telegram Interactions API](./interactions.md).
 - Suppress `pi-telegram`'s default routing for callbacks owned by the layered extension, so `pi-telegram` does not also forward them as `[callback] <data>` text.
 - Observe arbitrary update types such as messages, edits, channel posts, or reactions without owning the polling connection.
 
@@ -22,11 +22,12 @@ If the extension needs a durable top-level Telegram menu section with managed re
 
 ## Constraints
 
-- One bot, one pi process, one `getUpdates` loop. This registry does **not** enable running multiple pi instances against the same bot.
+- One bot profile has one leader-owned `getUpdates` loop. This registry is process-local and does not itself create a multi-instance bus; Threaded Mode uses the bridge's authenticated leader/follower bus and exact target ownership.
 - Handlers run in the polling loop. They must return quickly; long awaits delay subsequent updates.
 - Handler errors are caught and logged silently so polling never breaks. If you need durable error reporting, do it inside your handler.
 - The registry lives on `globalThis`. Module instance identity is not required, so layered extensions can reach it without importing `@ststgc/pi-telegram`.
-- Pairing proofs are deliberately outside the public handler contract in every state. Bots, groups/channels, edits, callbacks, reactions, media, service messages, malformed claims, and all other unpaired updates are denied before handler dispatch. An exact `/start <code>` proof is always suppressed before handlers and default routing, including replay after a successful claim; while unpaired it is claimed atomically, and its generic reply/status refresh are best-effort side effects. After pairing, non-proof update registration order and `consume` behavior are unchanged.
+- Pairing proofs are deliberately outside the public handler contract in every state. Bots, groups/channels, edits, callbacks, reactions, media, service messages, malformed claims, and all other unpaired updates are denied before handler dispatch. An exact `/start <code>` proof is always suppressed before handlers and default routing, including replay after a successful claim; while unpaired it is claimed atomically, and its generic reply/status refresh are best-effort side effects.
+- After positive paired-sender authorization, private interaction candidates are also outside this contract. `interact:` callbacks and non-command text replies to a message whose private ownership purpose is `interaction` settle locally or are forwarded to the exact owner before public dispatch. Other paired updates preserve registration order and `consume` behavior.
 
 ## Verdicts
 
@@ -127,23 +128,34 @@ The registry object on `globalThis.__piTelegramUpdateHandlerRegistry__` is versi
 
 ## Interaction with built-in routing
 
-For paired profiles, `pi-telegram` invokes registered handlers first, then routes the update through its own handlers: commands, app menu, queue menu, model menu, default prompt routing, and callback namespace fallback. The unpaired proof gate is the sole exception and always runs before this public membrane. If any handler returns `"consume"`, `pi-telegram` skips the rest of routing for that update.
+The exact inbound order is:
+
+1. suppress/handle first-contact proof shapes and positively authorize the paired sender;
+2. run the private interaction-priority classifier;
+3. for a foreign interaction owner, forward the complete original update to the exact live follower `instanceId` and registration generation; the follower repeats step 2 before its local public handlers;
+4. dispatch non-interaction updates through this process-local public registry; and
+5. if no handler consumes the update, run ordinary commands, app/model/queue/settings menus, sections, generated buttons, edited-message handling, prompt routing, and callback fallback.
+
+`/abort` and `/stop` retain ordinary command precedence while an interaction is pending. Other slash-prefixed messages are not captured as text answers. A stale, replayed, wrong-target, wrong-profile, wrong-generation, or otherwise denied interaction candidate is consumed privately with a bounded expiry/unavailable response; it never leaks to a public handler, `[callback]` fallback, or Pi prompt.
 
 This means:
 
-- Extensions can claim callback namespaces that `pi-telegram` would otherwise forward as `[callback] <data>` text.
-- Extensions can observe updates by always returning `"pass"`.
-- Extensions must not consume updates that belong to `pi-telegram`'s own prefixes (`compact:`, `tgbtn:`, `menu:`, `model:`, `thinking:`, `status:`, `queue:`, `settings:`, `section:`) unless they are deliberately replacing that behavior.
+- Extensions can claim non-reserved callback namespaces that `pi-telegram` would otherwise forward as `[callback] <data>` text.
+- Extensions can observe non-interaction updates by always returning `"pass"`.
+- Extensions cannot observe or consume pairing proofs or interaction answers.
+- Extensions must not consume updates that belong to `pi-telegram`'s own prefixes (`compact:`, `tgbtn:`, `menu:`, `model:`, `thinking:`, `status:`, `queue:`, `recovery:`, `settings:`, `section:`, `interact:`).
 
 ## Ownership semantics
 
-The handler registry is ownership-agnostic and does not interact with the extension-local transport owner slots documented in [Architecture](./architecture.md#configuration-and-ownership). When the polling runtime loses its `owners.json` slot and stops `getUpdates`, handlers stop receiving updates because no updates are being fetched; they are not unregistered.
+The public registry itself is ownership-agnostic, but the bridge is not. Pairing, target ownership, profile/transport generation, session generation, and direct-owner epoch or follower registration generation are checked by private routing before an interaction candidate can reach any public handler. Ordinary non-interaction updates follow the established target-owner forwarding rules.
 
-If a layered extension needs to react to ownership changes, it should observe `pi-telegram` lifecycle events through the standard pi extension hooks rather than through the handler registry.
+When a leader forwards a private interaction candidate, it sends the exact full Telegram update over the authenticated bus to the exact current follower registration. The leader does not settle the follower's Promise and does not maintain a second interaction registry. The follower applies its own current session/authority stamp, runs its priority classifier, and acknowledges through the existing bus path. Stale registration generations fail closed.
 
-## Not a multiplexer
+If the polling runtime loses its exact `owners.json` slot and stops `getUpdates`, its process-local handlers stop receiving new leader-polled updates; registration objects are not thereby an ownership authority. A layered extension that needs lifecycle evidence should use the standard Pi hooks or the Activity API rather than infer authority from handler registration.
 
-This registry does not multiplex one bot across multiple pi processes, and it does not bypass Telegram's single-polling-connection-per-bot constraint. To run multiple pi instances on Telegram, give each instance its own bot and its own `~/.pi/agent` directory; the registry is for layered extensions inside **one** pi process.
+## Not a polling multiplexer
+
+This registry never opens or shares another `getUpdates` loop. Classic mode has one polling owner. Threaded Mode has one leader polling owner and explicit operator-started follower Pi processes connected through the authenticated local bus; each process has its own public handler registry. The bus may route owned updates to a follower, but the registry itself cannot spawn instances, select arbitrary followers, bypass registration generations, or contact Telegram directly.
 
 ## Relationship to extension sections
 

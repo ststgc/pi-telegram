@@ -92,6 +92,8 @@ export interface TelegramSetupPromptRuntimeDeps<
   setupGuard: TelegramSetupGuard;
   getMe: TelegramSetupDeps["getMe"];
   persistConfig: (config: TelegramSetupConfig) => Promise<void>;
+  beforeConfigPublication?: () => Promise<void> | void;
+  afterConfigPublication?: () => Promise<void> | void;
   getPairingInstructions?: () => Promise<string | undefined>;
   startPolling: (ctx: TContext) => unknown | Promise<unknown>;
   updateStatus: (ctx: TContext) => void;
@@ -218,13 +220,16 @@ export function createTelegramSetupPromptRuntime<
         getMe: deps.getMe,
         persistConfig: async (config) => {
           const previousConfig = deps.getConfig();
+          await deps.beforeConfigPublication?.();
           deps.setConfig(config);
           try {
             await deps.persistConfig(config);
           } catch (error) {
             deps.setConfig(previousConfig);
+            await deps.afterConfigPublication?.();
             throw error;
           }
+          await deps.afterConfigPublication?.();
         },
         getPairingInstructions: deps.getPairingInstructions,
         notify: (message, level) => ctx.ui.notify(message, level),

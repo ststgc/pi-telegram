@@ -285,10 +285,16 @@ test("Session startup rehydrates outbound and inbound before opening ingress", a
         recordRuntimeEvent: () => {},
       },
       follower: {
-        registrationState: { isRegistered: () => false },
+        registrationState: {
+          isRegistered: () => false,
+          getTarget: () => undefined,
+          getSlot: () => undefined,
+          getThreadName: () => undefined,
+          getGeneration: () => undefined,
+        },
         registrationRuntime: {},
         instanceId: "instance-a",
-        suspendPolling: async () => {},
+        suspendPolling: async () => events.push("teardown:polling"),
         isLeader: () => false,
         getLeaderBinding: () => undefined,
         getActiveContext: () => undefined,
@@ -305,27 +311,28 @@ test("Session startup rehydrates outbound and inbound before opening ingress", a
           },
         },
         resumeGroupedInput: () => events.push("ingress:grouped"),
-        suspendGroupedInput: () => {},
+        suspendGroupedInput: () => events.push("teardown:grouped"),
         delivery: {
           onSessionStart: async () => events.push("ingress:delivery"),
-          onSessionShutdown: async () => {},
+          onSessionShutdown: async () => events.push("teardown:delivery"),
         },
         polling: {
           onSessionStart: async () => events.push("ingress:polling"),
         },
         capabilityMonitor: {
           start: () => events.push("ingress:capability"),
-          stop: () => {},
+          stop: () => events.push("teardown:capability"),
         },
         queueWatchdog: {
           start: () => events.push("ingress:watchdog"),
-          stop: () => {},
+          stop: () => events.push("teardown:watchdog"),
         },
       },
     } as unknown as Parameters<typeof createTelegramBridgeSessionLifecycleAssembly>[0]);
   const ctx = { cwd: "/repo" } as ExtensionContext;
   const events: string[] = [];
-  await createAssembly(events).onSessionStart({} as never, ctx);
+  const assembly = createAssembly(events);
+  await assembly.onSessionStart({} as never, ctx);
   assert.deepEqual(events, [
     "queue:reset",
     "recovery:outbound-inbound",
@@ -334,6 +341,14 @@ test("Session startup rehydrates outbound and inbound before opening ingress", a
     "ingress:polling",
     "ingress:capability",
     "ingress:watchdog",
+  ]);
+  await assembly.onSessionShutdown({} as never, ctx);
+  assert.deepEqual(events.slice(7), [
+    "teardown:delivery",
+    "teardown:watchdog",
+    "teardown:capability",
+    "teardown:polling",
+    "teardown:grouped",
   ]);
 
   const failedEvents: string[] = [];
@@ -491,6 +506,55 @@ test("Message activity hooks re-arm typing for active Telegram turns", async () 
     "typing:start",
     "message:update",
   ]);
+});
+
+test("Waiting lease suppresses compaction and message activity re-arm paths", async () => {
+  const runtime = createTelegramBridgeRuntime();
+  const actions: string[] = [];
+  const startTyping = createTelegramTypingLoopStarter({
+    typing: runtime.typing,
+    getDefaultChatId: () => 42,
+    async sendTypingAction() {
+      actions.push("typing");
+    },
+    updateStatus: () => {},
+    intervalMs: 60_000,
+  });
+  const lease = await runtime.typing.acquireWaitingLease({
+    correlationId: "lifecycle-wait",
+    isActive: () => true,
+  });
+  const observer = createTelegramCompactionObserverRuntime({
+    setCompactionInProgress: runtime.lifecycle.setCompactionInProgress,
+    updateStatus: () => {},
+    startTypingLoop: startTyping,
+    stopTypingLoop: runtime.typing.stop,
+    requestDeferredDispatchNextQueuedTelegramTurn: () => {},
+    dispatchNextQueuedTelegramTurn: () => {},
+  });
+  const messageHooks = createTelegramMessageActivityTypingHooks({
+    hasActiveTurn: () => true,
+    startTypingLoop: startTyping,
+    onMessageStart: async () => {},
+    onMessageUpdate: async () => {},
+  });
+
+  observer.onSessionBeforeCompact({} as never, createLifecycleContext());
+  await messageHooks.onMessageStart(
+    { message: {} as never },
+    createLifecycleContext(),
+  );
+  await messageHooks.onMessageUpdate(
+    { message: {} as never },
+    createLifecycleContext(),
+  );
+  await Promise.resolve();
+
+  assert.deepEqual(actions, []);
+  assert.equal(runtime.typing.isWaiting(), true);
+  observer.onSessionCompact({} as never, createLifecycleContext());
+  assert.equal(runtime.typing.isWaiting(), true);
+  lease.release({ resumeIfActive: false });
 });
 
 test("Message activity hooks preserve typing after transient preview errors", async () => {

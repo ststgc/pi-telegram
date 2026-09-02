@@ -796,3 +796,24 @@ test("Concrete delivery runtime serializes operations per target", async () => {
   await Promise.all([sending, action]);
   assert.deepEqual(order, ["first-start", "first-end", "action"]);
 });
+
+test("Interaction ownership purpose follows logical handle growth", async () => {
+  const { runtime, events } = createConcreteRuntimeHarness();
+  const sent = await runtime.sendView(
+    { text: "one" },
+    { scope: { kind: "active-turn" }, ownershipPurpose: "interaction" },
+  );
+  assert.equal(sent.ok, true);
+  if (!sent.ok) return;
+  events.length = 0;
+  const grown = await runtime.editView(sent.value, { text: "one|two" });
+  assert.equal(grown.ok, true);
+  assert.deepEqual(
+    events.map((event) =>
+      (event.options as { ownershipPurpose?: string } | undefined)
+        ?.ownershipPurpose,
+    ),
+    ["interaction", "interaction"],
+  );
+  if (grown.ok) assert.deepEqual(grown.value.messageIds, [101, 102]);
+});

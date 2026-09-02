@@ -101,7 +101,8 @@ interface TelegramCommandsAndToolsBindingDeps {
   resumeDurableOutboundWorker: () => Promise<void>;
   stopPolling?: () => Promise<void | string>;
   getDisconnectThreadName?: () => string | undefined;
-  onTransportChanged?: () => Promise<void> | void;
+  invalidateTransportAuthority?: () => void;
+  rebindTransportAuthority?: () => Promise<void> | void;
   getStatusLines: (
     options?: Status.TelegramBridgeStatusLineOptions,
   ) => string[];
@@ -131,7 +132,8 @@ export function registerTelegramCommandsAndTools({
   resumeDurableOutboundWorker,
   stopPolling,
   getDisconnectThreadName,
-  onTransportChanged,
+  invalidateTransportAuthority,
+  rebindTransportAuthority,
   getStatusLines,
   buttonActionStore,
   sendMarkdownReply,
@@ -171,6 +173,21 @@ export function registerTelegramCommandsAndTools({
       }
       return result;
     };
+  const stopActiveTransport = stopPolling ?? lockedPollingRuntime.stop;
+  const invalidateActiveTransport = (): void => {
+    invalidateTransportAuthority?.();
+  };
+  const rebindActiveTransport = async (): Promise<void> => {
+    await rebindTransportAuthority?.();
+  };
+  const disconnectActiveTransport = async (): Promise<void | string> => {
+    invalidateActiveTransport();
+    try {
+      return await stopActiveTransport();
+    } finally {
+      await rebindActiveTransport();
+    }
+  };
   Commands.registerTelegramBridgeCommands(pi, {
     promptForConfig: async (ctx, profileName) => {
       const nextProfileName = profileName ?? undefined;
@@ -181,12 +198,20 @@ export function registerTelegramCommandsAndTools({
       const previousProfileName = configStore.getActiveProfileName();
       let setupConfigStore = configStore;
       let persistSetupConfig = persistConfig;
+      let setupTransportStopped = false;
       if (!profileName) {
+        invalidateActiveTransport();
         if (previousProfileName !== nextProfileName) {
-          await (stopPolling ?? lockedPollingRuntime.stop)();
+          try {
+            await stopActiveTransport();
+            setupTransportStopped = true;
+          } catch (error) {
+            await rebindActiveTransport();
+            throw error;
+          }
         }
         configStore.activateProfile(undefined);
-        await onTransportChanged?.();
+        await rebindActiveTransport();
       } else {
         const storedConfig = configStore.getStoredConfig();
         setupConfigStore = Config.createTelegramConfigStore({
@@ -203,9 +228,6 @@ export function registerTelegramCommandsAndTools({
         setupConfigStore.activateProfile(profileName);
         persistSetupConfig = async () => {
           try {
-            if (previousProfileName !== profileName) {
-              await (stopPolling ?? lockedPollingRuntime.stop)();
-            }
             const profile = Config.getTelegramProfileFields(
               setupConfigStore.get(),
             );
@@ -217,14 +239,14 @@ export function registerTelegramCommandsAndTools({
             await configStore.load();
             configStore.setProfile(profileName, profile);
             configStore.activateProfile(profileName);
-            await onTransportChanged?.();
             await persistConfig(configStore.get());
           } catch (error) {
             await configStore.load().catch(() => undefined);
             configStore.activateProfile(previousProfileName);
-            await onTransportChanged?.();
+            await rebindActiveTransport();
             throw error;
           }
+          await rebindActiveTransport();
         };
       }
       const runSetup = Setup.createTelegramSetupPromptRuntime({
@@ -233,6 +255,20 @@ export function registerTelegramCommandsAndTools({
         setupGuard: setup,
         getMe: TelegramApi.fetchTelegramBotIdentity,
         persistConfig: persistSetupConfig,
+        beforeConfigPublication: async () => {
+          invalidateActiveTransport();
+          if (setupTransportStopped) return;
+          try {
+            await stopActiveTransport();
+            setupTransportStopped = true;
+          } catch (error) {
+            await rebindActiveTransport();
+            throw error;
+          }
+        },
+        ...(!profileName
+          ? { afterConfigPublication: rebindActiveTransport }
+          : {}),
         getPairingInstructions,
         startPolling: startPollingAndResumeOutbound,
         updateStatus,
@@ -248,7 +284,7 @@ export function registerTelegramCommandsAndTools({
     hasBotToken: configStore.hasBotToken,
     getPairingInstructions,
     startPolling: startPollingAndResumeOutbound,
-    stopPolling: stopPolling ?? lockedPollingRuntime.stop,
+    stopPolling: disconnectActiveTransport,
     getDisconnectThreadName,
     updateStatus,
     getProfileNames: () =>
@@ -256,11 +292,18 @@ export function registerTelegramCommandsAndTools({
     activateDefaultProfileConfig: async () => {
       const previousProfileName = configStore.getActiveProfileName();
       await configStore.load();
-      if (previousProfileName) {
-        await (stopPolling ?? lockedPollingRuntime.stop)();
+      invalidateActiveTransport();
+      try {
+        if (previousProfileName) {
+          await stopActiveTransport();
+        }
+        configStore.activateProfile(undefined);
+        await rebindActiveTransport();
+      } catch (error) {
+        configStore.activateProfile(previousProfileName);
+        await rebindActiveTransport();
+        throw error;
       }
-      configStore.activateProfile(undefined);
-      await onTransportChanged?.();
     },
     activateProfileConfig: async (_ctx, profileName) => {
       const previousProfileName = configStore.getActiveProfileName();
@@ -268,12 +311,22 @@ export function registerTelegramCommandsAndTools({
       if (!Config.isValidTelegramProfileName(profileName)) return false;
       const storedConfig = configStore.getStoredConfig();
       if (!storedConfig.profiles?.[profileName]) return false;
-      if (previousProfileName !== profileName) {
-        await (stopPolling ?? lockedPollingRuntime.stop)();
+      invalidateActiveTransport();
+      try {
+        if (previousProfileName !== profileName) {
+          await stopActiveTransport();
+        }
+        if (!configStore.activateProfile(profileName)) {
+          await rebindActiveTransport();
+          return false;
+        }
+        await rebindActiveTransport();
+        return true;
+      } catch (error) {
+        configStore.activateProfile(previousProfileName);
+        await rebindActiveTransport();
+        throw error;
       }
-      if (!configStore.activateProfile(profileName)) return false;
-      await onTransportChanged?.();
-      return true;
     },
   });
 }
@@ -281,6 +334,7 @@ export function registerTelegramCommandsAndTools({
 interface TelegramLifecycleBindingDeps {
   pi: Pi.ExtensionAPI;
   activityRuntime: Activity.TelegramActivityRuntime;
+  interactionLifecycleRuntime: { invalidateAuthority(): void };
   assistantOutputRuntime: Pick<
     Activity.TelegramAssistantOutputRuntime,
     "start" | "stop"
@@ -334,6 +388,7 @@ interface TelegramLifecycleBindingDeps {
 export function registerTelegramLifecycleRuntimeHooks({
   pi,
   activityRuntime,
+  interactionLifecycleRuntime,
   assistantOutputRuntime,
   sessionLifecycleRuntime,
   configStore,
@@ -523,6 +578,7 @@ export function registerTelegramLifecycleRuntimeHooks({
     },
     async onAgentEnd(event, ctx) {
       if (!isSessionContextActive(ctx)) return;
+      interactionLifecycleRuntime.invalidateAuthority();
       activityRuntime.onAgentEnd();
       await agentLifecycleHooks.onAgentEnd(event, ctx);
     },

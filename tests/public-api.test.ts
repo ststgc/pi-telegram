@@ -24,6 +24,7 @@ test("Public package subpaths expose the stable extension API", async () => {
     inbound,
     outbound,
     delivery,
+    interactions,
     activity,
     updates,
     commands,
@@ -36,6 +37,7 @@ test("Public package subpaths expose the stable extension API", async () => {
     import("@ststgc/pi-telegram/inbound"),
     import("@ststgc/pi-telegram/outbound"),
     import("@ststgc/pi-telegram/delivery"),
+    import("@ststgc/pi-telegram/interactions"),
     import("@ststgc/pi-telegram/activity"),
     import("@ststgc/pi-telegram/updates"),
     import("@ststgc/pi-telegram/commands"),
@@ -59,6 +61,7 @@ test("Public package subpaths expose the stable extension API", async () => {
     "sendTelegramChatAction",
     "sendTelegramView",
   ]);
+  assert.deepEqual(Object.keys(interactions), ["requestTelegramInteraction"]);
   assert.deepEqual(Object.keys(activity).sort(), [
     "registerTelegramActivityHandler",
   ]);

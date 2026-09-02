@@ -28,6 +28,7 @@ import {
 import {
   createTelegramBusFollowerRegistry,
   createTelegramBusFollowerTargetController,
+  createTelegramBusForeignOwnedUpdateForwarder,
   createTelegramBusLocalServer,
   resolveTelegramBusSocketPath,
   sendTelegramBusLocalEnvelope,
@@ -41,6 +42,14 @@ import {
 } from "../lib/threads.ts";
 import { RecoveryProfileOperationGate } from "../lib/recovery.ts";
 import { isTelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
+import {
+  createTelegramInteractionRuntime,
+  type TelegramInteractionActiveTurnSnapshot,
+} from "../lib/interactions.ts";
+import {
+  createTelegramInteractionPriorityHandle,
+  createTelegramUpdateHandle,
+} from "../lib/updates.ts";
 
 async function waitForCondition(
   predicate: () => boolean,
@@ -355,6 +364,387 @@ test("Bus follower receiver handles leader-forwarded updates and target replacem
   }
 });
 
+test("Interaction full-update routing settles only the exact follower Promise before public handlers", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-interaction-roundtrip-"));
+  const leaderSocketPath = join(dir, "leader.sock");
+  const followerASocketPath = join(dir, "follower-a.sock");
+  const followerBSocketPath = join(dir, "follower-b.sock");
+  const ownerId = "paired-owner";
+  const targets = {
+    a: { chatId: 7, threadId: 11 },
+    b: { chatId: 7, threadId: 22 },
+  };
+  const generations = { a: "generation-a", b: "generation-b" };
+  const identity = (target: { chatId: number; threadId: number }) => ({
+    target,
+    profile: "default",
+    transportGeneration: "transport-1",
+    sessionGeneration: "1",
+    authorityGeneration: "follower-current",
+  });
+  const snapshot = (
+    target: { chatId: number; threadId: number },
+  ): TelegramInteractionActiveTurnSnapshot => ({
+    turnId: `turn-${target.threadId}`,
+    ...identity(target),
+    sourceMessageIds: [],
+  });
+  const runtimeA = createTelegramInteractionRuntime({
+    generation: "runtime-a",
+    captureActiveTurn: () => snapshot(targets.a),
+    isActive: () => true,
+    createToken: () => "AAAAAAAAAAAAAAAA",
+    delivery: {
+      async sendView() {
+        return {
+          ok: true,
+          value: { target: targets.a, messageIds: [101], generation: "delivery-a" },
+        };
+      },
+      async editView(handle) { return { ok: true, value: handle }; },
+      async deleteView() { return { ok: true, value: undefined }; },
+    },
+  });
+  const runtimeB = createTelegramInteractionRuntime({
+    generation: "runtime-b",
+    captureActiveTurn: () => snapshot(targets.b),
+    isActive: () => true,
+    delivery: {
+      async sendView() {
+        return {
+          ok: true,
+          value: { target: targets.b, messageIds: [201], generation: "delivery-b" },
+        };
+      },
+      async editView(handle) { return { ok: true, value: handle }; },
+      async deleteView() { return { ok: true, value: undefined }; },
+    },
+  });
+  const pendingA = runtimeA.request({
+    question: "A",
+    mode: { kind: "single-select", options: [{ label: "A", value: "a" }] },
+  });
+  const pendingB = runtimeB.request({ question: "B", mode: { kind: "text" } });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  let followerPublic = 0;
+  let followerDefault = 0;
+  let recursiveForwards = 0;
+  const pairedGate = {
+    getAllowedUserId: () => 7,
+    async claim() { return { kind: "already-paired" as const }; },
+    async sendGenericResponse() {},
+    async onPaired() {},
+    recordSideEffectFailure() {},
+  };
+  const makeFollowerHandler = (
+    instanceId: string,
+    target: { chatId: number; threadId: number },
+    anchor: number,
+    runtime: typeof runtimeA,
+  ) => {
+    const priority = createTelegramInteractionPriorityHandle({
+      getCurrentInstanceId: () => instanceId,
+      getCurrentProfile: () => "default",
+      getMessageOwnership: (_chatId, messageId) =>
+        messageId === anchor
+          ? {
+              instanceId,
+              ownerGeneration:
+                instanceId === "follower-a" ? generations.a : generations.b,
+              target,
+              purpose: "interaction" as const,
+            }
+          : undefined,
+      classifyMessageOwnership: (_chatId, messageId) =>
+        messageId === anchor ? { purpose: "interaction" as const } : undefined,
+      isInteractionPending: runtime.isPending,
+      foreignOwnedUpdateForwarder: {
+        async forwardUpdate() {
+          recursiveForwards += 1;
+          return undefined;
+        },
+      },
+      prepareCallback(input) {
+        return runtime.prepareCallback({ ...input, ...identity(target) });
+      },
+      handleInput(input) {
+        return runtime.handleInput({ ...input, ...identity(target) });
+      },
+      async answerCallbackQuery() {},
+    });
+    return createTelegramUpdateHandle({
+      pairingGate: pairedGate,
+      priorityHandle: priority,
+      registry: {
+        version: 1 as const,
+        add: () => () => {},
+        async dispatch() { followerPublic += 1; return "consume" as const; },
+      },
+      async defaultHandle() {
+        followerDefault += 1;
+        return { kind: "completed" as const, reason: "ignored" as const };
+      },
+    });
+  };
+  const followerHandlers = {
+    a: makeFollowerHandler("follower-a", targets.a, 101, runtimeA),
+    b: makeFollowerHandler("follower-b", targets.b, 201, runtimeB),
+  };
+  const proof = (
+    updateId: number,
+    target: { chatId: number; threadId: number },
+    generation: string,
+  ) => ({
+    version: 1 as const,
+    updateId,
+    recordId: `record-${updateId}`,
+    turnId: `turn-${updateId}`,
+    profile: "default",
+    target,
+    ownerId,
+    registrationGeneration: generation,
+    sessionGeneration: 1,
+    admissionRevision: 1,
+    disposition: "terminal" as const,
+  });
+  const makeReceiver = (
+    socketPath: string,
+    instanceId: string,
+    target: { chatId: number; threadId: number },
+    generation: string,
+    handleUpdate: ReturnType<typeof makeFollowerHandler>,
+  ) => createTelegramBusForwardedUpdateReceiverRuntime({
+    socketPath,
+    instanceId,
+    getRegistrationGeneration: () => generation,
+    getProfile: () => "default",
+    getTarget: () => target,
+    getSessionGeneration: () => 1,
+    manualFollowerOwnerId: ownerId,
+    getContext: () => "ctx",
+    async handleForwardedUpdate(input, ctx) {
+      await handleUpdate(input.update, ctx);
+      return proof(input.update.update_id, target, generation);
+    },
+    handleForwardedCallback() {},
+    handleForwardedReaction() {},
+  });
+  const receiverA = makeReceiver(
+    followerASocketPath,
+    "follower-a",
+    targets.a,
+    generations.a,
+    followerHandlers.a,
+  );
+  const receiverB = makeReceiver(
+    followerBSocketPath,
+    "follower-b",
+    targets.b,
+    generations.b,
+    followerHandlers.b,
+  );
+  const registry = createTelegramBusFollowerRegistry();
+  registry.register({
+    instanceId: "follower-a",
+    manualFollowerOwnerId: ownerId,
+    registrationGeneration: generations.a,
+    sessionGeneration: 1,
+    connectedAtMs: 1,
+    busSocketPath: followerASocketPath,
+    target: targets.a,
+  });
+  registry.register({
+    instanceId: "follower-b",
+    manualFollowerOwnerId: ownerId,
+    registrationGeneration: generations.b,
+    sessionGeneration: 1,
+    connectedAtMs: 1,
+    busSocketPath: followerBSocketPath,
+    target: targets.b,
+  });
+  const leader = createTelegramBusLocalServer({
+    socketPath: leaderSocketPath,
+    handleEnvelope: createTelegramBusLeaderEnvelopeHandler({
+      followerRegistry: registry,
+    }),
+  });
+  const forwarder = createTelegramBusForeignOwnedUpdateForwarder({
+    socketPath: leaderSocketPath,
+    createRequestId: (() => {
+      let sequence = 0;
+      return () => `interaction:${++sequence}`;
+    })(),
+  });
+  const leaderOwnership = new Map<number, {
+    instanceId: string;
+    ownerGeneration?: string;
+    target: { chatId: number; threadId: number };
+    purpose: "interaction";
+  }>([
+    [101, { instanceId: "follower-a", ownerGeneration: generations.a, target: targets.a, purpose: "interaction" }],
+    [201, { instanceId: "follower-b", ownerGeneration: generations.b, target: targets.b, purpose: "interaction" }],
+  ]);
+  let leaderPublic = 0;
+  let leaderDefault = 0;
+  const callbackA = "interact:AAAAAAAAAAAAAAAA:pick:0";
+  const callbackUpdate = (
+    updateId: number,
+    messageId: number,
+    threadId: number | undefined,
+    data = callbackA,
+    userId = 7,
+  ) => ({
+    update_id: updateId,
+    callback_query: {
+      id: `callback-${updateId}`,
+      data,
+      from: { id: userId, is_bot: false },
+      message: {
+        message_id: messageId,
+        ...(threadId === undefined ? {} : { message_thread_id: threadId }),
+        chat: { id: 7, type: "private" },
+      },
+    },
+  });
+  const leaderPriority = createTelegramInteractionPriorityHandle({
+    getCurrentInstanceId: () => "leader",
+    getCurrentProfile: () => "default",
+    getMessageOwnership: (_chatId, messageId) => leaderOwnership.get(messageId),
+    classifyMessageOwnership: (_chatId, messageId) => {
+      const purpose = leaderOwnership.get(messageId)?.purpose;
+      return purpose ? { purpose } : undefined;
+    },
+    isInteractionPending: () => false,
+    foreignOwnedUpdateForwarder: forwarder,
+    prepareCallback() {
+      return {
+        acknowledgement: "This interaction has expired.",
+        async commit() { return { handled: true }; },
+      };
+    },
+    async handleInput() { return { handled: true }; },
+    async answerCallbackQuery() {},
+  });
+  const leaderHandler = createTelegramUpdateHandle({
+    pairingGate: pairedGate,
+    priorityHandle: leaderPriority,
+    registry: {
+      version: 1,
+      add: () => () => {},
+      async dispatch() { leaderPublic += 1; return "consume"; },
+    },
+    async defaultHandle() {
+      leaderDefault += 1;
+      return { kind: "completed", reason: "ignored" };
+    },
+  });
+
+  try {
+    await receiverA.start();
+    await receiverB.start();
+    await leader.start();
+
+    await leaderHandler(callbackUpdate(1, 201, 22), "ctx");
+    const missingGeneration = leaderOwnership.get(101)!;
+    missingGeneration.ownerGeneration = undefined;
+    await leaderHandler(callbackUpdate(2, 101, 11), "ctx");
+    missingGeneration.ownerGeneration = "stale-generation";
+    await leaderHandler(callbackUpdate(3, 101, 11), "ctx");
+    missingGeneration.ownerGeneration = generations.a;
+    await leaderHandler(callbackUpdate(4, 101, 99), "ctx");
+    await leaderHandler(callbackUpdate(5, 999, 11), "ctx");
+    await leaderHandler(callbackUpdate(6, 101, 11, callbackA, 8), "ctx");
+    assert.equal(
+      await forwarder.forwardUpdate({
+        update: callbackUpdate(7, 101, 11),
+        profile: "other",
+        target: targets.a,
+        ownership: leaderOwnership.get(101)!,
+      }),
+      undefined,
+    );
+    assert.equal(
+      await forwarder.forwardUpdate({
+        update: callbackUpdate(8, 101, 11),
+        profile: "default",
+        target: { chatId: 7, threadId: 99 },
+        ownership: leaderOwnership.get(101)!,
+      }),
+      undefined,
+    );
+
+    await leaderHandler(
+      callbackUpdate(9, 101, undefined),
+      "ctx",
+    );
+    assert.deepEqual(await pendingA, {
+      handled: true,
+      result: {
+        status: "answered",
+        answers: [{ type: "option", index: 1, label: "A", value: "a" }],
+      },
+    });
+    await leaderHandler(callbackUpdate(10, 101, undefined), "ctx");
+    await leaderHandler({
+      update_id: 11,
+      message: {
+        message_id: 202,
+        message_thread_id: 22,
+        chat: { id: 7, type: "private" },
+        from: { id: 7, is_bot: false },
+        text: "Follower B answer",
+        reply_to_message: {
+          message_id: 201,
+          chat: { id: 7, type: "private" },
+          from: { id: 99, is_bot: true },
+        },
+      },
+    }, "ctx");
+    assert.deepEqual(await pendingB, {
+      handled: true,
+      result: {
+        status: "answered",
+        answers: [{ type: "text", label: "Follower B answer", value: "Follower B answer" }],
+      },
+    });
+
+    await leaderHandler({ update_id: 12, message: {
+      message_id: 300, chat: { id: 7, type: "private" },
+      from: { id: 7, is_bot: false }, photo: [{ file_id: "photo" }],
+    } } as unknown as Parameters<typeof leaderHandler>[0], "ctx");
+    await leaderHandler({ update_id: 13, edited_message: {
+      message_id: 301, chat: { id: 7, type: "private" },
+      from: { id: 7, is_bot: false }, text: "edited",
+    } }, "ctx");
+    await leaderHandler({ update_id: 14, message: {
+      message_id: 302, chat: { id: 7, type: "private" },
+      from: { id: 7, is_bot: false }, text: "unanchored",
+    } }, "ctx");
+    await leaderHandler({ update_id: 15, message: {
+      message_id: 303, chat: { id: 7, type: "private" },
+      from: { id: 7, is_bot: false }, text: "ordinary",
+      reply_to_message: {
+        message_id: 999, chat: { id: 7, type: "private" },
+        from: { id: 99, is_bot: true },
+      },
+    } }, "ctx");
+
+    assert.equal(recursiveForwards, 0, "forwarded updates re-enter locally without recursion");
+    assert.equal(followerPublic, 0, "interaction candidates stay private on followers");
+    assert.equal(followerDefault, 0, "interaction candidates never reach follower fallback");
+    assert.equal(leaderPublic, 4, "only media/edit/unanchored/ordinary updates remain public");
+    assert.equal(leaderDefault, 0);
+  } finally {
+    runtimeA.shutdown();
+    runtimeB.shutdown();
+    await leader.stop();
+    await receiverA.stop();
+    await receiverB.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("Bus follower recovery fence authenticates exact authority, drains, and resumes exact generation", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-recovery-fence-"));
   const socketPath = join(dir, "follower.sock");
@@ -516,8 +906,9 @@ test("Bus follower receiver rejects delayed work from a replaced registration ge
   }
 });
 
-test("Bus follower heartbeat recovery passes current binding into promotion", async () => {
+test("Bus follower heartbeat recovery invalidates follower authority before promotion", async () => {
   const promoted: unknown[] = [];
+  const authorityEvents: string[] = [];
   let leaderStateCalls = 0;
   const registrationState = createTelegramBusFollowerRegistrationState();
   registrationState.setRegistered(
@@ -528,12 +919,17 @@ test("Bus follower heartbeat recovery passes current binding into promotion", as
       threadName: "Fjord",
     },
   );
+  registrationState.subscribeAuthorityChange(() => {
+    authorityEvents.push(
+      `invalidate:${String(registrationState.isRegistered())}:${registrationState.getGeneration() ?? "none"}`,
+    );
+  });
   const handler = createTelegramBusFollowerHeartbeatRecoveryHandler({
     registrationState,
     getRegistrationRuntime: () => ({
       registerWithLeader: async () => false,
       setContext: () => undefined,
-      stop: () => undefined,
+      stop: () => registrationState.setRegistered(false),
     }),
     getLeaderState: () => {
       leaderStateCalls += 1;
@@ -544,6 +940,7 @@ test("Bus follower heartbeat recovery passes current binding into promotion", as
     setLifecyclePhase: () => undefined,
     updateStatus: () => undefined,
     promoteToLeader: async (_ctx, binding) => {
+      authorityEvents.push(`promote:${String(registrationState.isRegistered())}`);
       promoted.push(binding);
       return true;
     },
@@ -557,6 +954,40 @@ test("Bus follower heartbeat recovery passes current binding into promotion", as
   assert.deepEqual(promoted, [
     { target: { chatId: 42, threadId: 10 }, slot: "F", threadName: "Fjord" },
   ]);
+  assert.deepEqual(authorityEvents, ["invalidate:true:none", "promote:false"]);
+});
+
+test("Bus follower registration invalidates old authority before replacement publication", () => {
+  const state = createTelegramBusFollowerRegistrationState();
+  state.setRegistered(
+    true,
+    { chatId: 42, threadId: 10 },
+    { generation: "generation-1" },
+  );
+  const events: string[] = [];
+  const unsubscribe = state.subscribeAuthorityChange(() => {
+    events.push(
+      `${String(state.isRegistered())}:${state.getTarget()?.threadId ?? "none"}:${state.getGeneration() ?? "none"}`,
+    );
+  });
+
+  state.setRegistered(
+    true,
+    { chatId: 42, threadId: 11 },
+    { generation: "generation-2" },
+  );
+  state.setRegistered(false);
+  unsubscribe();
+  state.setRegistered(true, { chatId: 42, threadId: 12 }, {
+    generation: "generation-3",
+  });
+
+  assert.deepEqual(events, [
+    "true:10:generation-1",
+    "true:11:generation-2",
+  ]);
+  assert.equal(state.getTarget()?.threadId, 12);
+  assert.equal(state.getGeneration(), "generation-3");
 });
 
 test("Bus follower election defers a higher slot to the lowest live candidate", async () => {
@@ -1105,6 +1536,263 @@ test("Bus follower assembly wires receiver, recovery, and registration", async (
     assembly.registration.stop();
     await assembly.receiver.stop();
     await leader.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Delayed stale registration rejection cannot deregister a replacement generation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-stale-register-"));
+  const socketPath = join(dir, "bus.sock");
+  const state = createTelegramBusFollowerRegistrationState();
+  let releaseOld!: () => void;
+  let observeOld!: () => void;
+  const oldObserved = new Promise<void>((resolve) => {
+    observeOld = resolve;
+  });
+  const oldGate = new Promise<void>((resolve) => {
+    releaseOld = resolve;
+  });
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    async handleEnvelope(envelope) {
+      if (envelope.kind !== "follower.register") return undefined;
+      if (envelope.registration.registrationGeneration === "generation-old") {
+        observeOld();
+        await oldGate;
+        return {
+          kind: "bus.ack",
+          requestId: envelope.requestId,
+          ok: false,
+          message: "old registration rejected",
+        };
+      }
+      return {
+        kind: "bus.ack",
+        requestId: envelope.requestId,
+        ok: true,
+        result: {
+          target: { chatId: 7, threadId: 42 },
+          slot: "F",
+          threadName: "Fjord",
+        },
+      };
+    },
+  });
+  let requestSequence = 0;
+  const follower = createTelegramBusFollowerRegistrationRuntime({
+    instanceId: "inst-a",
+    createRequestId: () => `request-${++requestSequence}`,
+    getSessionGeneration: () => 1,
+    registrationState: state,
+    heartbeatMs: 60_000,
+  });
+  let authorityChanges = 0;
+  state.subscribeAuthorityChange(() => {
+    authorityChanges += 1;
+  });
+  try {
+    await server.start();
+    const oldRegistration = follower.registerWithLeader(
+      { cwd: "/repo" },
+      { busSocketPath: socketPath },
+      { registrationGeneration: "generation-old" },
+    );
+    await oldObserved;
+    assert.equal(
+      await follower.registerWithLeader(
+        { cwd: "/repo" },
+        { busSocketPath: socketPath },
+        { registrationGeneration: "generation-new" },
+      ),
+      true,
+    );
+    assert.equal(state.getGeneration(), "generation-new");
+    assert.equal(authorityChanges, 1);
+
+    releaseOld();
+    assert.equal(await oldRegistration, false);
+    assert.equal(state.isRegistered(), true);
+    assert.equal(state.getGeneration(), "generation-new");
+    assert.equal(authorityChanges, 1);
+  } finally {
+    releaseOld();
+    follower.stop();
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Delayed stale initial heartbeat cannot invalidate replacement registration or interaction authority", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-stale-heartbeat-"));
+  const socketPath = join(dir, "bus.sock");
+  const state = createTelegramBusFollowerRegistrationState();
+  let releaseOldHeartbeat!: () => void;
+  let observeOldHeartbeat!: () => void;
+  const oldHeartbeatObserved = new Promise<void>((resolve) => {
+    observeOldHeartbeat = resolve;
+  });
+  const oldHeartbeatGate = new Promise<void>((resolve) => {
+    releaseOldHeartbeat = resolve;
+  });
+  const heartbeatAuth: Array<string | undefined> = [];
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    async handleEnvelope(envelope) {
+      if (envelope.kind === "follower.register") {
+        return {
+          kind: "bus.ack",
+          requestId: envelope.requestId,
+          ok: true,
+          result: {
+            target: {
+              chatId: 7,
+              threadId:
+                envelope.registration.registrationGeneration === "generation-old"
+                  ? 41
+                  : 42,
+            },
+            slot: envelope.registration.registrationGeneration === "generation-old" ? "O" : "N",
+            threadName:
+              envelope.registration.registrationGeneration === "generation-old"
+                ? "Olden"
+                : "Novel",
+          },
+        };
+      }
+      if (envelope.kind !== "follower.heartbeat") return undefined;
+      heartbeatAuth.push(envelope.auth);
+      if (envelope.registrationGeneration === "generation-old") {
+        observeOldHeartbeat();
+        await oldHeartbeatGate;
+        return {
+          kind: "bus.ack",
+          requestId: envelope.requestId,
+          ok: false,
+          message: "old heartbeat rejected",
+        };
+      }
+      return {
+        kind: "bus.ack",
+        requestId: envelope.requestId,
+        ok: true,
+        result: { eligibleElectionSlots: ["N"] },
+      };
+    },
+  });
+  let requestSequence = 0;
+  let recoveryCalls = 0;
+  let heartbeatEvents = 0;
+  const follower = createTelegramBusFollowerRegistrationRuntime({
+    instanceId: "inst-a",
+    createRequestId: () => `request-${++requestSequence}`,
+    getSessionGeneration: () => 1,
+    getLeaderAuthSecret: (leader) => leader.busSecret,
+    registrationState: state,
+    heartbeatMs: 60_000,
+    onHeartbeatFailure: () => {
+      recoveryCalls += 1;
+    },
+    recordRuntimeEvent: (_category, _error, details) => {
+      if (details?.phase === "follower-heartbeat") heartbeatEvents += 1;
+    },
+  });
+  let authorityChanges = 0;
+  let replacementInteraction: ReturnType<
+    typeof createTelegramInteractionRuntime
+  > | undefined;
+  state.subscribeAuthorityChange(() => {
+    authorityChanges += 1;
+    replacementInteraction?.invalidateAuthority();
+  });
+  let replacementAttempt: ReturnType<
+    ReturnType<typeof createTelegramInteractionRuntime>["request"]
+  > | undefined;
+  try {
+    await server.start();
+    const oldRegistration = follower.registerWithLeader(
+      { cwd: "/old" },
+      { busSocketPath: socketPath, busSecret: "old-auth" },
+      { registrationGeneration: "generation-old" },
+    );
+    await oldHeartbeatObserved;
+    assert.equal(state.getGeneration(), "generation-old");
+
+    assert.equal(
+      await follower.registerWithLeader(
+        { cwd: "/new" },
+        { busSocketPath: socketPath, busSecret: "new-auth" },
+        { registrationGeneration: "generation-new" },
+      ),
+      true,
+    );
+    assert.equal(state.getGeneration(), "generation-new");
+    assert.deepEqual(state.getTarget(), { chatId: 7, threadId: 42 });
+    assert.deepEqual(state.getEligibleElectionSlots(), ["N"]);
+    assert.equal(authorityChanges, 2);
+
+    const snapshot: TelegramInteractionActiveTurnSnapshot = {
+      turnId: "turn-new",
+      target: { chatId: 7, threadId: 42 },
+      profile: "default",
+      transportGeneration: "transport-new",
+      sessionGeneration: "session-new",
+      authorityGeneration: "generation-new",
+      sourceMessageIds: [],
+    };
+    replacementInteraction = createTelegramInteractionRuntime({
+      generation: "interaction-new",
+      captureActiveTurn: () => snapshot,
+      isActive: (candidate) => candidate === snapshot,
+      delivery: {
+        async sendView() {
+          return {
+            ok: true,
+            value: {
+              target: snapshot.target,
+              messageIds: [101],
+              generation: "delivery-new",
+            },
+          };
+        },
+        async editView(handle) {
+          return { ok: true, value: handle };
+        },
+        async deleteView() {
+          return { ok: true, value: undefined };
+        },
+      },
+    });
+    replacementAttempt = replacementInteraction.request({
+      question: "Replacement question",
+      mode: { kind: "text" },
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(replacementInteraction.isPending(), true);
+
+    releaseOldHeartbeat();
+    assert.equal(await oldRegistration, false);
+    assert.equal(state.isRegistered(), true);
+    assert.equal(state.getGeneration(), "generation-new");
+    assert.deepEqual(state.getTarget(), { chatId: 7, threadId: 42 });
+    assert.deepEqual(state.getEligibleElectionSlots(), ["N"]);
+    assert.equal(authorityChanges, 2);
+    assert.equal(recoveryCalls, 0);
+    assert.equal(heartbeatEvents, 0);
+    assert.equal(replacementInteraction.isPending(), true);
+    assert.deepEqual(heartbeatAuth, ["old-auth", "new-auth"]);
+
+    replacementInteraction.shutdown();
+    assert.deepEqual(await replacementAttempt, {
+      handled: true,
+      result: { status: "unavailable" },
+    });
+    replacementInteraction = undefined;
+  } finally {
+    releaseOldHeartbeat();
+    replacementInteraction?.shutdown();
+    if (replacementAttempt) await replacementAttempt;
+    follower.stop();
+    await server.stop();
     rmSync(dir, { recursive: true, force: true });
   }
 });

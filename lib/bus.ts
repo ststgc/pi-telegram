@@ -205,6 +205,8 @@ export function getTelegramFollowerTargetOwnership(input: {
 }
 
 const TELEGRAM_BUS_AGGREGATE_DELIVERY_FIELD = "__piTelegramAggregateDelivery";
+const TELEGRAM_BUS_INTERACTION_DELIVERY_FIELD =
+  "__piTelegramInteractionPurpose";
 
 export function markTelegramBusAggregateDelivery<
   T extends Record<string, unknown>,
@@ -213,6 +215,33 @@ export function markTelegramBusAggregateDelivery<
     ...body,
     [TELEGRAM_BUS_AGGREGATE_DELIVERY_FIELD]: true,
   };
+}
+
+export function markTelegramBusInteractionDelivery<
+  T extends Record<string, unknown>,
+>(body: T): T {
+  return {
+    ...body,
+    [TELEGRAM_BUS_INTERACTION_DELIVERY_FIELD]: "interaction",
+  };
+}
+
+export function isTelegramBusInteractionDelivery(body: unknown): boolean {
+  return Boolean(
+    body &&
+    typeof body === "object" &&
+    !Array.isArray(body) &&
+    (body as Record<string, unknown>)[
+      TELEGRAM_BUS_INTERACTION_DELIVERY_FIELD
+    ] === "interaction",
+  );
+}
+
+function hasValidTelegramBusInteractionMetadata(body: unknown): boolean {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return true;
+  const record = body as Record<string, unknown>;
+  return !(TELEGRAM_BUS_INTERACTION_DELIVERY_FIELD in record) ||
+    isTelegramBusInteractionDelivery(record);
 }
 
 export function isTelegramBusAggregateDelivery(body: unknown): boolean {
@@ -228,9 +257,15 @@ export function isTelegramBusAggregateDelivery(body: unknown): boolean {
 export function stripTelegramBusApiMetadata<T extends Record<string, unknown>>(
   body: T,
 ): T {
-  if (!(TELEGRAM_BUS_AGGREGATE_DELIVERY_FIELD in body)) return body;
+  if (
+    !(TELEGRAM_BUS_AGGREGATE_DELIVERY_FIELD in body) &&
+    !(TELEGRAM_BUS_INTERACTION_DELIVERY_FIELD in body)
+  ) {
+    return body;
+  }
   const clean = { ...body };
   delete clean[TELEGRAM_BUS_AGGREGATE_DELIVERY_FIELD];
+  delete clean[TELEGRAM_BUS_INTERACTION_DELIVERY_FIELD];
   return clean;
 }
 
@@ -307,6 +342,17 @@ export function isTelegramFollowerApiCallAllowed(input: {
   if (input.method === "call") {
     const apiMethod = input.args[0];
     if (typeof apiMethod !== "string") return false;
+    if (!hasValidTelegramBusInteractionMetadata(input.args[1])) return false;
+    if (
+      input.args[1] &&
+      typeof input.args[1] === "object" &&
+      !Array.isArray(input.args[1]) &&
+      TELEGRAM_BUS_INTERACTION_DELIVERY_FIELD in
+        (input.args[1] as Record<string, unknown>) &&
+      apiMethod !== "sendMessage"
+    ) {
+      return false;
+    }
     if (
       apiMethod === "answerCallbackQuery" ||
       apiMethod === "answerGuestQuery"
@@ -1653,9 +1699,13 @@ function parseForwardMessageEnvelope(
   requestId: string,
   kind: "leader.forwardMessage" | "leader.forwardEditedMessage",
 ): TelegramBusEnvelope | undefined {
-  return typeof value.recipientInstanceId === "string" &&
-    typeof value.sentAtMs === "number"
-    ? {
+  if (
+    typeof value.recipientInstanceId !== "string" ||
+    typeof value.sentAtMs !== "number"
+  ) {
+    return undefined;
+  }
+  return {
         kind,
         requestId,
         recipientInstanceId: value.recipientInstanceId,
@@ -1674,8 +1724,7 @@ function parseForwardMessageEnvelope(
             }
           : {}),
         sentAtMs: value.sentAtMs,
-      }
-    : undefined;
+      } as TelegramBusEnvelope;
 }
 
 function parseReplaceFollowerTargetEnvelope(

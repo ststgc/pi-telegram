@@ -24,10 +24,13 @@ export interface TelegramRuntimeLifecycleFlags {
 export interface TelegramBridgeRuntimeState
   extends TelegramRuntimeQueueCounters, TelegramRuntimeLifecycleFlags {
   abortHandler?: () => void;
+  typingGeneration?: number;
   typingInterval?: ReturnType<typeof setInterval>;
   typingInFlight?: Promise<void>;
+  typingInFlightRequests?: Set<Promise<void>>;
   typingLoopDeps?: TelegramTypingLoopDeps;
   typingLoopKey?: string;
+  typingWaitingLease?: TelegramTypingWaitingLeaseState;
 }
 
 export interface TelegramRuntimeQueuePort {
@@ -66,10 +69,30 @@ export interface TelegramRuntimeAbortPort {
   abortTurn: () => boolean;
 }
 
+export interface TelegramTypingWaitingIdentity {
+  readonly correlationId: string;
+  isActive(): boolean;
+}
+
+export interface TelegramTypingWaitingLease {
+  release(options: { resumeIfActive: boolean }): void;
+}
+
+interface TelegramTypingWaitingLeaseState {
+  readonly generation: number;
+  readonly identity: TelegramTypingWaitingIdentity;
+  readonly resumeDeps?: TelegramTypingLoopDeps;
+}
+
 export interface TelegramRuntimeTypingPort {
   start: (deps: TelegramTypingLoopDeps) => boolean;
   stop: () => boolean;
   waitForIdle: () => Promise<void>;
+  acquireWaitingLease: (
+    identity: TelegramTypingWaitingIdentity,
+  ) => Promise<TelegramTypingWaitingLease>;
+  clearWaitingLease: () => boolean;
+  isWaiting: () => boolean;
 }
 
 export interface TelegramBridgeRuntime {
@@ -91,6 +114,7 @@ export function createTelegramBridgeRuntimeState(): TelegramBridgeRuntimeState {
     compactionInProgress: false,
     foldQueuedPromptsIntoHistory: false,
     setupInProgress: false,
+    typingGeneration: 0,
   };
 }
 
@@ -144,6 +168,10 @@ export function createTelegramBridgeRuntime(
       start: (deps) => startTelegramTypingLoop(state, deps),
       stop: () => stopTelegramTypingLoop(state),
       waitForIdle: () => waitForTelegramTypingLoopIdle(state),
+      acquireWaitingLease: (identity) =>
+        acquireTelegramTypingWaitingLease(state, identity),
+      clearWaitingLease: () => clearTelegramTypingWaitingLease(state),
+      isWaiting: () => isTelegramTypingWaiting(state),
     },
   };
 }
@@ -316,6 +344,8 @@ export function getTelegramAbortHandler(
 
 export function abortTelegramTurn(state: TelegramBridgeRuntimeState): boolean {
   if (!state.abortHandler) return false;
+  clearTelegramTypingWaitingLease(state);
+  stopTelegramTypingLoop(state);
   state.abortHandler();
   return true;
 }
@@ -444,11 +474,54 @@ function getTelegramTypingLoopKey(deps: TelegramTypingLoopDeps): string {
   return `${deps.chatId ?? 0}:${Number.isInteger(threadId) ? threadId : "all"}`;
 }
 
+function getTelegramTypingGeneration(state: TelegramBridgeRuntimeState): number {
+  return state.typingGeneration ?? 0;
+}
+
+function advanceTelegramTypingGeneration(
+  state: TelegramBridgeRuntimeState,
+): number {
+  const generation = getTelegramTypingGeneration(state) + 1;
+  state.typingGeneration = generation;
+  return generation;
+}
+
+function clearTelegramTypingInterval(state: TelegramBridgeRuntimeState): boolean {
+  if (!state.typingInterval) return false;
+  clearInterval(state.typingInterval);
+  state.typingInterval = undefined;
+  state.typingLoopDeps = undefined;
+  state.typingLoopKey = undefined;
+  return true;
+}
+
+function isTelegramTypingGenerationActive(
+  state: TelegramBridgeRuntimeState,
+  generation: number,
+): boolean {
+  return (
+    getTelegramTypingGeneration(state) === generation &&
+    state.typingWaitingLease === undefined
+  );
+}
+
+export function isTelegramTypingWaiting(
+  state: TelegramBridgeRuntimeState,
+): boolean {
+  return state.typingWaitingLease !== undefined;
+}
+
 export function startTelegramTypingLoop(
   state: TelegramBridgeRuntimeState,
   deps: TelegramTypingLoopDeps,
 ): boolean {
-  if (deps.chatId === undefined || deps.chatId === 0) return false;
+  if (
+    state.typingWaitingLease ||
+    deps.chatId === undefined ||
+    deps.chatId === 0
+  ) {
+    return false;
+  }
   const previousKey = state.typingLoopKey;
   const nextKey = getTelegramTypingLoopKey(deps);
   state.typingLoopDeps = deps;
@@ -457,19 +530,29 @@ export function startTelegramTypingLoop(
     const activeDeps = state.typingLoopDeps;
     if (!activeDeps || activeDeps.chatId === undefined || activeDeps.chatId === 0)
       return;
+    const generation = getTelegramTypingGeneration(state);
     const targetChatId = activeDeps.chatId;
     const threadParams = getTelegramTypingLoopThreadParams(activeDeps.target);
     const typing = Promise.resolve()
       .then(async () => {
+        if (!isTelegramTypingGenerationActive(state, generation)) return;
         await activeDeps.sendTypingAction(targetChatId, threadParams);
-        if (threadParams?.message_thread_id !== undefined) {
+        if (
+          threadParams?.message_thread_id !== undefined &&
+          isTelegramTypingGenerationActive(state, generation)
+        ) {
           await activeDeps.sendAggregateTypingAction?.(targetChatId);
         }
       })
       .then(() => undefined)
       .catch(() => undefined);
     state.typingInFlight = typing;
+    const inFlightRequests =
+      state.typingInFlightRequests ?? (state.typingInFlightRequests = new Set());
+    inFlightRequests.add(typing);
     void typing.finally(() => {
+      inFlightRequests.delete(typing);
+      if (inFlightRequests.size === 0) state.typingInFlightRequests = undefined;
       if (state.typingInFlight === typing) state.typingInFlight = undefined;
     });
   };
@@ -487,19 +570,17 @@ export function startTelegramTypingLoop(
 export function stopTelegramTypingLoop(
   state: TelegramBridgeRuntimeState,
 ): boolean {
-  if (!state.typingInterval) return false;
-  clearInterval(state.typingInterval);
-  state.typingInterval = undefined;
-  state.typingLoopDeps = undefined;
-  state.typingLoopKey = undefined;
-  return true;
+  advanceTelegramTypingGeneration(state);
+  return clearTelegramTypingInterval(state);
 }
 
 export async function waitForTelegramTypingLoopIdle(
   state: TelegramBridgeRuntimeState,
   timeoutMs = TELEGRAM_TYPING_IDLE_DRAIN_MAX_MS,
 ): Promise<void> {
-  const inFlight = state.typingInFlight;
+  const inFlight = state.typingInFlightRequests?.size
+    ? Promise.all([...state.typingInFlightRequests]).then(() => undefined)
+    : state.typingInFlight;
   if (!inFlight) return;
   if (timeoutMs <= 0) {
     await Promise.race([inFlight, Promise.resolve()]);
@@ -508,9 +589,45 @@ export async function waitForTelegramTypingLoopIdle(
   await Promise.race([
     inFlight,
     new Promise<void>((resolve) => {
-      setTimeout(resolve, timeoutMs);
+      const timer = setTimeout(resolve, timeoutMs);
+      timer.unref?.();
     }),
   ]);
+}
+
+export async function acquireTelegramTypingWaitingLease(
+  state: TelegramBridgeRuntimeState,
+  identity: TelegramTypingWaitingIdentity,
+): Promise<TelegramTypingWaitingLease> {
+  const resumeDeps = state.typingInterval ? state.typingLoopDeps : undefined;
+  const generation = advanceTelegramTypingGeneration(state);
+  state.typingWaitingLease = { generation, identity, resumeDeps };
+  clearTelegramTypingInterval(state);
+  await waitForTelegramTypingLoopIdle(state);
+  return {
+    release(options) {
+      const waiting = state.typingWaitingLease;
+      if (!waiting || waiting.generation !== generation) return;
+      state.typingWaitingLease = undefined;
+      if (
+        options.resumeIfActive &&
+        waiting.resumeDeps &&
+        waiting.identity.isActive()
+      ) {
+        startTelegramTypingLoop(state, waiting.resumeDeps);
+      }
+    },
+  };
+}
+
+export function clearTelegramTypingWaitingLease(
+  state: TelegramBridgeRuntimeState,
+): boolean {
+  if (!state.typingWaitingLease) return false;
+  advanceTelegramTypingGeneration(state);
+  state.typingWaitingLease = undefined;
+  clearTelegramTypingInterval(state);
+  return true;
 }
 
 export function createTelegramContextAbortHandlerSetter<
@@ -525,7 +642,7 @@ export function createTelegramContextAbortHandlerSetter<
 
 export interface TelegramAgentEndResetDeps {
   abort: Pick<TelegramRuntimeAbortPort, "clearHandler">;
-  typing: Pick<TelegramRuntimeTypingPort, "stop">;
+  typing: Pick<TelegramRuntimeTypingPort, "stop" | "clearWaitingLease">;
   clearActiveTurn: () => void;
   resetToolExecutions: () => void;
   clearPendingModelSwitch: () => void;
@@ -537,6 +654,7 @@ export function createTelegramAgentEndResetter(
 ): () => void {
   return () => {
     deps.abort.clearHandler();
+    deps.typing.clearWaitingLease();
     deps.typing.stop();
     deps.clearActiveTurn();
     deps.resetToolExecutions();

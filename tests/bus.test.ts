@@ -39,6 +39,8 @@ import {
   getTelegramProcessBirthIdentity,
   isTelegramFollowerApiCallAllowed,
   markTelegramBusAggregateDelivery,
+  markTelegramBusInteractionDelivery,
+  isTelegramBusInteractionDelivery,
   parseTelegramBusEnvelope,
   resolveTelegramBusSocketPath,
   stripTelegramBusApiMetadata,
@@ -1875,5 +1877,35 @@ test("Bus follower registry returns defensive copies", () => {
   assert.deepEqual(registry.getByTarget({ chatId: 1, threadId: 2 })?.target, {
     chatId: 1,
     threadId: 2,
+  });
+});
+
+test("Interaction delivery metadata is strict and stripped before Bot API transport", () => {
+  const follower = {
+    instanceId: "inst-a",
+    connectedAtMs: 1,
+    lastHeartbeatMs: 1,
+    target: { chatId: 100, threadId: 42 },
+  };
+  const marked = markTelegramBusInteractionDelivery({
+    chat_id: 100,
+    message_thread_id: 42,
+    text: "Question",
+  });
+  assert.equal(isTelegramBusInteractionDelivery(marked), true);
+  assert.equal(isTelegramFollowerApiCallAllowed({
+    follower,
+    method: "call",
+    args: ["sendMessage", marked],
+  }), true);
+  assert.equal(isTelegramFollowerApiCallAllowed({
+    follower,
+    method: "call",
+    args: ["sendMessage", { ...marked, __piTelegramInteractionPurpose: "forged" }],
+  }), false);
+  assert.deepEqual(stripTelegramBusApiMetadata(marked), {
+    chat_id: 100,
+    message_thread_id: 42,
+    text: "Question",
   });
 });

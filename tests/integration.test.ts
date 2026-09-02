@@ -18,14 +18,19 @@ import { setTimeout as waitForTimeout } from "node:timers/promises";
 import testRoot, { mock, type TestContext } from "node:test";
 
 import { registerTelegramActivityHandler } from "../api/activity.ts";
+import { requestTelegramInteraction } from "../api/interactions.ts";
 import * as BusApi from "../lib/bus-api.ts";
 import * as BusFollower from "../lib/bus-follower.ts";
 import * as BusLeader from "../lib/bus-leader.ts";
 import * as Bus from "../lib/bus.ts";
+import * as Commands from "../lib/commands.ts";
 import * as Delivery from "../lib/delivery.ts";
+import * as Interactions from "../lib/interactions.ts";
 import * as Locks from "../lib/locks.ts";
 import * as Polling from "../lib/polling.ts";
 import * as Recovery from "../lib/recovery.ts";
+import * as Runtime from "../lib/runtime.ts";
+import * as Updates from "../lib/updates.ts";
 import type { TelegramBridgeApiRuntime } from "../lib/telegram-api.ts";
 
 type RuntimeTestHandler = (context: TestContext) => void | Promise<void>;
@@ -41,6 +46,486 @@ function test(name: string, fn: RuntimeTestHandler): void {
 
 let runtimeTelegramExtension: RuntimeTelegramExtension | undefined;
 let runtimeAgentDir: string | undefined;
+
+test("Interaction composition snapshots classic authority and brackets Delivery lifecycle", async () => {
+  const events: string[] = [];
+  let transportGeneration = "transport-1";
+  let changeTransportDuringSend = true;
+  const turn = {
+    queueOrder: 1,
+    laneOrder: 2,
+    replyToMessageId: 50,
+    sourceMessageIds: [50],
+    transportStamp: { profile: "default", generation: "transport-1" },
+  };
+  const lifecycle = Interactions.createTelegramInteractionBridgeLifecycleRuntime({
+    generationSeed: "integration-interaction",
+    activeTurn: {
+      get: () => turn,
+      getTarget: () => ({ chatId: 42 }),
+    },
+    session: { getGeneration: () => 7 },
+    transport: {
+      getStamp: () => ({ profile: "default", generation: transportGeneration }),
+      isActive: (stamp) => stamp.generation === transportGeneration,
+    },
+    authority: {
+      capture: () => ({ route: "direct" as const, directEpoch: "epoch-1" }),
+      isActive: (authority) => authority.directEpoch === "epoch-1",
+    },
+    delivery: {
+      async sendView(_view, options) {
+        events.push(`interaction:send:${String(options.replyToMessageId)}`);
+        if (changeTransportDuringSend) transportGeneration = "transport-2";
+        return {
+          ok: true,
+          value: { target: { chatId: 42 }, messageIds: [101], generation: "delivery-1" },
+        };
+      },
+      async editView(handle) {
+        events.push("interaction:edit");
+        return { ok: true, value: handle };
+      },
+      async deleteView() {
+        return { ok: true, value: undefined };
+      },
+    },
+    deliveryLifecycle: {
+      async onSessionStart() {
+        const attempt = await requestTelegramInteraction({
+          question: "too early",
+          mode: { kind: "text" },
+        });
+        events.push(`delivery:start:${String(attempt.handled)}`);
+      },
+      async onSessionShutdown() {
+        const attempt = await requestTelegramInteraction({
+          question: "too late",
+          mode: { kind: "text" },
+        });
+        events.push(`delivery:shutdown:${String(attempt.handled)}`);
+      },
+    },
+  });
+  try {
+    await lifecycle.onSessionStart();
+    const stale = requestTelegramInteraction({
+      question: "classic snapshot",
+      mode: { kind: "text" },
+    });
+    assert.deepEqual(await stale, {
+      handled: true,
+      result: { status: "unavailable" },
+    });
+    assert.deepEqual(events.slice(0, 2), [
+      "delivery:start:false",
+      "interaction:send:50",
+    ]);
+
+    transportGeneration = "transport-1";
+    changeTransportDuringSend = false;
+    const replaced = requestTelegramInteraction({
+      question: "transport replacement",
+      mode: { kind: "text" },
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    lifecycle.invalidateAuthority();
+    await lifecycle.rebindAuthority();
+    assert.deepEqual(await replaced, {
+      handled: true,
+      result: { status: "unavailable" },
+    });
+    assert.equal(events.at(-1), "delivery:start:false");
+
+    const pending = requestTelegramInteraction({
+      question: "shutdown ordering",
+      mode: { kind: "text" },
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await lifecycle.onSessionShutdown();
+    assert.deepEqual(await pending, {
+      handled: true,
+      result: { status: "unavailable" },
+    });
+    assert.equal(events.at(-1), "delivery:shutdown:false");
+  } finally {
+    Interactions.clearTelegramInteractionRuntime();
+  }
+});
+
+async function createPendingAuthorityTransitionHarness(authority: {
+  capture(): { route: "direct" | "follower" | "none"; directEpoch?: string; followerGeneration?: string };
+  isActive(value: { route: "direct" | "follower" | "none"; directEpoch?: string; followerGeneration?: string }): boolean;
+}) {
+  const bridgeRuntime = Runtime.createTelegramBridgeRuntime();
+  bridgeRuntime.typing.start({
+    chatId: 42,
+    intervalMs: 60_000,
+    sendTypingAction: async () => undefined,
+  });
+  const lifecycle = Interactions.createTelegramInteractionBridgeLifecycleRuntime({
+    generationSeed: "authority-transition",
+    activeTurn: {
+      get: () => ({
+        queueOrder: 1,
+        laneOrder: 1,
+        replyToMessageId: 50,
+        sourceMessageIds: [50],
+        transportStamp: { profile: "default", generation: "transport-1" },
+      }),
+      getTarget: () => ({ chatId: 42 }),
+    },
+    session: { getGeneration: () => 1 },
+    transport: {
+      getStamp: () => ({ profile: "default", generation: "transport-1" }),
+      isActive: () => true,
+    },
+    authority,
+    delivery: {
+      async sendView() {
+        return {
+          ok: true,
+          value: { target: { chatId: 42 }, messageIds: [101], generation: "delivery-1" },
+        };
+      },
+      async editView(handle) {
+        return { ok: true, value: handle };
+      },
+      async deleteView() {
+        return { ok: true, value: undefined };
+      },
+    },
+    waiting: bridgeRuntime.typing,
+    deliveryLifecycle: {
+      onSessionStart: async () => undefined,
+      onSessionShutdown: async () => undefined,
+    },
+  });
+  await lifecycle.onSessionStart();
+  const pending = requestTelegramInteraction({
+    question: "authority transition",
+    mode: { kind: "text" },
+  });
+  await waitForCondition(() => lifecycle.isPending() && bridgeRuntime.typing.isWaiting());
+  return { bridgeRuntime, lifecycle, pending };
+}
+
+test("Authority transitions settle pending interactions and clear real waiting leases", async (t) => {
+  await t.test("passive direct ownership loss invalidates before polling stop", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-telegram-interaction-lock-loss-"));
+    const locksPath = join(dir, "owners.json");
+    const ctx = { cwd: "/repo" };
+    const lock = Locks.createTelegramLockRuntime({ locksPath, pid: 10 });
+    let harness!: Awaited<ReturnType<typeof createPendingAuthorityTransitionHarness>>;
+    const events: string[] = [];
+    const polling = Locks.createTelegramLockedPollingRuntime({
+      lock,
+      hasBotToken: () => true,
+      ownershipCheckMs: 1,
+      startPolling: async () => undefined,
+      stopPolling: async () => {
+        events.push("stop");
+        assert.equal(harness.lifecycle.isPending(), false);
+        assert.equal(harness.bridgeRuntime.typing.isWaiting(), false);
+      },
+      onOwnershipLoss: () => {
+        events.push("invalidate");
+        harness.lifecycle.invalidateAuthority();
+      },
+      updateStatus: () => undefined,
+    });
+    try {
+      assert.equal((await polling.start(ctx)).ok, true);
+      harness = await createPendingAuthorityTransitionHarness({
+        capture: () => ({ route: "direct", directEpoch: String(lock.getOwnedLeaderEpoch()) }),
+        isActive: () => lock.owns(ctx),
+      });
+      await writeFile(locksPath, "{}", "utf8");
+      await waitForCondition(() => events.includes("stop"));
+      assert.deepEqual(await harness.pending, {
+        handled: true,
+        result: { status: "unavailable" },
+      });
+      assert.deepEqual(events, ["invalidate", "stop"]);
+      await harness.lifecycle.onSessionShutdown();
+    } finally {
+      await polling.stop();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  await t.test("follower re-registration invalidates before replacement publication", async () => {
+    const state = BusFollower.createTelegramBusFollowerRegistrationState();
+    state.setRegistered(true, { chatId: 42, threadId: 7 }, {
+      generation: "generation-old",
+    });
+    const harness = await createPendingAuthorityTransitionHarness({
+      capture: () => {
+        const followerGeneration = state.getGeneration();
+        return {
+          route: state.isRegistered() ? "follower" as const : "none" as const,
+          ...(followerGeneration ? { followerGeneration } : {}),
+        };
+      },
+      isActive: (authority) =>
+        state.isRegistered() && authority.followerGeneration === state.getGeneration(),
+    });
+    const observed: string[] = [];
+    state.subscribeAuthorityChange(() => {
+      observed.push(state.getGeneration() ?? "none");
+      harness.lifecycle.invalidateAuthority();
+    });
+    state.setRegistered(true, { chatId: 42, threadId: 8 }, {
+      generation: "generation-new",
+    });
+    assert.deepEqual(await harness.pending, {
+      handled: true,
+      result: { status: "unavailable" },
+    });
+    assert.deepEqual(observed, ["generation-old"]);
+    assert.equal(harness.bridgeRuntime.typing.isWaiting(), false);
+    await harness.lifecycle.onSessionShutdown();
+  });
+
+  await t.test("promotion clears follower wait before leader acquisition", async () => {
+    const state = BusFollower.createTelegramBusFollowerRegistrationState();
+    state.setRegistered(true, { chatId: 42, threadId: 7 }, {
+      generation: "generation-old",
+      slot: "F",
+    });
+    const harness = await createPendingAuthorityTransitionHarness({
+      capture: () => {
+        const followerGeneration = state.getGeneration();
+        return {
+          route: state.isRegistered() ? "follower" as const : "none" as const,
+          ...(followerGeneration ? { followerGeneration } : {}),
+        };
+      },
+      isActive: (authority) =>
+        state.isRegistered() && authority.followerGeneration === state.getGeneration(),
+    });
+    state.subscribeAuthorityChange(harness.lifecycle.invalidateAuthority);
+    let leaderStateCalls = 0;
+    const recover = BusFollower.createTelegramBusFollowerHeartbeatRecoveryHandler({
+      registrationState: state,
+      getRegistrationRuntime: () => ({
+        registerWithLeader: async () => false,
+        setContext: () => undefined,
+        stop: () => state.setRegistered(false),
+      }),
+      getLeaderState: () =>
+        ++leaderStateCalls === 1
+          ? { kind: "active-elsewhere", lock: { pid: 99 } }
+          : { kind: "inactive" },
+      setLifecyclePhase: () => undefined,
+      updateStatus: () => undefined,
+      promoteToLeader: async () => {
+        assert.equal(harness.lifecycle.isPending(), false);
+        assert.equal(harness.bridgeRuntime.typing.isWaiting(), false);
+        return true;
+      },
+      sleep: async () => undefined,
+      promotionGraceMs: 0,
+      recordRuntimeEvent: () => undefined,
+    });
+    await recover(new Error("leader lost"), "ctx");
+    assert.deepEqual(await harness.pending, {
+      handled: true,
+      result: { status: "unavailable" },
+    });
+    await harness.lifecycle.onSessionShutdown();
+  });
+});
+
+test("Interaction priority ACKs before settlement and safety commands cancel the pending tool signal", async () => {
+  const events: string[] = [];
+  const runtime = Interactions.createTelegramInteractionRuntime({
+    generation: "classic-priority",
+    captureActiveTurn: () => ({
+      turnId: "classic-turn",
+      target: { chatId: 42 },
+      sourceMessageIds: [],
+      profile: "default",
+      transportGeneration: "transport-1",
+      sessionGeneration: "1",
+      authorityGeneration: "direct-1",
+    }),
+    isActive: () => true,
+    createToken: () => "AAAAAAAAAAAAAAAA",
+    delivery: {
+      async sendView() {
+        return {
+          ok: true,
+          value: { target: { chatId: 42 }, messageIds: [101], generation: "delivery-1" },
+        };
+      },
+      async editView(handle) {
+        events.push("edit");
+        return { ok: true, value: handle };
+      },
+      async deleteView() { return { ok: true, value: undefined }; },
+    },
+  });
+  const unbind = Interactions.bindTelegramInteractionRuntime(runtime);
+  let publicCalls = 0;
+  let defaultCalls = 0;
+  let releaseAck!: () => void;
+  const ackGate = new Promise<void>((resolve) => { releaseAck = resolve; });
+  const priority = Updates.createTelegramInteractionPriorityHandle({
+    getCurrentInstanceId: () => "classic",
+    getCurrentProfile: () => "default",
+    getMessageOwnership: (_chatId, messageId) =>
+      messageId === 101
+        ? { instanceId: "classic", target: { chatId: 42 }, purpose: "interaction" }
+        : undefined,
+    classifyMessageOwnership: (_chatId, messageId) =>
+      messageId === 101 ? { purpose: "interaction" } : undefined,
+    isInteractionPending: runtime.isPending,
+    prepareCallback(input) {
+      return runtime.prepareCallback({
+        ...input,
+        profile: "default",
+        transportGeneration: "transport-1",
+        sessionGeneration: "1",
+        authorityGeneration: "direct-1",
+      });
+    },
+    handleInput(input) {
+      return runtime.handleInput({
+        ...input,
+        profile: "default",
+        transportGeneration: "transport-1",
+        sessionGeneration: "1",
+        authorityGeneration: "direct-1",
+      });
+    },
+    async answerCallbackQuery() {
+      events.push("ack-start");
+      await ackGate;
+      events.push("ack");
+    },
+  });
+  let activeAbortController: AbortController | undefined;
+  const commandReplies: string[] = [];
+  let stopQueueClears = 0;
+  const handler = Updates.createTelegramUpdateHandle({
+    pairingGate: {
+      getAllowedUserId: () => 7,
+      async claim() { return { kind: "already-paired" }; },
+      async sendGenericResponse() {},
+      async onPaired() {},
+      recordSideEffectFailure() {},
+    },
+    priorityHandle: priority,
+    registry: {
+      version: 1,
+      add: () => () => {},
+      async dispatch() {
+        publicCalls += 1;
+        return "consume";
+      },
+    },
+    async defaultHandle(update) {
+      defaultCalls += 1;
+      const command = (update as { message?: { text?: string } }).message?.text;
+      const abortCurrentTurn = () => activeAbortController?.abort();
+      const sendTextReply = async (text: string) => {
+        commandReplies.push(text);
+      };
+      if (command === "/abort") {
+        await Commands.handleTelegramAbortCommand({
+          hasAbortHandler: () => activeAbortController !== undefined,
+          hasActiveTelegramTurn: () => true,
+          clearPendingModelSwitch() {},
+          abortCurrentTurn,
+          setFoldQueuedPromptsIntoHistory() {},
+          updateStatus() {},
+          sendTextReply,
+        });
+      } else if (command === "/stop") {
+        await Commands.handleTelegramStopCommand({
+          hasAbortHandler: () => activeAbortController !== undefined,
+          clearPendingModelSwitch() {},
+          clearQueuedTelegramItems() {
+            stopQueueClears += 1;
+            return 0;
+          },
+          setFoldQueuedPromptsIntoHistory() {},
+          abortCurrentTurn,
+          updateStatus() {},
+          sendTextReply,
+        });
+      }
+      return { kind: "completed", reason: "command" };
+    },
+  });
+  try {
+    const pending = requestTelegramInteraction({
+      question: "Classic",
+      mode: { kind: "single-select", options: [{ label: "A", value: "a" }] },
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const handling = handler({
+      update_id: 1,
+      callback_query: {
+        id: "callback-1",
+        data: "interact:AAAAAAAAAAAAAAAA:pick:0",
+        from: { id: 7, is_bot: false },
+        message: { message_id: 101, chat: { id: 42, type: "private" } },
+      },
+    }, {});
+    await waitForCondition(() => events.includes("ack-start"));
+    assert.equal(events.includes("edit"), false);
+    releaseAck();
+    await handling;
+    assert.deepEqual(await pending, {
+      handled: true,
+      result: {
+        status: "answered",
+        answers: [{ type: "option", index: 1, label: "A", value: "a" }],
+      },
+    });
+    await waitForCondition(() => events.includes("edit"));
+    assert.deepEqual(events.slice(0, 3), ["ack-start", "ack", "edit"]);
+
+    for (const command of ["/abort", "/stop"]) {
+      activeAbortController = new AbortController();
+      const commandPending = requestTelegramInteraction({
+        question: command,
+        mode: { kind: "text" },
+        signal: activeAbortController.signal,
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await handler({
+        update_id: command === "/abort" ? 2 : 3,
+        message: {
+          message_id: command === "/abort" ? 102 : 103,
+          chat: { id: 42, type: "private" },
+          from: { id: 7, is_bot: false },
+          text: command,
+          reply_to_message: {
+            message_id: 101,
+            chat: { id: 42, type: "private" },
+            from: { id: 99, is_bot: true },
+          },
+        },
+      }, {});
+      assert.deepEqual(await commandPending, {
+        handled: true,
+        result: { status: "cancelled" },
+      });
+      activeAbortController = undefined;
+    }
+    assert.equal(publicCalls, 0, "private answers and reserved safety commands bypass consuming public handlers");
+    assert.equal(defaultCalls, 2, "each safety command reaches the existing default route exactly once");
+    assert.equal(stopQueueClears, 1, "only /stop clears the queue once");
+    assert.deepEqual(commandReplies, ["Aborted current turn.", "Aborted current turn."]);
+  } finally {
+    unbind();
+    runtime.shutdown();
+    Interactions.clearTelegramInteractionRuntime();
+  }
+});
 
 async function ensureRuntimeAgentDir(): Promise<string> {
   if (!runtimeAgentDir) {

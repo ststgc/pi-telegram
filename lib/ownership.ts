@@ -6,6 +6,8 @@
 
 import { getTelegramTargetKey, type TelegramTarget } from "./target.ts";
 
+export type TelegramMessageOwnershipPurpose = "interaction";
+
 export interface TelegramMessageOwnershipRecord {
   chatId: number;
   messageId: number;
@@ -13,6 +15,7 @@ export interface TelegramMessageOwnershipRecord {
   instanceId: string;
   profileKey?: string;
   ownerGeneration?: string;
+  purpose?: TelegramMessageOwnershipPurpose;
   createdAt: number;
   updatedAt: number;
 }
@@ -25,12 +28,17 @@ export interface TelegramMessageOwnershipStore {
     instanceId: string;
     profileKey?: string;
     ownerGeneration?: string;
+    purpose?: TelegramMessageOwnershipPurpose;
     now?: number;
   }) => TelegramMessageOwnershipRecord;
   get: (
     chatId: number,
     messageId: number,
   ) => TelegramMessageOwnershipRecord | undefined;
+  classify: (
+    chatId: number,
+    messageId: number,
+  ) => { purpose?: TelegramMessageOwnershipPurpose } | undefined;
   forget: (chatId: number, messageId: number) => boolean;
   forgetTarget: (target: TelegramTarget) => number;
   prune: (options: {
@@ -54,18 +62,21 @@ export interface TelegramBusMessageOwnershipRuntime {
     chatId: number;
     messageId: number;
     target?: TelegramTarget;
+    purpose?: TelegramMessageOwnershipPurpose;
   }): TelegramMessageOwnershipRecord;
   recordRouted(input: {
     chatId: number;
     messageId: number;
     target?: TelegramTarget;
     instanceId: string;
+    purpose?: TelegramMessageOwnershipPurpose;
   }): TelegramMessageOwnershipRecord;
   recordFollower(input: {
     chatId: number;
     messageId: number;
     target?: TelegramTarget;
     follower: TelegramFollowerOwnershipView;
+    purpose?: TelegramMessageOwnershipPurpose;
   }): TelegramMessageOwnershipRecord;
   isOwnedByFollower(input: {
     chatId: number;
@@ -106,6 +117,7 @@ export function createTelegramBusMessageOwnershipRuntime(deps: {
     messageId: number;
     target?: TelegramTarget;
     follower: TelegramFollowerOwnershipView;
+    purpose?: TelegramMessageOwnershipPurpose;
   }): TelegramMessageOwnershipRecord {
     return store.record({
       chatId: input.chatId,
@@ -113,6 +125,7 @@ export function createTelegramBusMessageOwnershipRuntime(deps: {
       target: input.target,
       instanceId: input.follower.instanceId,
       ownerGeneration: getTelegramFollowerOwnershipGeneration(input.follower),
+      purpose: input.purpose,
     });
   };
   return {
@@ -155,6 +168,7 @@ function createTelegramMessageOwnershipRecord(input: {
   instanceId: string;
   profileKey?: string;
   ownerGeneration?: string;
+  purpose?: TelegramMessageOwnershipPurpose;
   now: number;
   previous?: TelegramMessageOwnershipRecord;
 }): TelegramMessageOwnershipRecord {
@@ -167,6 +181,7 @@ function createTelegramMessageOwnershipRecord(input: {
     ...(input.ownerGeneration
       ? { ownerGeneration: input.ownerGeneration }
       : {}),
+    ...(input.purpose ? { purpose: input.purpose } : {}),
     createdAt: input.previous?.createdAt ?? input.now,
     updatedAt: input.now,
   };
@@ -214,6 +229,18 @@ export function createTelegramMessageOwnershipStore(
         return undefined;
       }
       return record;
+    },
+    classify: (chatId, messageId) => {
+      const record = records.get(
+        getTelegramMessageOwnershipKey(
+          chatId,
+          messageId,
+          options.getProfileKey?.(),
+        ),
+      );
+      return record
+        ? { ...(record.purpose ? { purpose: record.purpose } : {}) }
+        : undefined;
     },
     forget: (chatId, messageId) =>
       records.delete(

@@ -1342,6 +1342,9 @@ test("Locked polling runtime registers as follower when another live owner block
         );
         return true;
       },
+      onAuthorityAcquired: async () => {
+        events.push("authority");
+      },
       startPolling: async () => {
         events.push("start");
       },
@@ -1358,6 +1361,7 @@ test("Locked polling runtime registers as follower when another live owner block
     assert.equal(result.message, undefined);
     assert.deepEqual(events, [
       `register:/repo:owner-inst:${join(temp.dir, "bus.sock")}`,
+      "authority",
       "status",
     ]);
   } finally {
@@ -2223,6 +2227,9 @@ test("Locked polling runtime stops after ownership loss without live context", a
       stopPolling: async () => {
         events.push("stop");
       },
+      onOwnershipLoss: () => {
+        events.push("interaction:invalidate");
+      },
       updateStatus: () => {
         events.push("status");
       },
@@ -2237,7 +2244,12 @@ test("Locked polling runtime stops after ownership loss without live context", a
     assert.equal((await runtime.start(ctx)).ok, true);
     writeFileSync(temp.path, JSON.stringify({}));
     await waitForCondition(() => events.includes("stop"));
-    assert.deepEqual(events, ["start", "status", "stop"]);
+    assert.deepEqual(events, [
+      "start",
+      "status",
+      "interaction:invalidate",
+      "stop",
+    ]);
     assert.deepEqual(runtimeEvents, []);
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
@@ -2322,6 +2334,9 @@ test("Locked polling runtime resumes stale same-cwd ownership after process rest
     const runtime = createTelegramLockedPollingRuntime({
       lock,
       hasBotToken: () => true,
+      onAuthorityAcquired: async () => {
+        events.push("authority");
+      },
       startPolling: async () => {
         events.push("start");
       },
@@ -2334,7 +2349,7 @@ test("Locked polling runtime resumes stale same-cwd ownership after process rest
     });
     await runtime.onSessionStart({}, { cwd: "/repo" });
     await waitForCondition(() => events.includes("status"));
-    assert.deepEqual(events, ["start", "status"]);
+    assert.deepEqual(events, ["authority", "start", "status"]);
     assert.deepEqual(readLocks(temp.path)[TELEGRAM_LOCK_KEY], {
       pid: 10,
       cwd: "/repo",

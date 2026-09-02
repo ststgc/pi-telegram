@@ -148,6 +148,8 @@ export interface TelegramUpdateMessage {
   from?: TelegramUser;
   message_id?: number;
   message_thread_id?: number;
+  text?: string;
+  reply_to_message?: TelegramUpdateMessage;
   forum_topic_created?: unknown;
   forum_topic_closed?: unknown;
   forum_topic_reopened?: unknown;
@@ -195,6 +197,7 @@ export interface TelegramCallbackQuery {
   id?: string;
   from: TelegramUser;
   message?: TelegramUpdateMessage;
+  data?: string;
 }
 
 export interface TelegramGuestMessage {
@@ -216,6 +219,7 @@ export function getTelegramMessageTarget(
 }
 
 export interface TelegramUpdateRouting {
+  update_id?: number;
   message?: TelegramUpdateMessage;
   edited_message?: TelegramUpdateMessage;
   callback_query?: TelegramCallbackQuery;
@@ -270,12 +274,18 @@ export interface TelegramMessageOwnershipView {
   instanceId: string;
   ownerGeneration?: string;
   target?: TelegramTarget;
+  purpose?: "interaction";
 }
 
 export type TelegramMessageOwnershipLookup = (
   chatId: number,
   messageId: number,
 ) => TelegramMessageOwnershipView | undefined;
+
+export type TelegramMessageOwnershipClassificationLookup = (
+  chatId: number,
+  messageId: number,
+) => { purpose?: "interaction" } | undefined;
 
 export interface TelegramTargetOwnershipView {
   instanceId: string;
@@ -297,6 +307,12 @@ export interface TelegramForeignOwnedUpdateForwarder<
   TCallbackQuery extends TelegramCallbackQuery = TelegramCallbackQuery,
   TMessage extends TelegramUpdateMessage = TelegramUpdateMessage,
 > {
+  forwardUpdate?: (input: {
+    update: { update_id: number };
+    profile: string;
+    target: TelegramTarget;
+    ownership: TelegramMessageOwnershipView;
+  }) => Promise<TelegramFollowerForwardingResult | undefined> | TelegramFollowerForwardingResult | undefined;
   forwardCallback?: (input: {
     query: TCallbackQuery;
     ownership: TelegramMessageOwnershipView;
@@ -1688,11 +1704,234 @@ export interface TelegramUnpairedUpdateGateDeps<TContext> {
   ) => void;
 }
 
+/** @internal */
+export interface TelegramInteractionPriorityHandleDeps<
+  TContext,
+  TCallbackQuery extends TelegramCallbackQuery = TelegramCallbackQuery,
+  TMessage extends TelegramUpdateMessage = TelegramUpdateMessage,
+> {
+  getCurrentInstanceId(): string | undefined;
+  getCurrentProfile(): string;
+  getMessageOwnership: TelegramMessageOwnershipLookup;
+  classifyMessageOwnership: TelegramMessageOwnershipClassificationLookup;
+  isInteractionPending(): boolean;
+  foreignOwnedUpdateForwarder?: TelegramForeignOwnedUpdateForwarder<
+    TContext,
+    TelegramMessageReactionUpdated,
+    TCallbackQuery,
+    TMessage
+  >;
+  prepareCallback(input: {
+    kind: "callback";
+    target: TelegramTarget;
+    callbackData: string;
+    messageId: number;
+  }): {
+    acknowledgement: string;
+    commit(): Promise<{ handled: boolean; message?: string }>;
+  };
+  handleInput(input: {
+    kind: "text";
+    target: TelegramTarget;
+    text: string;
+    messageId: number;
+    replyToMessageId: number;
+  }): Promise<{ handled: boolean; message?: string }>;
+  answerCallbackQuery(callbackQueryId: string, text: string): Promise<unknown>;
+}
+
+function areTelegramPriorityTargetsEqual(
+  left: TelegramTarget,
+  right: TelegramTarget,
+): boolean {
+  return left.chatId === right.chatId && left.threadId === right.threadId;
+}
+
+/**
+ * Private interaction answer route. The caller must invoke this only after the
+ * exact pairing-proof and paired-sender authorization boundary.
+ * @internal
+ */
+export function createTelegramInteractionPriorityHandle<
+  TUpdate extends TelegramUpdateRouting,
+  TContext,
+  TCallbackQuery extends TelegramCallbackQuery = NonNullable<
+    TUpdate["callback_query"]
+  >,
+  TMessage extends TelegramUpdateMessage = NonNullable<TUpdate["message"]>,
+>(deps: TelegramInteractionPriorityHandleDeps<
+  TContext,
+  TCallbackQuery,
+  TMessage
+>): (
+  update: TUpdate,
+  ctx: TContext,
+) => Promise<
+  "pass" | "route-to-default" | TelegramInboundHandlingOutcome
+> {
+  const expired = "This interaction has expired.";
+  const completed = (): TelegramInboundHandlingOutcome => ({
+    kind: "completed",
+    reason: "callback",
+  });
+  return async (update, _ctx) => {
+    const query = update.callback_query as TCallbackQuery | undefined;
+    if (query?.data?.startsWith("interact:")) {
+      const callbackId = getTelegramCallbackQueryId(query);
+      const callbackTarget = query.message
+        ? getTelegramMessageTarget(query.message)
+        : undefined;
+      const callbackMessage = getTelegramCallbackMessageTarget(query);
+      const ownership = callbackMessage
+        ? deps.getMessageOwnership(
+            callbackMessage.chatId,
+            callbackMessage.messageId,
+          )
+        : undefined;
+      const hasExplicitCallbackThread =
+        query.message?.message_thread_id !== undefined;
+      if (
+        callbackTarget &&
+        ownership?.target &&
+        (callbackTarget.chatId !== ownership.target.chatId ||
+          (hasExplicitCallbackThread &&
+            !areTelegramPriorityTargetsEqual(callbackTarget, ownership.target)))
+      ) {
+        if (callbackId) await deps.answerCallbackQuery(callbackId, expired);
+        return completed();
+      }
+      const target = ownership?.target ?? callbackTarget;
+      const messageId = callbackMessage?.messageId;
+      const currentInstanceId = deps.getCurrentInstanceId();
+      if (
+        ownership &&
+        currentInstanceId &&
+        ownership.instanceId !== currentInstanceId
+      ) {
+        const updateId = (update as { update_id?: unknown }).update_id;
+        const forwarded =
+          ownership.ownerGeneration &&
+          target &&
+          Number.isSafeInteger(updateId) &&
+          (updateId as number) >= 0
+            ? await deps.foreignOwnedUpdateForwarder?.forwardUpdate?.({
+                update: update as TUpdate & { update_id: number },
+                profile: deps.getCurrentProfile(),
+                target,
+                ownership,
+              })
+            : undefined;
+        if (!forwarded && callbackId) {
+          await deps.answerCallbackQuery(callbackId, expired);
+        }
+        return completed();
+      }
+      if (!target || messageId === undefined) {
+        if (callbackId) await deps.answerCallbackQuery(callbackId, expired);
+        return completed();
+      }
+      const prepared = deps.prepareCallback({
+        kind: "callback",
+        target,
+        callbackData: query.data,
+        messageId,
+      });
+      if (callbackId) {
+        try {
+          await deps.answerCallbackQuery(
+            callbackId,
+            prepared.acknowledgement,
+          );
+        } catch {
+          // The one-use callback remains consumed even if Telegram rejects ACK.
+        }
+      }
+      await prepared.commit();
+      return completed();
+    }
+
+    const message = update.message as TMessage | undefined;
+    if (!message || typeof message.text !== "string") return "pass";
+    const command = message.text
+      .trimStart()
+      .split(/\s+/, 1)[0]
+      ?.split("@", 1)[0];
+    if (command?.startsWith("/")) {
+      return deps.isInteractionPending() &&
+          (command === "/abort" || command === "/stop")
+        ? "route-to-default"
+        : "pass";
+    }
+    const reply = message.reply_to_message;
+    if (
+      !reply?.from?.is_bot ||
+      typeof message.chat.id !== "number" ||
+      typeof message.message_id !== "number" ||
+      typeof reply.message_id !== "number"
+    ) {
+      return "pass";
+    }
+    const ownership = deps.getMessageOwnership(
+      message.chat.id,
+      reply.message_id,
+    );
+    if (ownership?.purpose !== "interaction") {
+      return deps.classifyMessageOwnership(
+        message.chat.id,
+        reply.message_id,
+      )?.purpose === "interaction"
+        ? completed()
+        : "pass";
+    }
+    const messageTarget = getTelegramMessageTarget(message);
+    const ownershipTarget = ownership.target;
+    if (
+      !messageTarget ||
+      (ownershipTarget &&
+        !areTelegramPriorityTargetsEqual(messageTarget, ownershipTarget))
+    ) {
+      return completed();
+    }
+    const currentInstanceId = deps.getCurrentInstanceId();
+    if (!currentInstanceId) return completed();
+    if (ownership.instanceId !== currentInstanceId) {
+      const updateId = (update as { update_id?: unknown }).update_id;
+      if (
+        ownership.ownerGeneration &&
+        Number.isSafeInteger(updateId) &&
+        (updateId as number) >= 0
+      ) {
+        await deps.foreignOwnedUpdateForwarder?.forwardUpdate?.({
+          update: update as TUpdate & { update_id: number },
+          profile: deps.getCurrentProfile(),
+          target: ownershipTarget ?? messageTarget,
+          ownership,
+        });
+      }
+      return completed();
+    }
+    await deps.handleInput({
+      kind: "text",
+      target: ownershipTarget ?? messageTarget,
+      text: message.text,
+      messageId: message.message_id,
+      replyToMessageId: reply.message_id,
+    });
+    return completed();
+  };
+}
+
 export interface TelegramUpdateHandlerWrapDeps<TUpdate, TContext> {
   defaultHandle: (
     update: TUpdate,
     ctx: TContext,
   ) => Promise<TelegramInboundHandlingOutcome>;
+  priorityHandle?: (
+    update: TUpdate,
+    ctx: TContext,
+  ) => Promise<
+    "pass" | "route-to-default" | TelegramInboundHandlingOutcome
+  >;
   pairingGate: TelegramUnpairedUpdateGateDeps<TContext>;
   registry?: TelegramUpdateHandlerRegistry;
   recordRuntimeEvent?: (
@@ -1796,6 +2035,13 @@ export function createTelegramUpdateHandle<TUpdate, TContext>(
       return { kind: "completed", reason: "unauthorized" };
     }
     if (senderId === allowedUserId) {
+      const priorityOutcome = await deps.priorityHandle?.(update, ctx);
+      if (priorityOutcome === "route-to-default") {
+        return defaultHandle(update, ctx);
+      }
+      if (priorityOutcome && priorityOutcome !== "pass") {
+        return priorityOutcome;
+      }
       const verdict = await registry.dispatch(
         update,
         (handlerId, handlerCategory) => {

@@ -151,6 +151,7 @@ test("Message ownership isolates bot profiles and rejects stale follower generat
 
   profileKey = "personal";
   assert.equal(store.get(7, 9), undefined);
+  assert.equal(store.classify(7, 9), undefined);
   store.record({
     chatId: 7,
     messageId: 9,
@@ -179,4 +180,27 @@ test("Message ownership prunes by age and record count", () => {
     store.entries().map((record) => record.messageId),
     [3],
   );
+});
+
+test("Interaction ownership purpose remains narrow and generation fenced", () => {
+  let followers = [{ instanceId: "follower", connectedAtMs: 1, registrationGeneration: "gen-a" }];
+  const runtime = createTelegramBusMessageOwnershipRuntime({
+    instanceId: "leader",
+    getProfileKey: () => "default",
+    listFollowers: () => followers,
+  });
+  const record = runtime.recordFollower({
+    chatId: 7,
+    messageId: 10,
+    target: { chatId: 7, threadId: 42 },
+    follower: followers[0]!,
+    purpose: "interaction",
+  });
+  assert.equal(record.purpose, "interaction");
+  assert.equal(record.ownerGeneration, "gen-a");
+  followers = [{ instanceId: "follower", connectedAtMs: 2, registrationGeneration: "gen-b" }];
+  assert.equal(runtime.store.get(7, 10), undefined);
+  assert.deepEqual(runtime.store.classify(7, 10), { purpose: "interaction" });
+  assert.equal(runtime.store.forget(7, 10), true);
+  assert.equal(runtime.store.classify(7, 10), undefined);
 });

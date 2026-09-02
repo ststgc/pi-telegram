@@ -4,7 +4,7 @@
 
 The Telegram Activity API lets trusted extension consumers observe normalized Pi work lifecycle without importing pi-telegram internals, correlating raw Pi events with bridge state, or capturing session contexts.
 
-It is a higher-level event surface over the [Telegram Delivery API](./delivery.md). Activity owns lifecycle normalization and event routing; delivery owns target authorization, rendering transport, ordering, chunk reconciliation, and stale-generation behavior.
+It is a higher-level event surface over the [Telegram Delivery API](./delivery.md). Activity owns lifecycle normalization and event routing; delivery owns target authorization, rendering transport, ordering, chunk reconciliation, and stale-generation behavior. Active-turn questions and native-typing waiting leases belong to the separate [Telegram Interactions API](./interactions.md), not Activity.
 
 The public membrane is:
 
@@ -270,6 +270,7 @@ The Activity API does not:
 - Expose signed/redacted reasoning metadata.
 - Render raw tool arguments or results automatically.
 - Replace assistant final replies or Rich Draft previews.
+- Mirror arbitrary `ctx.ui` calls, request answers, or settle interaction Promises.
 - Mutate queues, models, thinking levels, sessions, or process state.
 - Expose Telegram clients, bot tokens, Pi contexts, or private runtime objects.
 - Block Pi lifecycle on extension handlers or Telegram delivery.

@@ -4,7 +4,11 @@
  * Owns the public extension delivery contract, authorized scope resolution, operational rendering adapter, per-target serialization, chunk reconciliation, generation-fenced logical handles, and process-local runtime membrane; composes the established reply renderer with bus-aware Telegram API ports and excludes bot clients, Pi contexts, and consumer-extension policy
  */
 
-import { markTelegramBusAggregateDelivery } from "./bus.ts";
+import {
+  markTelegramBusAggregateDelivery,
+  markTelegramBusInteractionDelivery,
+} from "./bus.ts";
+import type { TelegramMessageOwnershipPurpose } from "./ownership.ts";
 import {
   assertTelegramInlineKeyboardCallbackData,
   type TelegramInlineKeyboardMarkup,
@@ -35,6 +39,13 @@ class TelegramDeliveryAuthorityLostAfterStartError extends Error {
   constructor() {
     super("Telegram Delivery authority was lost after mutation start.");
     this.name = "TelegramDeliveryAuthorityLostAfterStartError";
+  }
+}
+
+class TelegramDeliveryMutationCancelledError extends Error {
+  constructor() {
+    super("Telegram Delivery mutation was cancelled.");
+    this.name = "TelegramDeliveryMutationCancelledError";
   }
 }
 
@@ -84,6 +95,15 @@ export interface SendTelegramViewOptions {
   replyToMessageId?: number;
 }
 
+interface TelegramDeliverySendOptions extends SendTelegramViewOptions {
+  ownershipPurpose?: TelegramMessageOwnershipPurpose;
+}
+
+/** @internal */
+export interface TelegramDeliveryMutationOptions {
+  signal?: AbortSignal;
+}
+
 export type TelegramDeliveryChatAction =
   "typing" | "upload_document" | "upload_photo" | "record_voice";
 
@@ -93,14 +113,16 @@ export interface TelegramDeliveryRuntime {
   shutdown: () => void;
   sendView: (
     view: TelegramDeliveryView,
-    options: SendTelegramViewOptions,
+    options: TelegramDeliverySendOptions,
   ) => Promise<TelegramDeliveryResult<TelegramDeliveryHandle>>;
   editView: (
     handle: TelegramDeliveryHandle,
     view: TelegramDeliveryView,
+    options?: TelegramDeliveryMutationOptions,
   ) => Promise<TelegramDeliveryResult<TelegramDeliveryHandle>>;
   deleteView: (
     handle: TelegramDeliveryHandle,
+    options?: TelegramDeliveryMutationOptions,
   ) => Promise<TelegramDeliveryResult<void>>;
   sendChatAction: (
     action: TelegramDeliveryChatAction,
@@ -126,6 +148,7 @@ export interface TelegramDeliveryRenderedChunk {
 export interface TelegramDeliveryTransportOptions {
   replyToMessageId?: number;
   replyMarkup?: TelegramInlineKeyboardMarkup | null;
+  ownershipPurpose?: TelegramMessageOwnershipPurpose;
 }
 
 /** @internal */
@@ -174,6 +197,7 @@ export interface TelegramBridgeDeliveryRuntimeDeps {
     chatId: number;
     messageId: number;
     target: TelegramDeliveryTarget;
+    purpose?: TelegramMessageOwnershipPurpose;
   }) => void;
   recordFailure?: TelegramDeliveryRuntimeDeps["recordFailure"];
 }
@@ -403,18 +427,45 @@ function createTelegramDeliveryTargetQueue() {
   return async function run<T>(
     target: TelegramDeliveryTarget,
     operation: () => Promise<T>,
+    signal?: AbortSignal,
   ): Promise<T> {
+    if (signal?.aborted) throw new TelegramDeliveryMutationCancelledError();
     const key = targetKey(target);
     const previous = queues.get(key) ?? Promise.resolve();
-    const current = previous.then(operation, operation);
-    const settled = current.then(
+    const current = previous.then(
+      async () => {
+        if (signal?.aborted) throw new TelegramDeliveryMutationCancelledError();
+        return operation();
+      },
+      async () => {
+        if (signal?.aborted) throw new TelegramDeliveryMutationCancelledError();
+        return operation();
+      },
+    );
+    let removeAbortListener: (() => void) | undefined;
+    const released = signal
+      ? Promise.race([
+          current,
+          new Promise<never>((_resolve, reject) => {
+            const onAbort = (): void => {
+              reject(new TelegramDeliveryMutationCancelledError());
+            };
+            signal.addEventListener("abort", onAbort, { once: true });
+            removeAbortListener = () =>
+              signal.removeEventListener("abort", onAbort);
+            if (signal.aborted) onAbort();
+          }),
+        ])
+      : current;
+    const settled = released.then(
       () => {},
       () => {},
     );
     queues.set(key, settled);
     try {
-      return await current;
+      return await released;
     } finally {
+      removeAbortListener?.();
       if (queues.get(key) === settled) queues.delete(key);
     }
   };
@@ -426,11 +477,13 @@ function getChunkTransportOptions(
   chunkCount: number,
   replyToMessageId?: number,
   editing = false,
+  ownershipPurpose?: TelegramMessageOwnershipPurpose,
 ): TelegramDeliveryTransportOptions {
   const isFirst = index === 0;
   const isLast = index === chunkCount - 1;
   return {
     ...(isFirst && replyToMessageId !== undefined ? { replyToMessageId } : {}),
+    ...(ownershipPurpose ? { ownershipPurpose } : {}),
     ...(isLast
       ? { replyMarkup: view.replyMarkup ?? (editing ? null : undefined) }
       : editing
@@ -446,7 +499,11 @@ export function createTelegramDeliveryRuntime(
   let active = true;
   const handleBindings = new WeakMap<
     TelegramDeliveryHandle,
-    { target: TelegramDeliveryTarget; messageIds: readonly number[] }
+    {
+      target: TelegramDeliveryTarget;
+      messageIds: readonly number[];
+      ownershipPurpose?: TelegramMessageOwnershipPurpose;
+    }
   >();
   const runForTarget = createTelegramDeliveryTargetQueue();
   const render = (
@@ -472,6 +529,14 @@ export function createTelegramDeliveryRuntime(
       "runtime-unavailable",
       "Telegram delivery runtime generation is inactive.",
     );
+  const assertMutationActive = (signal?: AbortSignal): void => {
+    if (signal?.aborted) throw new TelegramDeliveryMutationCancelledError();
+  };
+  const cancelled = <T>(): TelegramDeliveryResult<T> =>
+    failure(
+      "transport-failed",
+      "Telegram delivery mutation was cancelled before completion.",
+    );
   const transportFailure = <T>(
     operation: "send" | "edit" | "delete" | "chat-action",
     error: unknown,
@@ -496,6 +561,7 @@ export function createTelegramDeliveryRuntime(
   const createHandle = (
     target: TelegramDeliveryTarget,
     messageIds: readonly number[],
+    ownershipPurpose?: TelegramMessageOwnershipPurpose,
   ): TelegramDeliveryHandle => {
     const canonicalTarget = Object.freeze(cloneTarget(target));
     const canonicalMessageIds = Object.freeze([...messageIds]);
@@ -507,6 +573,7 @@ export function createTelegramDeliveryRuntime(
     handleBindings.set(handle, {
       target: canonicalTarget,
       messageIds: canonicalMessageIds,
+      ...(ownershipPurpose ? { ownershipPurpose } : {}),
     });
     return handle;
   };
@@ -515,6 +582,7 @@ export function createTelegramDeliveryRuntime(
   ): TelegramDeliveryResult<{
     target: TelegramDeliveryTarget;
     messageIds: readonly number[];
+    ownershipPurpose?: TelegramMessageOwnershipPurpose;
   }> => {
     if (!active) return inactive();
     const binding = handleBindings.get(handle);
@@ -559,12 +627,17 @@ export function createTelegramDeliveryRuntime(
                 index,
                 rendered.value.length,
                 options.replyToMessageId,
+                false,
+                options.ownershipPurpose,
               ),
             );
             messageIds.push(messageId);
             if (!active) return inactive();
           }
-          return { ok: true, value: createHandle(target, messageIds) };
+          return {
+            ok: true,
+            value: createHandle(target, messageIds, options.ownershipPurpose),
+          };
         } catch (error) {
           return (
               active ||
@@ -575,14 +648,14 @@ export function createTelegramDeliveryRuntime(
                 error,
                 target,
                 messageIds.length > 0
-                  ? createHandle(target, messageIds)
+                  ? createHandle(target, messageIds, options.ownershipPurpose)
                   : undefined,
               )
             : inactive();
         }
       });
     },
-    async editView(handle, view) {
+    async editView(handle, view, options) {
       const resolved = resolveHandle(handle);
       if (!resolved.ok) return failure(resolved.reason, resolved.message);
       const rendered = render(view);
@@ -590,6 +663,7 @@ export function createTelegramDeliveryRuntime(
       const target = resolved.value.target;
       return runForTarget(target, async () => {
         if (!active) return inactive();
+        assertMutationActive(options?.signal);
         const visibleMessageIds = [...resolved.value.messageIds];
         try {
           const sharedCount = Math.min(
@@ -598,6 +672,7 @@ export function createTelegramDeliveryRuntime(
           );
           for (let index = 0; index < sharedCount; index += 1) {
             if (!active) return inactive();
+            assertMutationActive(options?.signal);
             await deps.editChunk(
               target,
               visibleMessageIds[index]!,
@@ -608,9 +683,11 @@ export function createTelegramDeliveryRuntime(
                 rendered.value.length,
                 undefined,
                 true,
+                resolved.value.ownershipPurpose,
               ),
             );
             if (!active) return inactive();
+            assertMutationActive(options?.signal);
           }
           for (
             let index = sharedCount;
@@ -618,59 +695,87 @@ export function createTelegramDeliveryRuntime(
             index += 1
           ) {
             if (!active) return inactive();
+            assertMutationActive(options?.signal);
             visibleMessageIds.push(
               await deps.sendChunk(
                 target,
                 rendered.value[index]!,
-                getChunkTransportOptions(view, index, rendered.value.length),
+                getChunkTransportOptions(
+                  view,
+                  index,
+                  rendered.value.length,
+                  undefined,
+                  false,
+                  resolved.value.ownershipPurpose,
+                ),
               ),
             );
             if (!active) return inactive();
+            assertMutationActive(options?.signal);
           }
           const removedMessageIds = visibleMessageIds.slice(
             rendered.value.length,
           );
           for (const messageId of removedMessageIds) {
             if (!active) return inactive();
+            assertMutationActive(options?.signal);
             await deps.deleteMessage(target, messageId);
-            visibleMessageIds.splice(visibleMessageIds.indexOf(messageId), 1);
             if (!active) return inactive();
+            assertMutationActive(options?.signal);
+            visibleMessageIds.splice(visibleMessageIds.indexOf(messageId), 1);
           }
           return {
             ok: true,
-            value: createHandle(target, visibleMessageIds),
+            value: createHandle(
+              target,
+              visibleMessageIds,
+              resolved.value.ownershipPurpose,
+            ),
           };
         } catch (error) {
+          if (error instanceof TelegramDeliveryMutationCancelledError) {
+            return cancelled();
+          }
           return active
             ? transportFailure(
                 "edit",
                 error,
                 target,
-                createHandle(target, visibleMessageIds),
+                createHandle(
+                  target,
+                  visibleMessageIds,
+                  resolved.value.ownershipPurpose,
+                ),
               )
             : inactive();
         }
-      });
+      }, options?.signal);
     },
-    async deleteView(handle) {
+    async deleteView(handle, options) {
       const resolved = resolveHandle(handle);
       if (!resolved.ok) return failure(resolved.reason, resolved.message);
       const target = resolved.value.target;
       return runForTarget(target, async () => {
         if (!active) return inactive();
+        assertMutationActive(options?.signal);
         try {
           for (const messageId of resolved.value.messageIds) {
             if (!active) return inactive();
+            assertMutationActive(options?.signal);
             await deps.deleteMessage(target, messageId);
             if (!active) return inactive();
+            assertMutationActive(options?.signal);
           }
           return { ok: true, value: undefined };
         } catch (error) {
+          if (error instanceof TelegramDeliveryMutationCancelledError) {
+            return cancelled();
+          }
           return active
             ? transportFailure("delete", error, target)
             : inactive();
         }
-      });
+      }, options?.signal);
     },
     async sendChatAction(action, scope) {
       if (!active) return inactive();
@@ -749,10 +854,13 @@ export function createTelegramBridgeDeliveryRuntime(
         ...(options.replyMarkup ? { reply_markup: options.replyMarkup } : {}),
       };
       try {
+        const purposeBody = options.ownershipPurpose === "interaction"
+          ? markTelegramBusInteractionDelivery(body)
+          : body;
         const sent = await deps.api.sendMessage(
           target.threadId === undefined
-            ? markTelegramBusAggregateDelivery(body)
-            : body,
+            ? markTelegramBusAggregateDelivery(purposeBody)
+            : purposeBody,
         );
         assertTransportActive(true);
         if (!Number.isSafeInteger(sent.message_id) || sent.message_id <= 0) {
@@ -764,6 +872,9 @@ export function createTelegramBridgeDeliveryRuntime(
             chatId: target.chatId,
             messageId: sent.message_id,
             target,
+            ...(options.ownershipPurpose
+              ? { purpose: options.ownershipPurpose }
+              : {}),
           });
         } catch (error) {
           deps.recordFailure?.("send", error, target);
@@ -868,6 +979,18 @@ export async function sendTelegramView(
   const invalid = validateView<TelegramDeliveryHandle>(view);
   if (invalid) return invalid;
   return runDeliveryOperation((runtime) => runtime.sendView(view, options));
+}
+
+/** @internal */
+export async function sendTelegramInteractionView(
+  view: TelegramDeliveryView,
+  options: SendTelegramViewOptions,
+): Promise<TelegramDeliveryResult<TelegramDeliveryHandle>> {
+  const invalid = validateView<TelegramDeliveryHandle>(view);
+  if (invalid) return invalid;
+  return runDeliveryOperation((runtime) =>
+    runtime.sendView(view, { ...options, ownershipPurpose: "interaction" }),
+  );
 }
 
 export async function editTelegramView(

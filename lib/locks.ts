@@ -1142,6 +1142,8 @@ export interface TelegramLockedPollingRuntimeDeps<
     owner: TelegramLockEntry,
   ) => boolean | undefined | Promise<boolean | undefined>;
   stopFollowerRegistration?: () => void;
+  onAuthorityAcquired?: (ctx: TContext) => Promise<void> | void;
+  onOwnershipLoss?: () => void;
   updateStatus: (ctx: TContext) => void;
   recordRuntimeEvent?: (
     category: string,
@@ -1191,6 +1193,13 @@ export function createTelegramLockedPollingRuntime<
   };
   const stopAfterOwnershipLoss = () => {
     if (ownershipStop) return;
+    try {
+      deps.onOwnershipLoss?.();
+    } catch (error) {
+      deps.recordRuntimeEvent?.("lock", error, {
+        phase: "ownership-loss-invalidation",
+      });
+    }
     stopOwnershipWatcher();
     ownershipStop = deps
       .stopPolling()
@@ -1233,6 +1242,7 @@ export function createTelegramLockedPollingRuntime<
         stopOwnershipWatcher();
         return false;
       }
+      await deps.onAuthorityAcquired?.(ctx);
       await options.onAcquired?.();
       await deps.startPolling(ctx, options);
     } catch (error) {
@@ -1303,6 +1313,12 @@ export function createTelegramLockedPollingRuntime<
               acquired.lock,
             );
             if (registered) {
+              try {
+                await deps.onAuthorityAcquired?.(ctx);
+              } catch (error) {
+                deps.stopFollowerRegistration?.();
+                throw error;
+              }
               deps.updateStatus(ctx);
               return { ok: true, canTakeover: false };
             }

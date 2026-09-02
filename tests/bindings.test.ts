@@ -202,6 +202,7 @@ test("Named profile connect completes old teardown before activating new identit
   const harness = createBindingApiHarness();
   const events: string[] = [];
   let activeProfileName: string | undefined = "active";
+  let authorityInvalidated = false;
   let stopCompleted = false;
   registerTelegramCommandsAndTools({
     pi: harness.api,
@@ -235,10 +236,18 @@ test("Named profile connect completes old teardown before activating new identit
         return { ok: true };
       },
       stop: async () => {
+        assert.equal(authorityInvalidated, true);
         events.push(`stop:${activeProfileName}`);
         await Promise.resolve();
         stopCompleted = true;
       },
+    },
+    invalidateTransportAuthority: () => {
+      events.push(`invalidate:${activeProfileName}`);
+      authorityInvalidated = true;
+    },
+    rebindTransportAuthority: () => {
+      events.push(`rebind:${activeProfileName}`);
     },
     resumeDurableOutboundWorker: async () => {
       events.push("worker:resume");
@@ -264,12 +273,68 @@ test("Named profile connect completes old teardown before activating new identit
   assert.equal(activeProfileName, "work");
   assert.deepEqual(events, [
     "load",
+    "invalidate:active",
     "stop:active",
     "activate:work",
+    "rebind:work",
     "start:work",
     "worker:resume",
     "status",
   ]);
+});
+
+test("Disconnect invalidates interaction authority before stop and rebinds the published state", async () => {
+  const harness = createBindingApiHarness();
+  const events: string[] = [];
+  let invalidated = false;
+  registerTelegramCommandsAndTools({
+    pi: harness.api,
+    configStore: {
+      get: () => ({ botToken: "token" }),
+      getStoredConfig: () => ({ profiles: { default: { botToken: "token" } } }),
+      getActiveProfileName: () => undefined,
+      activateProfile: () => true,
+      getAllowedUserId: () => 840585,
+      getOutboundHandlers: () => [],
+      hasBotToken: () => true,
+      load: async () => undefined,
+      persist: async () => undefined,
+      set: () => undefined,
+    },
+    setup: { start: () => true, finish: () => undefined },
+    activeTurnRuntime: { get: () => undefined },
+    lockedPollingRuntime: {
+      start: async () => ({ ok: true }),
+      stop: async () => {
+        assert.equal(invalidated, true);
+        events.push("stop");
+      },
+    },
+    invalidateTransportAuthority: () => {
+      invalidated = true;
+      events.push("invalidate");
+    },
+    rebindTransportAuthority: () => events.push("rebind"),
+    resumeDurableOutboundWorker: async () => undefined,
+    getStatusLines: () => [],
+    buttonActionStore: { register: () => "button-action" },
+    sendMarkdownReply: async () => 1,
+    callMultipart: async () => ({ ok: true }),
+    getDefaultChatId: () => 840585,
+    canSendDirect: () => true,
+    updateStatus: () => events.push("status"),
+    recordRuntimeEvent: () => undefined,
+  } as unknown as Parameters<typeof registerTelegramCommandsAndTools>[0]);
+
+  const disconnect = harness.commands.get("telegram-disconnect") as {
+    handler: (args: string, ctx: ExtensionContext) => Promise<void>;
+  };
+  await disconnect.handler("", {
+    cwd: "/repo",
+    ui: { notify: () => undefined },
+  } as unknown as ExtensionContext);
+
+  assert.deepEqual(events, ["invalidate", "stop", "rebind", "status"]);
 });
 
 test("Named profile setup cancellation preserves the active runtime", async () => {
@@ -351,6 +416,206 @@ test("Named profile setup cancellation preserves the active runtime", async () =
   assert.deepEqual(notifications, []);
 });
 
+test("Named profile setup invalidates before stop/publication and rebinds only after publication", async (t) => {
+  const harness = createBindingApiHarness();
+  const events: string[] = [];
+  let invalidated = false;
+  let activeProfileName: string | undefined = "active";
+  const profiles: Record<string, { botToken?: string; botId?: number; botUsername?: string }> = {
+    active: { botToken: "111111:ACTIVE" },
+  };
+  t.mock.method(globalThis, "fetch", async () =>
+    new Response(JSON.stringify({
+      ok: true,
+      result: {
+        id: 7,
+        is_bot: true,
+        first_name: "Bridge",
+        username: "bridge_bot",
+      },
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+  registerTelegramCommandsAndTools({
+    pi: harness.api,
+    configStore: {
+      get: () => ({ ...profiles[activeProfileName ?? "default"] }),
+      getStoredConfig: () => ({ profiles: { ...profiles } }),
+      getActiveProfileName: () => activeProfileName,
+      activateProfile: (profileName?: string) => {
+        events.push(`activate:${profileName ?? "default"}`);
+        activeProfileName = profileName;
+        return !profileName || !!profiles[profileName];
+      },
+      setProfile: (profileName: string, profile: (typeof profiles)[string]) => {
+        assert.equal(invalidated, true);
+        events.push(`publish:${profileName}`);
+        profiles[profileName] = { ...profile };
+      },
+      getAllowedUserId: () => 840585,
+      getOutboundHandlers: () => [],
+      hasBotToken: () => !!profiles[activeProfileName ?? "default"]?.botToken,
+      load: async () => events.push("load"),
+      persist: async () => undefined,
+      set: () => undefined,
+    },
+    persistConfig: async () => events.push(`persist:${activeProfileName}`),
+    getPairingInstructions: async () => undefined,
+    setup: { start: () => true, finish: () => events.push("guard:finish") },
+    activeTurnRuntime: { get: () => undefined },
+    lockedPollingRuntime: {
+      start: async () => {
+        events.push(`start:${activeProfileName}`);
+        return { ok: true };
+      },
+      stop: async () => {
+        assert.equal(invalidated, true);
+        events.push(`stop:${activeProfileName}`);
+      },
+    },
+    invalidateTransportAuthority: () => {
+      invalidated = true;
+      events.push(`invalidate:${activeProfileName}`);
+    },
+    rebindTransportAuthority: () => events.push(`rebind:${activeProfileName}`),
+    resumeDurableOutboundWorker: async () => events.push("worker:resume"),
+    getStatusLines: () => [],
+    buttonActionStore: { register: () => "button-action" },
+    sendMarkdownReply: async () => 1,
+    callMultipart: async () => ({ ok: true }),
+    getDefaultChatId: () => 840585,
+    canSendDirect: () => true,
+    updateStatus: () => events.push("status"),
+    recordRuntimeEvent: () => undefined,
+  } as unknown as Parameters<typeof registerTelegramCommandsAndTools>[0]);
+
+  const setupCommand = harness.commands.get("telegram-setup") as {
+    handler: (args: string, ctx: ExtensionContext) => Promise<void>;
+  };
+  await setupCommand.handler("work", {
+    cwd: "/repo",
+    hasUI: true,
+    ui: {
+      input: async () => "222222:WORK",
+      editor: async () => "222222:WORK",
+      notify: () => undefined,
+    },
+  } as unknown as ExtensionContext);
+
+  assert.deepEqual(events.slice(0, 8), [
+    "invalidate:active",
+    "stop:active",
+    "load",
+    "publish:work",
+    "activate:work",
+    "persist:work",
+    "rebind:work",
+    "start:work",
+  ]);
+  assert.equal(activeProfileName, "work");
+});
+
+test("Named profile setup keeps its persisted profile active when rebind fails", async (t) => {
+  const harness = createBindingApiHarness();
+  const events: string[] = [];
+  let activeProfileName: string | undefined = "active";
+  const profiles: Record<string, { botToken?: string; botId?: number; botUsername?: string }> = {
+    active: { botToken: "111111:ACTIVE" },
+  };
+  t.mock.method(globalThis, "fetch", async () =>
+    new Response(JSON.stringify({
+      ok: true,
+      result: {
+        id: 7,
+        is_bot: true,
+        first_name: "Bridge",
+        username: "bridge_bot",
+      },
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+  registerTelegramCommandsAndTools({
+    pi: harness.api,
+    configStore: {
+      get: () => ({ ...profiles[activeProfileName ?? "default"] }),
+      getStoredConfig: () => ({ profiles: { ...profiles } }),
+      getActiveProfileName: () => activeProfileName,
+      activateProfile: (profileName?: string) => {
+        events.push(`activate:${profileName ?? "default"}`);
+        activeProfileName = profileName;
+        return !profileName || !!profiles[profileName];
+      },
+      setProfile: (profileName: string, profile: (typeof profiles)[string]) => {
+        events.push(`publish:${profileName}`);
+        profiles[profileName] = { ...profile };
+      },
+      getAllowedUserId: () => 840585,
+      getOutboundHandlers: () => [],
+      hasBotToken: () => !!profiles[activeProfileName ?? "default"]?.botToken,
+      load: async () => events.push("load"),
+      persist: async () => undefined,
+      set: () => undefined,
+    },
+    persistConfig: async () => events.push(`persist:${activeProfileName}`),
+    getPairingInstructions: async () => undefined,
+    setup: { start: () => true, finish: () => events.push("guard:finish") },
+    activeTurnRuntime: { get: () => undefined },
+    lockedPollingRuntime: {
+      start: async () => {
+        events.push(`start:${activeProfileName}`);
+        return { ok: true };
+      },
+      stop: async () => events.push(`stop:${activeProfileName}`),
+    },
+    invalidateTransportAuthority: () => events.push(`invalidate:${activeProfileName}`),
+    rebindTransportAuthority: () => {
+      events.push(`rebind:${activeProfileName}`);
+      throw new Error("rebind failed");
+    },
+    resumeDurableOutboundWorker: async () => events.push("worker:resume"),
+    getStatusLines: () => [],
+    buttonActionStore: { register: () => "button-action" },
+    sendMarkdownReply: async () => 1,
+    callMultipart: async () => ({ ok: true }),
+    getDefaultChatId: () => 840585,
+    canSendDirect: () => true,
+    updateStatus: () => events.push("status"),
+    recordRuntimeEvent: (category: string, error: unknown) =>
+      events.push(`record:${category}:${error instanceof Error ? error.message : String(error)}`),
+  } as unknown as Parameters<typeof registerTelegramCommandsAndTools>[0]);
+
+  const setupCommand = harness.commands.get("telegram-setup") as {
+    handler: (args: string, ctx: ExtensionContext) => Promise<void>;
+  };
+  await assert.rejects(
+    setupCommand.handler("work", {
+      cwd: "/repo",
+      hasUI: true,
+      ui: {
+        input: async () => "222222:WORK",
+        editor: async () => "222222:WORK",
+        notify: () => undefined,
+      },
+    } as unknown as ExtensionContext),
+    /rebind failed/,
+  );
+
+  assert.equal(activeProfileName, "work");
+  assert.deepEqual(profiles.work, {
+    botToken: "222222:WORK",
+    botId: 7,
+    botUsername: "bridge_bot",
+  });
+  assert.deepEqual(events, [
+    "invalidate:active",
+    "stop:active",
+    "load",
+    "publish:work",
+    "activate:work",
+    "persist:work",
+    "rebind:work",
+    "record:setup:rebind failed",
+    "guard:finish",
+  ]);
+  assert.equal(events.some((event) => event.startsWith("start:")), false);
+});
+
 test("Lifecycle binding delegates shutdown to composed session runtime", async () => {
   const events: string[] = [];
   const harness = createBindingApiHarness();
@@ -371,6 +636,7 @@ test("Lifecycle binding delegates shutdown to composed session runtime", async (
       onAgentSettled: () => {},
       onSessionShutdown: () => {},
     },
+    interactionLifecycleRuntime: { invalidateAuthority: () => {} },
     assistantOutputRuntime: { start: () => {}, stop: () => {} },
     sessionLifecycleRuntime: {
       onSessionStart: async () => {
@@ -504,6 +770,9 @@ test("Lifecycle binding routes native typing, previews, and normalized activity"
       onAgentEnd: () => events.push("activity:agent-end"),
       onAgentSettled: () => events.push("activity:agent-settled"),
       onSessionShutdown: () => events.push("activity:shutdown"),
+    },
+    interactionLifecycleRuntime: {
+      invalidateAuthority: () => events.push("interaction:invalidate"),
     },
     assistantOutputRuntime: {
       start: () => events.push("assistant-output:start"),
@@ -657,6 +926,10 @@ test("Lifecycle binding routes native typing, previews, and normalized activity"
     { type: "session_before_compact" },
     {} as ExtensionContext,
   );
+  await getRequiredBindingHandler(harness.handlers, "agent_end")(
+    { messages: [] },
+    {} as ExtensionContext,
+  );
 
   assert.deepEqual(events, [
     "activity:agent-start:none",
@@ -674,5 +947,7 @@ test("Lifecycle binding routes native typing, previews, and normalized activity"
     "activity:compact-end:unknown",
     "activity:compact-start:unknown",
     "typing:42:8",
+    "interaction:invalidate",
+    "activity:agent-end",
   ]);
 });

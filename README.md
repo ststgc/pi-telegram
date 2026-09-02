@@ -22,6 +22,8 @@ pi install git:github.com/ststgc/pi-telegram
 
 The package manifest and public import namespace are `@ststgc/pi-telegram`. This release line is distributed through GitHub rather than npm; no `npm:@ststgc/pi-telegram` publication is claimed.
 
+Operators still running `@llblab/pi-telegram@0.20.6` must migrate through Pi's supported package mechanism to this canonical GitHub package before companion imports such as `@ststgc/pi-telegram/interactions` can resolve. Source support does not edit installed package configuration, package locks, or consumer extensions; those changes and a real Telegram smoke are a separate, explicitly approved rollout.
+
 The 0.21 extension platform requires Pi `0.80.6` or newer. Its Activity API uses the public `agent_settled` lifecycle event to keep retries/continuations under one activity identity and release that identity only after the run fully settles.
 
 ## Quick Start
@@ -70,6 +72,7 @@ The code expires after 10 minutes and is single-use. The bridge stores only a st
 - Ask for an artifact; `telegram_attach` returns it through the active reply or direct Telegram delivery.
 - In Threaded Mode, run multiple visible Pi instances through one bot, each with its own Telegram thread.
 - Configure named profiles to run independent Telegram bots from the same Pi agent directory without sharing transport or routing state.
+- Let an explicitly adapted tool ask one bounded question in its active Telegram turn, wait without misleading `…typing`, and resume the same tool Promise from buttons or an exact reply.
 
 ## Product Model
 
@@ -79,8 +82,8 @@ The code expires after 10 minutes and is single-use. The bridge stores only a st
 | Runtime adapter | Telegram targets mapped to Pi instances, then into each instance's current session lifecycle, queueing, previews, final replies, and artifacts |
 | Telegram UI harness | Menus, settings, callbacks, Rich Markdown, drafts, active status, buttons, voice, and files |
 | Multi-instance organism | One leader plus explicit visible followers routed through Telegram private-chat threads |
-| Extension platform | Commands, sections, status rows, update handlers, inbound/outbound handlers, and voice providers |
-| Safety boundary | No hidden Pi processes, no fake terminal, no PTY tricks, no arbitrary TUI slash-command forwarding |
+| Extension platform | Commands, sections, status rows, active-turn interactions, update handlers, inbound/outbound handlers, and voice providers |
+| Safety boundary | No hidden Pi processes, fake terminal, PTY tricks, arbitrary TUI slash-command forwarding, or automatic `ctx.ui` mirroring |
 
 ## Feature Showcase
 
@@ -103,6 +106,7 @@ The code expires after 10 minutes and is single-use. The bridge stores only a st
 | Voice output | Choose `hidden`, `mirror`, or `always`; active automatic turns carry one compact `[voice] delivery: automatic voice` line, while explicit `telegram_voice` remains available. | Voice policy stays dynamic and model-legible without duplicating the full action contract in every prompt. |
 | Buttons | Turn top-level `telegram_button` comments into inline buttons. | Assistant-authored choices become native Telegram interactions. |
 | Callback routing | Route known callbacks to the owner extension and unknown callbacks back into Pi. | Companion extensions can build UI without polling Telegram themselves. |
+| Active-turn interactions | Let an explicitly integrated consumer ask text, single-select, or multi-select questions and resolve the same waiting Promise. | Tool workflows can pause for the paired owner's decision without converting the answer into another Pi prompt or exposing a generic TUI mirror. |
 | Threaded Mode | Run one leader plus visible follower Pi instances through named private-chat threads. | One bot can host a local multi-instance Pi organism without hidden process spawning. |
 | Reroute and restore | Preserve unknown threads and offer explicit target choices. | Telegram client state can be repaired without silently deleting or hijacking prompts. |
 | Extension sections | Add menu sections, commands, status rows, settings, callbacks, and delivery helpers from companion extensions. | `pi-telegram` becomes a platform surface for other Pi extensions. |
@@ -121,7 +125,7 @@ Telegram message
   -> optional files, voice, buttons, or callback actions
 ```
 
-The bridge keeps Telegram responsive without stealing Pi's runtime model. Queueing, model changes, compaction, aborts, final delivery, and direct artifact sends all stay scoped to the Pi instance that accepted the work.
+The bridge keeps Telegram responsive without stealing Pi's runtime model. Queueing, model changes, compaction, aborts, final delivery, direct artifact sends, and claimed interactions all stay scoped to the Pi instance that accepted the work. Interaction answers take a private pre-public route and settle the same waiting consumer call; they do not become queued prompts.
 
 ## Telegram Controls
 
@@ -175,9 +179,11 @@ Inbound files land under `<agent-dir>/tmp/telegram` and default to a 50 MiB limi
 
 Voice notes, audio, images, PDFs, and other media can pass through configured inbound handlers, programmatic handlers, or registered STT providers. Outbound voice can use configured `outboundHandlers` or registered TTS providers; `pi-telegram` owns reply policy and Telegram transport, while providers own synthesis.
 
-### Buttons And Callbacks
+### Buttons, Callbacks, And Interactions
 
 Assistant replies can include top-level hidden `telegram_button` comments. The bridge strips the comments from visible text, renders inline buttons, and routes callbacks back into Pi as queued prompts or extension-owned callback actions.
+
+The separate `@ststgc/pi-telegram/interactions` API is a narrow active-turn contract for explicitly adapted consumer tools: one text, single-select, or multi-select question at a time, with sequential questionnaires composed by the consumer. It requires the paired owner, exact profile/target/transport/session/direct-owner-or-follower generation, one-use `interact:` callbacks, and an exact reply to the current question message for text answers. A claim suppresses native typing while Pi waits and never falls back to local UI after `handled: true`. It does not mirror arbitrary `ctx.ui`; see [Telegram Interactions](./docs/interactions.md).
 
 ### Threaded Mode And Multi-Instance Bus
 
@@ -218,13 +224,14 @@ Companion extensions can integrate with Telegram without owning polling or trans
 - Add menu sections and settings surfaces.
 - Add compact status rows.
 - Deliver target-aware operational views and chat actions from companion code.
+- Request one ownership-gated answer during an active Telegram turn and resume the same consumer Promise.
 - Observe normalized assistant, reasoning, tool, compaction, and settlement activity without blocking Pi.
 - Handle update/callback namespaces.
 - Provide inbound preprocessing handlers.
 - Provide outbound voice synthesis.
 - Use direct delivery helpers for explicit local/TUI sends.
 
-Stable public entrypoints are documented in [Public API](./docs/public-api.md), [Telegram Delivery API](./docs/delivery.md), [Telegram Activity API](./docs/activity.md), [Extension Sections](./docs/sections.md), [Inbound Handlers](./docs/inbound.md), [Outbound Handlers](./docs/outbound.md), [Updates](./docs/updates.md), and [Voice Integration](./docs/voice.md).
+Stable public entrypoints are documented in [Public API](./docs/public-api.md), [Telegram Interactions](./docs/interactions.md), [Telegram Delivery API](./docs/delivery.md), [Telegram Activity API](./docs/activity.md), [Extension Sections](./docs/sections.md), [Inbound Handlers](./docs/inbound.md), [Outbound Handlers](./docs/outbound.md), [Updates](./docs/updates.md), and [Voice Integration](./docs/voice.md).
 
 ## Safety Boundaries
 
@@ -236,6 +243,7 @@ Stable public entrypoints are documented in [Public API](./docs/public-api.md), 
 - Inject raw TTY input or terminal-control sequences.
 - Replace Pi session lifecycle without an official Pi API.
 - Let non-owner Telegram users control the bridge.
+- Mirror arbitrary Pi `ctx.ui` dialogs or make every local interactive tool Telegram-capable without a consumer adapter.
 
 Telegram is a companion surface around a live Pi runtime, not a second runtime. It can compact the current session, but it cannot create, resume, fork, browse, or switch sessions until Pi exposes safe public extension APIs for those operations. In particular, Telegram `/new` is intentionally unavailable in `0.25.0`; no hidden process, synthetic input, unsafe cast, or raw TTY fallback is used.
 
@@ -249,6 +257,7 @@ Final replies and attachments use the same private store as a durable ordered ou
 
 - [Architecture](./docs/architecture.md) — runtime, domains, queue, transport, and Threaded Mode overview.
 - [Public API](./docs/public-api.md) — package entrypoints and stable companion-extension contracts.
+- [Telegram Interactions](./docs/interactions.md) — active-turn request/result bounds, ownership, routing, waiting, fallback, and rollout contract.
 - [Telegram Delivery API](./docs/delivery.md) — target-aware operational views, logical message handles, and lifecycle-safe transport.
 - [Telegram Activity API](./docs/activity.md) — normalized lifecycle events, source identity, non-blocking delivery contexts, and consumer policy examples.
 - [Inbound Handlers](./docs/inbound.md) — Telegram-to-Pi preprocessing pipelines.
@@ -278,7 +287,7 @@ Full validation:
 npm run validate
 ```
 
-`npm run audit` executes raw npm audit and then applies a fail-closed temporary policy for two findings pinned inside Pi's published shrinkwrap: `brace-expansion@5.0.6` (`GHSA-3jxr-9vmj-r5cp`) and `protobufjs@7.6.4` (`GHSA-j3f2-48v5-ccww`). It verifies exact advisory sources, graph, installed paths/versions, and rejects every other finding. The exception expires after 2026-08-21 UTC; see [BACKLOG.md](./BACKLOG.md).
+`npm run audit` executes raw npm audit and then applies a fail-closed temporary policy for findings pinned inside Pi's published shrinkwrap: `brace-expansion@5.0.6` (`GHSA-3jxr-9vmj-r5cp`, `GHSA-mh99-v99m-4gvg`) and `protobufjs@7.6.4` (`GHSA-j3f2-48v5-ccww`). It verifies the exact advisory set, graph, installed paths/versions, and rejects missing, duplicate, or additional findings. The exception expires after 2026-08-21 UTC; see [BACKLOG.md](./BACKLOG.md).
 
 Project context:
 

@@ -36,6 +36,12 @@ function currentAuditReport() {
             url: "https://github.com/advisories/GHSA-3jxr-9vmj-r5cp",
             severity: "high",
           },
+          {
+            source: 1124334,
+            name: "brace-expansion",
+            url: "https://github.com/advisories/GHSA-mh99-v99m-4gvg",
+            severity: "high",
+          },
         ],
         nodes: [bracePath],
       },
@@ -111,7 +117,7 @@ test("dependency audit accepts only the approved current Pi shrinkwrap leaves", 
       Date.parse("2026-08-21T23:59:59Z"),
     ),
     {
-      acceptedAdvisorySources: [1123898, 1123964],
+      acceptedAdvisorySources: [1123898, 1123964, 1124334],
       vulnerabilityCount: 2,
     },
   );
@@ -125,7 +131,7 @@ test("dependency audit accepts only approved parent findings resolving to those 
       Date.parse("2026-08-21T23:59:59Z"),
     ),
     {
-      acceptedAdvisorySources: [1123898, 1123964],
+      acceptedAdvisorySources: [1123898, 1123964, 1124334],
       vulnerabilityCount: 6,
     },
   );
@@ -176,7 +182,27 @@ test("dependency audit rejects an unknown advisory source", () => {
   };
   assert.throws(
     () => evaluateDependencyAudit(report, installedVersion),
-    /unapproved advisory/,
+    /advisory sources differ/,
+  );
+});
+
+test("dependency audit rejects an omitted advisory from an approved leaf", () => {
+  const report = currentAuditReport();
+  report.vulnerabilities["brace-expansion"].via.pop();
+  assert.throws(
+    () => evaluateDependencyAudit(report, installedVersion),
+    /advisory sources differ/,
+  );
+});
+
+test("dependency audit rejects a duplicate advisory in an approved leaf", () => {
+  const report = currentAuditReport();
+  report.vulnerabilities["brace-expansion"].via.push(
+    report.vulnerabilities["brace-expansion"].via[0],
+  );
+  assert.throws(
+    () => evaluateDependencyAudit(report, installedVersion),
+    /advisory sources differ/,
   );
 });
 

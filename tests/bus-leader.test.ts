@@ -1666,18 +1666,26 @@ test("Bus leader records ownership for follower-sent messages", async () => {
     target: { chatId: 1, threadId: 42 },
   });
   const ownership: unknown[] = [];
+  const transported: unknown[] = [];
+  const apiProxy = createTelegramBusLeaderApiProxy({
+    async call(method, body) {
+      transported.push({ method, body });
+      return { message_id: 44 };
+    },
+    async callMultipart() { throw new Error("unexpected multipart call"); },
+    async downloadFile() { throw new Error("unexpected download call"); },
+  });
   const handleEnvelope = createTelegramBusLeaderEnvelopeHandler({
     followerRegistry: registry,
     getNowMs: () => 4000,
-    callApi() {
-      return { message_id: 44 };
-    },
+    callApi: apiProxy,
     recordFollowerMessageOwnership(record) {
       ownership.push({
         instanceId: record.follower.instanceId,
         chatId: record.chatId,
         messageId: record.messageId,
         target: record.target,
+        purpose: record.purpose,
       });
     },
   });
@@ -1692,7 +1700,14 @@ test("Bus leader records ownership for follower-sent messages", async () => {
     registrationGeneration: "generation-a",
     followerSessionGeneration: 1,
     method: "call",
-    args: ["sendMessage", { chat_id: 1, text: "Menu" }],
+    args: [
+      "sendMessage",
+      {
+        chat_id: 1,
+        text: "Menu",
+        __piTelegramInteractionPurpose: "interaction",
+      },
+    ],
     sentAtMs: 4000,
   });
 
@@ -1702,7 +1717,11 @@ test("Bus leader records ownership for follower-sent messages", async () => {
       chatId: 1,
       messageId: 44,
       target: { chatId: 1, threadId: 42 },
+      purpose: "interaction",
     },
+  ]);
+  assert.deepEqual(transported, [
+    { method: "sendMessage", body: { chat_id: 1, text: "Menu" } },
   ]);
 });
 

@@ -4,7 +4,7 @@
 
 The Telegram Delivery API gives trusted extension consumers a safe programmatic way to render operational Telegram UI without importing bridge internals or owning Telegram transport.
 
-It fills the boundary between callback-scoped `TelegramSectionContext.open()` and agent-callable `telegram_message` / `telegram_attach`. It does not replace normal active-turn final replies, Sections, outbound handlers, or raw update handlers.
+It fills the boundary between callback-scoped `TelegramSectionContext.open()` and agent-callable `telegram_message` / `telegram_attach`. It does not replace normal active-turn final replies, Sections, outbound handlers, raw update handlers, or the higher-level [Telegram Interactions API](./interactions.md).
 
 The public package membrane is:
 
@@ -53,7 +53,7 @@ export interface TelegramDeliveryView {
 
 `plain` is the default. Operational activity should prefer `plain` or explicit `html`. `markdown` exists for extension-authored content that naturally owns Markdown; the bridge converts it through the existing UI/compat Markdown-to-HTML renderer rather than entering the native assistant final-reply pipeline.
 
-`replyMarkup` accepts only structural keyboard data. Callback ownership stays with Sections or a registered raw update handler. The documented issue #126 consumer shape uses Sections for interactive Settings toggles and keeps delivered activity rows non-interactive, so a second managed callback registry would duplicate token, answer, edit, navigation, and cleanup ownership without a proven use case. Revisit only when a public-import-only consumer must generate managed callbacks independently of a registered Section context for arbitrary delivered messages.
+`replyMarkup` accepts only structural keyboard data. Callback ownership stays with Sections, a registered raw update handler for a non-reserved namespace, or the dedicated Interactions API. Public Delivery callers cannot set the bridge-private `purpose: "interaction"` ownership marker or use `interact:`; consumers that need an active-turn answer must call `requestTelegramInteraction()` instead of assembling a lookalike view.
 
 ### Target scopes
 
@@ -160,7 +160,7 @@ export function sendTelegramChatAction(
 
 The public functions resolve a process-local runtime binding on every call. They never capture a Pi `ExtensionContext` or command context.
 
-The bridge constructs and binds a genuinely fresh delivery runtime during every `session_start`. It unbinds and shuts down the current runtime during `session_shutdown` before session-bound transport state is discarded; binding an unexpected replacement also shuts down the displaced runtime. Reload and session replacement therefore produce these outcomes:
+The bridge constructs and binds a genuinely fresh delivery runtime during every `session_start`. On `session_shutdown`, the interaction runtime settles and removes its private tokens/listeners before Delivery is unbound and shut down; binding an unexpected replacement also shuts down the displaced delivery runtime. Reload and session replacement therefore produce these outcomes:
 
 - A new call resolves the newly bound runtime after startup.
 - An old handle returns `stale-handle` for edit and delete.
@@ -185,7 +185,7 @@ The binding uses the same `globalThis` membrane pattern as other extension regis
 
 ## Diagnostics
 
-Failures record redacted runtime events under a delivery-specific category with operation, scope kind, profile, and failure reason. Diagnostics must not include bot tokens, unrestricted message bodies, callback payload secrets, or raw transport responses.
+Failures record redacted runtime events under a delivery-specific category with operation, scope kind, profile, and failure reason. Diagnostics must not include bot tokens, unrestricted message bodies, callback payload secrets, or raw transport responses. Interaction lifecycle diagnostics use their own metadata-only category and never add question/answer bodies, option labels/values, Telegram identities, or raw callbacks to Delivery evidence.
 
 A future `getTelegramDeliveryDiagnostics()` is unnecessary for the first slice because callers receive structured results and `/telegram-status` already owns bridge diagnostics. Add a dedicated diagnostics getter only if a real consumer needs registry-level introspection.
 
@@ -220,6 +220,8 @@ The implementation must cover:
 - In-flight shutdown fencing and redacted diagnostics.
 - Package-boundary imports with no `/lib` access.
 
-## Relationship To Activity
+## Relationship To Activity And Interactions
 
 The Activity API builds on this contract rather than duplicating transport. Activity handlers receive a fresh target-aware context whose `send`, `edit`, `delete`, and chat-action methods delegate to the same delivery runtime. The Activity API owns lifecycle normalization; this API owns delivery only.
+
+The Interactions API also consumes a narrow internal Delivery port, but adds one active-turn claim, private purpose ownership, one-use callback/reply routing, timeout/abort settlement, and native-typing waiting policy. Those capabilities are intentionally absent from the public Delivery options so arbitrary operational views cannot impersonate an interaction anchor.

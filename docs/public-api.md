@@ -24,6 +24,7 @@ import { registerTelegramCommand } from "@ststgc/pi-telegram/commands";
 import { registerTelegramInboundHandler } from "@ststgc/pi-telegram/inbound";
 import { registerTelegramOutboundHandler } from "@ststgc/pi-telegram/outbound";
 import { sendTelegramView } from "@ststgc/pi-telegram/delivery";
+import { requestTelegramInteraction } from "@ststgc/pi-telegram/interactions";
 import { registerTelegramActivityHandler } from "@ststgc/pi-telegram/activity";
 import {
   registerTelegramVoiceSynthesisProvider,
@@ -130,6 +131,16 @@ With `assistant.rendering: "rich"` (the default), assistant Markdown delivery is
 
 Environment variables are stable only where documented in the README: bot-token bootstrap, proxy behavior, agent root, and inbound/outbound file size limits.
 
+## Interactions
+
+Import `requestTelegramInteraction()` from `@ststgc/pi-telegram/interactions` when an explicitly adapted consumer needs one structured answer during the current active Telegram turn. The API supports text, single-select, and multi-select modes and returns a discriminated `handled` attempt rather than exposing Telegram clients, Pi contexts, or mutable bridge state.
+
+`handled: false` means the bridge did not claim a Telegram surface and an eligible local-origin consumer may choose its established TUI/RPC fallback. After claim, cancellation, timeout, render failure, authority loss, and transport failure all remain `handled: true`; the consumer must not open a second UI. One active turn has one interaction at a time, and questionnaires are sequential consumer composition rather than a batch form API.
+
+The bridge authorizes the paired owner plus the exact active profile, target, transport/session generation, and direct-owner epoch or follower registration generation. Text requires an exact reply to the current question message; callbacks use the private one-use `interact:` namespace. Interaction candidates are routed before public update handlers and never become Pi prompts. See [Telegram Interactions](./interactions.md) for the authoritative types, field bounds, timeout/abort behavior, waiting lease, privacy rules, fallback, and rollout prerequisites.
+
+This surface does not mirror arbitrary `ctx.ui` calls. A tool or extension must explicitly adapt its own request/result contract.
+
 ## Programmatic API Matrix
 
 High-level stable APIs:
@@ -146,6 +157,9 @@ High-level stable APIs:
 - `sendTelegramView()` / `editTelegramView()` / `deleteTelegramView()` / `sendTelegramChatAction()`
   - Identity: current process-local delivery generation and returned logical message handles.
   - Purpose: ownership-gated operational delivery to active-turn, current-instance, aggregate, or explicitly authorized targets.
+- `requestTelegramInteraction()`
+  - Identity: one current active Telegram turn plus its exact target, profile, transport/session generation, and direct-owner or follower authority generation.
+  - Purpose: resolve one bounded text/single-select/multi-select answer into the same waiting consumer Promise.
 - `registerTelegramActivityHandler()`
   - Identity: required stable `id`.
   - Purpose: normalized non-blocking Pi lifecycle activity with source identity and fresh delivery contexts.
@@ -160,7 +174,7 @@ Low-level stable buses:
 
 - `registerTelegramUpdateHandler()`
   - Identity: no id.
-  - Purpose: observe or consume paired raw Telegram updates before default routing. Unpaired claims and rejected unpaired updates are security-gated first and are never observable or consumable here.
+  - Purpose: observe or consume paired non-interaction Telegram updates before default routing. Unpaired claims, rejected unpaired updates, and private interaction answers are security/ownership-gated first and are never observable or consumable here.
 - `registerTelegramInboundHandler()`
   - Identity: no id.
   - Purpose: generic Telegram-to-Pi transforms.
@@ -186,9 +200,10 @@ This inventory maps the complete bridge capability plane to its supported extens
 - **Telegram commands:** `/commands` registers explicit Telegram-native slash commands with scoped reply and prompt-enqueue ports.
 - **Managed menu and Settings UI:** `/sections` registers main-menu views, Settings rows, namespaced callbacks, standalone callback-scoped messages, and diagnostics.
 - **Programmatic target-aware delivery:** `/delivery` sends, edits, deletes, and signals operational views against active-turn, current-instance, aggregate, or explicitly authorized targets through generation-bound logical handles.
+- **Active-turn interaction:** `/interactions` claims one current Telegram turn, renders a bounded question, privately routes the paired owner's exact callback/reply, suppresses native typing while waiting, and resolves the same consumer Promise.
 - **Normalized lifecycle activity:** `/activity` registers non-blocking extension handlers for evidence-based run/source identity, assistant prose/reasoning segments, executed tools, compaction, and settlement with fresh delivery contexts.
 - **Compact status projection:** `/status` contributes synchronous status rows to the `/start` menu.
-- **Raw inbound update interception:** `/updates` observes or consumes Telegram updates before default routing and remains the low-level callback escape hatch.
+- **Raw inbound update interception:** `/updates` observes or consumes paired non-interaction Telegram updates before default routing and remains the low-level callback escape hatch. Pairing proofs and interaction answers stay private before this membrane.
 - **Inbound content transforms:** `/inbound` adds Telegram-to-Pi text/media preprocessing after operator-configured handlers.
 - **Final outbound transforms:** `/outbound` adds final text/voice transformation fallbacks and exposes redacted runtime-event recording.
 - **Voice providers and policy helpers:** `/voice` registers STT/TTS providers and exposes stable voice-mode projections.
@@ -199,7 +214,7 @@ This inventory maps the complete bridge capability plane to its supported extens
 
 - **Credentials and raw transport:** Bot tokens, Telegram clients, unrestricted Bot API calls, polling, retry loops, offsets, and multipart/download internals stay private so companions cannot bypass pairing or open a second transport owner.
 - **Ownership and multi-instance routing:** Locks, named-profile isolation, leader/follower IPC, authorization capabilities, thread provisioning, reconciliation, and sync assumptions stay bridge-owned.
-- **Session and queue coordination:** Active turns, queue lanes, dispatch gates, abort/compaction state, previews, final-reply ordering, and session-bound context stores stay internal invariants rather than shared mutable extension state. Telegram targets identify Pi instances and resolve their current session at dispatch time; they are not public handles to immutable session files.
+- **Session and queue coordination:** Active turns, queue lanes, dispatch gates, abort/compaction state, interaction routing/authority state, previews, final-reply ordering, and session-bound context stores stay internal invariants rather than shared mutable extension state. `/interactions` exposes only a bounded request/result capability. Telegram targets identify Pi instances and resolve their current session at dispatch time; they are not public handles to immutable session files.
 - **Core operator UI:** Built-in menus, model/thinking controls, rendering internals, prompt-template expansion, status diagnostics assembly, and thread naming remain core policy; companions extend them through commands, sections, and status providers.
 - **Raw Pi runtime objects:** Companion APIs never return captured `ExtensionContext`, `ExtensionCommandContext`, session managers, or private session-replacement/runtime handles.
 
@@ -570,7 +585,7 @@ async function synthesizeDemoOgg(_text: string): Promise<string> {
 
 ### Smoke Checklist
 
-- The extension imports only public package membranes: `@ststgc/pi-telegram`, `/commands`, `/sections`, `/status`, `/delivery`, `/activity`, `/updates`, `/inbound`, `/outbound`, `/voice`, or `/keyboard`.
+- The extension imports only public package membranes: `@ststgc/pi-telegram`, `/commands`, `/sections`, `/status`, `/delivery`, `/interactions`, `/activity`, `/updates`, `/inbound`, `/outbound`, `/voice`, or `/keyboard`.
 - It does not import `@ststgc/pi-telegram/lib/*`.
 - It registers on `session_start` and disposes on `session_shutdown`.
 - Stable high-level registrations use durable ids.
