@@ -6,6 +6,7 @@
 - `[Models]` The Telegram model menu now opens on all authenticated models instead of scoped favorites. Scoped models remain available as an optional tab, and the existing thinking menu continues to expose every Pi-supported reasoning level.
 - `[Terminal UI]` Telegram status updates now clear the extension status key instead of publishing connected/disconnected state into Pi's shared footer. Telegram menus and `/telegram-status` retain full operational diagnostics.
 - `[Validation]` Added command-context session replacement, confirmation callback, all-model default, and hidden terminal-status regressions.
+- `[Lifecycle Reliability]` Agent-end cleanup now treats only Pi stale-context status failures as completed teardown while preserving non-stale failures and continuing Telegram delivery/queue ordering. Impact: abort or session replacement cannot surface expected old-runtime status errors after typing cleanup.
 
 ## 0.20.6: Guest Attribution And Voice Action Hotfix
 

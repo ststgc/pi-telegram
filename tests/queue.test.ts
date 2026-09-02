@@ -1946,6 +1946,58 @@ test("Agent end uses rawFinalText when plannedReply is undefined", async () => {
   assert.ok(events.some((e) => e.includes("replyToPrompt=true")));
 });
 
+test("Agent end runtime continues after a stale status update following typing cleanup", async () => {
+  const events: string[] = [];
+  await handleTelegramAgentEndRuntime({
+    turn: undefined,
+    assistant: {},
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {
+      events.push("reset");
+    },
+    waitForTypingIdle: async () => {
+      events.push("typing-idle");
+    },
+    updateStatus: () => {
+      throw new Error("This extension ctx is stale after session replacement");
+    },
+    dispatchNextQueuedTelegramTurn: () => {
+      events.push("dispatch");
+    },
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async () => true,
+    sendMarkdownReply: async () => {},
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {},
+  });
+
+  assert.deepEqual(events, ["reset", "typing-idle", "dispatch"]);
+});
+
+test("Agent end runtime still rejects non-stale status failures", async () => {
+  await assert.rejects(
+    handleTelegramAgentEndRuntime({
+      turn: undefined,
+      assistant: {},
+      foldQueuedPromptsIntoHistory: false,
+      resetRuntimeState: () => {},
+      waitForTypingIdle: async () => {},
+      updateStatus: () => {
+        throw new Error("status update broke");
+      },
+      dispatchNextQueuedTelegramTurn: () => {},
+      clearPreview: async () => {},
+      setPreviewPendingText: () => {},
+      finalizeMarkdownPreview: async () => true,
+      sendMarkdownReply: async () => {},
+      sendTextReply: async () => {},
+      sendQueuedAttachments: async () => {},
+    }),
+    /status update broke/,
+  );
+});
+
 test("Agent end hook binds assistant extraction and runtime ports", async () => {
   const events: string[] = [];
   const turn: PendingTelegramTurn = createQueueTestPromptTurn();

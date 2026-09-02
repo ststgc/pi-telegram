@@ -1146,7 +1146,11 @@ export async function handleTelegramAgentEndRuntime<
   const replyMarkup = outboundReply?.replyMarkup;
   deps.resetRuntimeState();
   await deps.waitForTypingIdle?.();
-  deps.updateStatus();
+  try {
+    deps.updateStatus();
+  } catch (error) {
+    if (!isTelegramStaleContextError(error)) throw error;
+  }
   const endPlan = buildTelegramAgentEndPlan({
     hasTurn: !!turn,
     stopReason: assistant.stopReason,
